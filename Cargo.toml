@@ -1,0 +1,67 @@
+# vim: paste
+[package]
+name = "rget"
+version = "1.0.0"
+edition = "2024"
+description = "Secure file downloader with wget-like functionality"
+authors = ["Sami Farin"]
+license = "Apache-2.0 AND GPL-3.0-only"
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "stream", "http2", "charset"] }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "logging"] }
+aws-lc-rs = "1"
+charset = "0.1"
+
+log = "0"
+env_logger = "0.11"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tokio-stream = "0.1"
+
+# Command-line argument parsing
+clap = { version = "4", features = ["derive", "cargo"] }
+
+# URL parsing
+url = "2"
+
+# Temp file handling
+tempfile = "3"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# For async streaming
+futures-util = "0.3"
+
+# Progress bar
+indicatif = "0.18"
+
+libc = "0.2"
+#tikv-jemallocator = "0.6"
+
+# For deterministic temp filename generation (SHAKE256)
+sha3 = "0.10"
+# For base32 encoding of temp filenames
+data-encoding = "2"
+
+# For expanding ~ in paths
+dirs = "6"
+
+nix = { version = "0", features = ["fs", "user"] } 
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libseccomp = "0.4"
+
+[profile.release]
+opt-level = 3
+debug = true
+#lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[build-dependencies]
+time = { version = "0.3", features = ["formatting", "macros"] }
