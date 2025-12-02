@@ -15,6 +15,8 @@
 //! - Resume support with --continue flag (works with --temp too)
 //! - Safe open flags when creating files (O_EXCL O_NOFOLLOW O_NOCTTY)
 //! - Windows Reserved Filename protection
+//! - Mutual TLS (mTLS) support via --cert and --key
+//! - HSTS Persistence to enforce HTTPS for known hosts
 
 //     This program is free software: you can redistribute it and/or modify it under the terms of the
 //     GNU General Public License as published by the Free Software Foundation, either version 3 of
@@ -37,12 +39,12 @@ static GLOBAL: Jemalloc = Jemalloc;
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, BufWriter};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::io::IsTerminal;
 
 use anyhow::{bail, Context, Result};
@@ -51,12 +53,12 @@ use clap::builder::TypedValueParser;
 use crate::content_disposition::{parse_content_disposition, DispositionType};
 use data_encoding::BASE32_NOPAD;
 use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
-use reqwest::header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, LOCATION, RANGE};
+use reqwest::header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, LOCATION, RANGE, STRICT_TRANSPORT_SECURITY};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-use reqwest::{Client, Response, StatusCode};
+use reqwest::{Client, Response, StatusCode, Identity};
 use sha3::{Shake256, digest::{Update, ExtendableOutput, XofReader}};
 use tokio::time::{sleep, Instant};
-use tokio::io::{AsyncWrite, AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncWrite, AsyncWriteExt, BufWriter as TokBufWriter};
 use tokio_stream::StreamExt;
 use url::Url;
 
@@ -109,6 +111,9 @@ pub enum PermanentError {
 
     // Owner verification - file must be owned by current user when appending
     FileOwnerMismatch { path: PathBuf, expected_uid: u32, actual_uid: u32 },
+
+    // --cert and --key
+    ClientCertError(String),
 }
 
 impl std::fmt::Display for PermanentError {
@@ -179,6 +184,9 @@ impl std::fmt::Display for PermanentError {
                 write!(f, "File '{}' owner mismatch: expected UID {}, got UID {}. Use --insecure-owner to allow.",
                     path.display(), expected_uid, actual_uid)
             }
+            Self::ClientCertError(msg) => {
+                write!(f, "Client certificate/key error: {}", msg)
+            }
         }
     }
 }
@@ -193,11 +201,41 @@ const BUFFER_SIZE: usize = 1024 * 1024;
 /// Default personalization string if config file doesn't exist
 const DEFAULT_PERSONALIZATION: &str = "rget-default-key-v1";
 
+/// Maximum filename length in bytes (POSIX NAME_MAX is typically 255)
+const MAX_FILENAME_BYTES: usize = 255;
+
 /// Config file name (placed in platform-specific config directory)
 /// - Linux: ~/.config/rget/resumekey.conf
 /// - macOS: ~/Library/Application Support/rget/resumekey.conf
 /// - Windows: C:\Users\<User>\AppData\Roaming\rget\resumekey.conf
 const RESUME_KEY_FILENAME: &str = "resumekey.conf";
+
+/// Check if an io::Error is ENAMETOOLONG
+fn is_name_too_long(err: &std::io::Error) -> bool {
+    err.raw_os_error() == Some(libc::ENAMETOOLONG)
+}
+
+/// Apply safe open flags (O_NOFOLLOW | O_NOCTTY) on Unix
+#[cfg(unix)]
+fn apply_safe_flags(opts: &mut OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+    opts.custom_flags(libc::O_NOFOLLOW | libc::O_NOCTTY);
+}
+
+#[cfg(not(unix))]
+fn apply_safe_flags(_opts: &mut OpenOptions) {}
+
+#[cfg(unix)]
+fn apply_file_mode(opts: &mut OpenOptions, args: &Args) {
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(ref mode_str) = args.filemode
+        && let Ok(mode) = u32::from_str_radix(mode_str, 8) {
+            opts.mode(mode);
+        }
+}
+
+/// HSTS database filename
+const HSTS_DB_FILENAME: &str = "hsts.json";
 
 const VERSION_MESSAGE: &str = concat!(
     env!("CARGO_PKG_VERSION"),
@@ -299,7 +337,7 @@ struct Args {
 
     /// Read URLs from a local or external file
     #[arg(short = 'i', long = "input-file", help = "Read URLs from a local or external file")]
-    input_file: Option<String>, /// Read URLs from a local or external file
+    input_file: Option<String>,
 
     /// Specify username for HTTP authentication
     #[arg(long = "user", help = "Specify username for HTTP authentication")]
@@ -320,33 +358,446 @@ struct Args {
     /// Set file permissions (octal, e.g. 644). Default: based on umask.
     #[arg(long = "filemode", help = "Set file permissions (octal, e.g. 644)")]
     filemode: Option<String>,
+
+    /// Client certificate file (PEM) for Mutual TLS
+    #[arg(long = "cert", requires = "key", help = "Client certificate file (PEM) for Mutual TLS")]
+    cert: Option<String>,
+
+    /// Private key file (PEM) for Mutual TLS
+    #[arg(long = "key", requires = "cert", help = "Private key file (PEM) for Mutual TLS")]
+    key: Option<String>,
+
+    /// HSTS cache file path
+    #[arg(long = "hsts-file", help = "Path to HSTS cache file (default: ~/.config/rget/hsts.conf)")]
+    hsts_file: Option<String>,
 }
 
-/// Maximum filename length in bytes (POSIX NAME_MAX is typically 255)
-const MAX_FILENAME_BYTES: usize = 255;
-
-/// Check if an io::Error is ENAMETOOLONG
-fn is_name_too_long(err: &std::io::Error) -> bool {
-    err.raw_os_error() == Some(libc::ENAMETOOLONG)
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct HstsEntry {
+    expiry: u64, // Unix timestamp
+    include_subdomains: bool,
 }
 
-/// Apply safe open flags (O_NOFOLLOW | O_NOCTTY) on Unix
-#[cfg(unix)]
-fn apply_safe_flags(opts: &mut OpenOptions) {
-    use std::os::unix::fs::OpenOptionsExt;
-    opts.custom_flags(libc::O_NOFOLLOW | libc::O_NOCTTY);
+type HstsMap = HashMap<String, HstsEntry>;
+
+fn get_default_hsts_path() -> PathBuf {
+    dirs::config_dir()
+        .map(|d| d.join(env!("CARGO_PKG_NAME")).join(HSTS_DB_FILENAME))
+        .unwrap_or_else(|| PathBuf::from(HSTS_DB_FILENAME))
 }
 
-#[cfg(not(unix))]
-fn apply_safe_flags(_opts: &mut OpenOptions) {}
+fn load_hsts_db(path: &Path) -> HstsMap {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return HashMap::new(),
+    };
+    let reader = BufReader::new(file);
 
-#[cfg(unix)]
-fn apply_file_mode(opts: &mut OpenOptions, args: &Args) {
-    use std::os::unix::fs::OpenOptionsExt;
-    if let Some(ref mode_str) = args.filemode
-        && let Ok(mode) = u32::from_str_radix(mode_str, 8) {
-            opts.mode(mode);
+    // Parse JSON
+    match serde_json::from_reader::<_, HstsMap>(reader) {
+        Ok(mut map) => {
+            // Prune expired entries immediately on load
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            map.retain(|_, entry| entry.expiry > now);
+            map
         }
+        Err(_) => {
+            // Silently fail on parse error (e.g., empty file or old format), return empty map
+            // You can uncomment the line below for debugging
+            // eprintln!("[DEBUG] HSTS JSON parse error: {}", e);
+            HashMap::new()
+        }
+    }
+}
+
+fn save_hsts_db(path: &Path, map: &HstsMap) {
+    // Attempt to create parent directories
+    if let Some(parent) = path.parent()
+        && let Err(e) = fs::create_dir_all(parent) {
+             eprintln!("Warning: Failed to create HSTS config directory '{}': {}", parent.display(), e);
+        }
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+
+    // Filter out expired entries before saving
+    let valid_entries: HstsMap = map
+        .iter()
+        .filter(|(_, entry)| entry.expiry > now)
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+
+    match File::create(path) {
+        Ok(file) => {
+            let writer = BufWriter::new(file);
+            if let Err(e) = serde_json::to_writer_pretty(writer, &valid_entries) {
+                eprintln!("Failed to serialize HSTS DB to '{}': {}", path.display(), e);
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to write HSTS DB to '{}': {}", path.display(), e);
+        }
+    }
+}
+
+fn check_hsts(map: &HstsMap, host: &str) -> bool {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+
+    // Check exact match
+    if let Some(entry) = map.get(host) && entry.expiry > now {
+            return true;
+    }
+
+    // Check superdomains if they have includeSubDomains set
+    let mut parts: Vec<&str> = host.split('.').collect();
+    while parts.len() > 1 {
+        parts.remove(0); // Remove subdomain
+        let superdomain = parts.join(".");
+        if let Some(entry) = map.get(&superdomain)
+             && entry.include_subdomains && entry.expiry > now {
+                 return true;
+             }
+    }
+
+    false
+}
+
+fn update_hsts(map: &mut HstsMap, url: &Url, headers: &HeaderMap, debug: bool) {
+    if let Some(hsts_val) = headers.get(STRICT_TRANSPORT_SECURITY)
+        && let Ok(hsts_str) = hsts_val.to_str() {
+            let mut max_age = None;
+            let mut include_subdomains = false;
+
+            for part in hsts_str.split(';') {
+                let part = part.trim();
+                if part.eq_ignore_ascii_case("includeSubDomains") {
+                    include_subdomains = true;
+                } else if part.to_lowercase().starts_with("max-age=")
+                    && let Ok(age) = part["max-age=".len()..].trim().parse::<u64>() {
+                        max_age = Some(age);
+                    }
+            }
+
+            if let Some(age) = max_age {
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                let expiry = now + age;
+                if let Some(host) = url.host_str() {
+                     map.insert(host.to_string(), HstsEntry { expiry, include_subdomains });
+
+                     if debug {
+                         eprintln!("[DEBUG] HSTS: Added/Updated entry for '{}' (max-age={}, includeSubDomains={})",
+                            host, age, include_subdomains);
+                     }
+                }
+            }
+        }
+}
+
+fn build_client(
+    args: &Args,
+    resolve_override: Option<(&str, SocketAddr)>
+) -> Result<Client> {
+    let mut builder = Client::builder()
+        .redirect(reqwest::redirect::Policy::none()) // Manual redirects
+        .user_agent(args.user_agent.as_deref().unwrap_or(concat!(env!("CARGO_PKG_NAME"), "/1.0")))
+        .connect_timeout(Duration::from_secs(30))
+        .no_gzip()
+        .no_brotli()
+        .no_deflate();
+
+    // Handle Proxy
+    if args.no_proxy {
+        builder = builder.no_proxy();
+    }
+
+    // Handle Security
+    if args.insecure {
+        builder = builder
+            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_hostnames(true);
+    } else {
+        builder = builder.use_rustls_tls();
+    }
+
+    // Handle mTLS (Client Certificate)
+    if let (Some(cert_path), Some(key_path)) = (&args.cert, &args.key) {
+        if args.debug {
+            eprintln!("[DEBUG] Loading client certificate: {}", cert_path);
+            eprintln!("[DEBUG] Loading private key: {}", key_path);
+        }
+
+        let cert_pem = fs::read(cert_path).map_err(|e|
+            PermanentError::ClientCertError(format!("Failed to read certificate file '{}': {}", cert_path, e))
+        )?;
+
+        let key_pem = fs::read(key_path).map_err(|e|
+            PermanentError::ClientCertError(format!("Failed to read key file '{}': {}", key_path, e))
+        )?;
+
+        // Combine cert and key for reqwest/rustls identity
+        let mut combined_pem = cert_pem;
+        combined_pem.push(b'\n');
+        combined_pem.extend_from_slice(&key_pem);
+
+        let identity = Identity::from_pem(&combined_pem)
+            .context("Failed to parse client certificate/key (PEM format required)")?;
+
+        builder = builder.identity(identity);
+    }
+
+    // Handle Custom Headers
+    let mut headers = HeaderMap::new();
+    if let Some(ref ref_url) = args.referer {
+        if let Ok(val) = HeaderValue::from_str(ref_url) {
+            headers.insert(reqwest::header::REFERER, val);
+        } else {
+            eprintln!("Warning: Invalid referer URL ignored");
+        }
+    }
+    for h in &args.header {
+        if let Some((k, v)) = h.split_once(':') {
+            if let (Ok(k_name), Ok(v_val)) = (HeaderName::from_bytes(k.trim().as_bytes()), HeaderValue::from_str(v.trim())) {
+                headers.insert(k_name, v_val);
+            } else {
+                eprintln!("Warning: Invalid header ignored: {}", h);
+            }
+        } else {
+            eprintln!("Warning: Invalid header format (missing colon): {}", h);
+        }
+    }
+    if !headers.is_empty() {
+        builder = builder.default_headers(headers);
+    }
+
+    // Handle DNS Resolve-and-Override
+    if let Some((host, addr)) = resolve_override {
+        builder = builder.resolve(host, addr);
+    }
+
+    builder.build().context("Failed to build HTTP client")
+}
+
+async fn resolve_final_url_and_client(
+    initial_url: Url,
+    args: &Args,
+    client_cache: &mut HashMap<String, Client>,
+    hsts_db: &mut HstsMap,
+) -> Result<(Client, Url, Option<u64>, Option<String>)> {
+    let mut current_url = initial_url;
+    let mut redirect_count = 0;
+
+    loop {
+        // HSTS Upgrade Check
+        if current_url.scheme() == "http"
+            && let Some(host) = current_url.host_str()
+                && check_hsts(hsts_db, host) {
+                    if args.verbose {
+                        eprintln!("HSTS: Upgrading insecure request to {}", host);
+                    }
+                    let _ = current_url.set_scheme("https");
+                }
+        if redirect_count >= MAX_REDIRECTS {
+            return Err(PermanentError::TooManyRedirects(MAX_REDIRECTS).into());
+        }
+
+        validate_url(&current_url, args.insecure)?;
+
+        if args.verbose {
+            eprintln!("-> Requesting: {}", current_url);
+        }
+
+        let client = if !args.no_proxy && (std::env::var("HTTP_PROXY").is_ok() || std::env::var("HTTPS_PROXY").is_ok()) {
+             build_client(args, None)?
+        } else {
+            let host = current_url.host_str().ok_or_else(|| anyhow::anyhow!("No host in URL"))?;
+
+            // Include port in cache key to separate HTTP (80) and HTTPS (443) clients
+            let port = current_url.port_or_known_default().unwrap_or(443);
+            let cache_key = format!("{}:{}", host, port);
+
+            if let Some(cached_client) = client_cache.get(&cache_key) {
+                 if args.verbose { eprintln!("   Reusing connection for {}", host); }
+                 cached_client.clone()
+            } else {
+                 let safe_ip = resolve_safe_ip(&current_url, args).await?;
+                 if !args.quiet { eprintln!("Connecting to {} ({})", host, safe_ip.ip()); }
+                 let new_client = build_client(args, Some((host, safe_ip)))?;
+                 client_cache.insert(cache_key, new_client.clone());
+                 new_client
+            }
+        };
+
+        let mut request = client.head(current_url.clone());
+        if let Some(ref u) = args.user {
+             request = request.basic_auth(u, args.password.as_deref());
+        }
+
+        let mut response = request.send().await.context("Failed to send HEAD request")?;
+        if response.status() == StatusCode::METHOD_NOT_ALLOWED {
+             if args.debug {
+                eprintln!("[DEBUG] HEAD status: 405 Method Not Allowed. Retrying with GET...");
+             }
+             let mut get_request = client.get(current_url.clone());
+             if let Some(ref u) = args.user {
+                get_request = get_request.basic_auth(u, args.password.as_deref());
+             }
+             response = get_request.send().await.context("Failed to send GET request")?;
+        }
+
+        update_hsts(hsts_db, &current_url, response.headers(), args.debug);
+
+        if args.debug {
+            eprintln!("[DEBUG] HTTP version: {:#?} {}", response.version(), response.status());
+            eprintln!("[DEBUG] All headers:");
+            // Sometimes Google CDN sends 'age: "0"' and no content-length or etag
+            for (name, value) in response.headers().iter() {
+                eprintln!("[DEBUG]   {}: {:?}", name, value);
+            }
+            if response.headers().contains_key("transfer-encoding") {
+                eprintln!("[DEBUG]   WARNING: Transfer-Encoding detected. Content-Length might be missing.");
+            }
+        }
+
+        let status = response.status();
+        let headers = response.headers().clone();
+
+        if status.is_redirection() && let Some(location) = headers.get(LOCATION) {
+             let location_str = location.to_str().context("Invalid Location header")?;
+             let next_url = current_url.join(location_str).context("Failed to resolve redirect URL")?;
+             if args.verbose { eprintln!("   Redirecting to: {}", next_url); }
+             current_url = next_url;
+             redirect_count += 1;
+             continue;
+        }
+
+        let content_length = headers.get(CONTENT_LENGTH)
+             .and_then(|v| v.to_str().ok())
+             .and_then(|s| s.parse::<u64>().ok());
+
+        let content_disposition = headers.get(CONTENT_DISPOSITION)
+             .and_then(|v| v.to_str().ok())
+             .map(|s| s.to_string());
+
+        if status.is_success() || status.is_client_error() || status.is_server_error() {
+             return Ok((client, current_url, content_length, content_disposition));
+        }
+
+        bail!("Unexpected status code: {}", status);
+    }
+}
+
+async fn run_with_args(args: Args) -> Result<()> {
+    let mut all_urls = args.urls.clone();
+
+    env_logger::init();
+    if let Some(ref input_path) = args.input_file {
+        let reader: Box<dyn BufRead> = if input_path == "-" {
+            Box::new(BufReader::new(std::io::stdin()))
+        } else {
+            let f = File::open(input_path).context("Failed to open input file")?;
+            Box::new(BufReader::new(f))
+        };
+
+        for line in reader.lines() {
+            let line = line?;
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                all_urls.push(trimmed.to_string());
+            }
+        }
+    }
+
+    // Deduplicate URLs automatically if --output is not specified
+    let urls: Vec<String> = if args.output.is_none() {
+        let mut seen = HashSet::new();
+        all_urls.iter().filter(|url| seen.insert(*url)).cloned().collect()
+    } else {
+        all_urls
+    };
+
+    if args.output.is_some() && urls.len() > 1 {
+        return Err(PermanentError::InvalidArguments("--output cannot be used with multiple URLs".to_string()).into())
+    }
+
+    if let Err(e) = apply_security_sandbox() {
+        eprintln!("Failed to apply seccomp filter: {}", e);
+        std::process::exit(1);
+    }
+
+    // Load HSTS Database
+    let hsts_path = if let Some(p) = &args.hsts_file {
+        PathBuf::from(p)
+    } else {
+        get_default_hsts_path()
+    };
+    let mut hsts_db = load_hsts_db(&hsts_path);
+
+    let mut client_cache: HashMap<String, Client> = HashMap::new();
+    let mut overall_success = true;
+    let max_retries = if args.retries == 0 { u64::MAX } else { args.retries };
+
+    for url_str in &urls {
+        let url = match Url::parse(url_str) {
+            Ok(u) => u,
+            Err(e) => {
+                 eprintln!("Error parsing URL '{}': {}", url_str, e);
+                 overall_success = false;
+                 continue;
+            }
+        };
+
+        if !args.quiet { eprintln!("Starting download: {}", url); }
+
+        let mut attempt = 0;
+        loop {
+            let mut current_args = args.clone();
+            if attempt > 0 { current_args.resume = true; }
+
+            // Pass the cache to be used/updated
+            let result = async {
+                match resolve_final_url_and_client(url.clone(), &current_args, &mut client_cache, &mut hsts_db).await {
+                    Ok((client, final_url, content_length, content_disposition)) => {
+                        if current_args.verbose && final_url != url {
+                            eprintln!("Final URL: {}", final_url);
+                        }
+
+                        if let (Some(max), Some(size)) = (current_args.max_size, content_length)
+                            && size > max {
+                                return Err(PermanentError::FileSizeExceedsLimit { size, max, url: final_url.to_string() }.into())
+                            }
+                        download_file(&client, &final_url, &current_args, content_length, content_disposition.as_deref()).await
+                    }
+                    Err(e) => Err(e),
+                }
+            }.await;
+
+            match result {
+                Ok(()) => break,
+                Err(e) => {
+                    if is_permanent_error(&e) {
+                         eprintln!("Failed to download {}: {:#}", url, e);
+                         overall_success = false;
+                         break;
+                    }
+                    if attempt >= max_retries {
+                         eprintln!("Failed to download {}: {:#}", url, e);
+                         overall_success = false;
+                         break;
+                    }
+                    eprintln!("Error: {}. Retrying (attempt {}/{})...", e, attempt + 1, if args.retries == 0 { "\u{221e}".to_string() } else { args.retries.to_string() });
+                    attempt += 1;
+
+                    // Exponential backoff: 2^attempt (capped at 64s)
+                    let delay = 1u64 << attempt.clamp(0, 6);
+                    sleep(Duration::from_secs(delay)).await;
+                }
+            }
+        }
+        if !args.quiet && urls.len() > 1 { eprintln!(); }
+    }
+
+    save_hsts_db(&hsts_path, &hsts_db);
+
+    if overall_success { Ok(()) } else { bail!("One or more downloads failed") }
 }
 
 /// Truncate a string to fit within a maximum byte limit, respecting UTF-8 boundaries.
@@ -787,68 +1238,6 @@ fn generate_deterministic_temp_filename(
     parent_dir.join(filename)
 }
 
-fn build_client(
-    args: &Args,
-    resolve_override: Option<(&str, SocketAddr)>
-) -> Result<Client> {
-    let mut builder = Client::builder()
-        .redirect(reqwest::redirect::Policy::none()) // Manual redirects
-        .user_agent(args.user_agent.as_deref().unwrap_or(concat!(env!("CARGO_PKG_NAME"), "/1.0")))
-        // We remove the global timeout to allow long downloads.
-        // We handle "no data received" timeout manually in write_response_to_file.
-        .connect_timeout(Duration::from_secs(30))
-        // Disable auto-compression to ensure we get Content-Length
-        // and can safely use Byte Ranges for resuming.
-        .no_gzip()
-        .no_brotli()
-        .no_deflate();
-
-    // Handle Proxy
-    if args.no_proxy {
-        builder = builder.no_proxy();
-    }
-
-    // Handle Security
-    if args.insecure {
-        builder = builder
-            .danger_accept_invalid_certs(true)
-            .danger_accept_invalid_hostnames(true);
-    } else {
-        builder = builder.use_rustls_tls();
-    }
-
-    // Handle Custom Headers
-    let mut headers = HeaderMap::new();
-    if let Some(ref ref_url) = args.referer {
-        if let Ok(val) = HeaderValue::from_str(ref_url) {
-            headers.insert(reqwest::header::REFERER, val);
-        } else {
-            eprintln!("Warning: Invalid referer URL ignored");
-        }
-    }
-    for h in &args.header {
-        if let Some((k, v)) = h.split_once(':') {
-            if let (Ok(k_name), Ok(v_val)) = (HeaderName::from_bytes(k.trim().as_bytes()), HeaderValue::from_str(v.trim())) {
-                headers.insert(k_name, v_val);
-            } else {
-                eprintln!("Warning: Invalid header ignored: {}", h);
-            }
-        } else {
-            eprintln!("Warning: Invalid header format (missing colon): {}", h);
-        }
-    }
-    if !headers.is_empty() {
-        builder = builder.default_headers(headers);
-    }
-
-    // Handle DNS Resolve-and-Override
-    if let Some((host, addr)) = resolve_override {
-        builder = builder.resolve(host, addr);
-    }
-
-    builder.build().context("Failed to build HTTP client")
-}
-
 fn validate_url(url: &Url, insecure: bool) -> Result<()> {
     match url.scheme() {
         "https" => Ok(()),
@@ -858,124 +1247,6 @@ fn validate_url(url: &Url, insecure: bool) -> Result<()> {
             }
         }
         scheme => Err(PermanentError::UnsupportedScheme(scheme.to_string()).into()),
-    }
-}
-
-async fn resolve_final_url_and_client(
-    initial_url: Url,
-    args: &Args,
-    client_cache: &mut HashMap<String, Client>,
-) -> Result<(Client, Url, Option<u64>, Option<String>)> {
-    let mut current_url = initial_url;
-    let mut redirect_count = 0;
-
-    loop {
-        if redirect_count >= MAX_REDIRECTS {
-            return Err(PermanentError::TooManyRedirects(MAX_REDIRECTS).into());
-        }
-
-        validate_url(&current_url, args.insecure)?;
-
-        if args.verbose {
-            eprintln!("-> Requesting: {}", current_url);
-        }
-
-        // Determine how to connect (Proxy vs Direct)
-        // If Proxy: bypass manual resolution (and thus ignore -4/-6 and SSRF checks locally)
-        // We do not cache proxy clients in this simple implementation as the system proxy handles multiplexing
-        let client = if !args.no_proxy && (std::env::var("HTTP_PROXY").is_ok() || std::env::var("HTTPS_PROXY").is_ok()) {
-            build_client(args, None)?
-        } else {
-            // Direct mode: Manual DNS, IP Pinning, and IP Version enforcement
-            let host = current_url.host_str().ok_or_else(|| anyhow::anyhow!("No host in URL"))?;
-
-            // Try to reuse an existing client for this host to benefit from HTTP keep-alive
-            if let Some(cached_client) = client_cache.get(host) {
-                if args.verbose {
-                    eprintln!("   Reusing connection for {}", host);
-                }
-                cached_client.clone()
-            } else {
-                let safe_ip = resolve_safe_ip(&current_url, args).await?;
-
-                // Show connection info if not quiet
-                if !args.quiet {
-                    eprintln!("Connecting to {} ({})", host, safe_ip.ip());
-                }
-
-                let new_client = build_client(args, Some((host, safe_ip)))?;
-                client_cache.insert(host.to_string(), new_client.clone());
-                new_client
-            }
-        };
-
-        let mut request = client.head(current_url.clone());
-
-        if let Some(ref u) = args.user {
-            request = request.basic_auth(u, args.password.as_deref());
-        }
-
-        let mut response = request
-            .send()
-            .await
-            .context("Failed to send HEAD request")?;
-
-        if response.status() == StatusCode::METHOD_NOT_ALLOWED {
-            if args.debug {
-                eprintln!("[DEBUG] HEAD status: 405 Method Not Allowed. Retrying with GET...");
-            }
-
-            let mut get_request = client.get(current_url.clone());
-            if let Some(ref u) = args.user {
-                get_request = get_request.basic_auth(u, args.password.as_deref());
-            }
-            response = get_request
-                .send()
-                .await
-                .context("Failed to send GET request")?;
-        }
-
-        if args.debug {
-            eprintln!("[DEBUG] HTTP version: {:#?} {}", response.version(), response.status());
-            eprintln!("[DEBUG] All headers:");
-            // Sometimes Google CDN sends 'age: "0"' and no content-length or etag
-            for (name, value) in response.headers().iter() {
-                eprintln!("[DEBUG]   {}: {:?}", name, value);
-            }
-            if response.headers().contains_key("transfer-encoding") {
-                eprintln!("[DEBUG]   WARNING: Transfer-Encoding detected. Content-Length might be missing.");
-            }
-        }
-        let status = response.status();
-        let headers = response.headers().clone();
-
-        if status.is_redirection()
-            && let Some(location) = headers.get(LOCATION) {
-                let location_str = location.to_str().context("Invalid Location header")?;
-                let next_url = current_url.join(location_str).context("Failed to resolve redirect URL")?;
-
-                if args.verbose {
-                    eprintln!("   Redirecting to: {}", next_url);
-                }
-
-                current_url = next_url;
-                redirect_count += 1;
-                continue;
-            }
-
-        let content_length = headers.get(CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok());
-
-        let content_disposition = headers.get(CONTENT_DISPOSITION)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-
-        if status.is_success() || status.is_client_error() || status.is_server_error() {
-            return Ok((client, current_url, content_length, content_disposition));
-        }
-
-        bail!("Unexpected status code: {}", status);
     }
 }
 
@@ -1723,7 +1994,7 @@ async fn write_response_to_file<W: AsyncWrite + Unpin>(
 ) -> Result<u64> {
     let mut bytes_written: u64 = 0;
     let buf_capacity = if output_path_str == "-" { 64 * 1024 } else { BUFFER_SIZE };
-    let mut writer = BufWriter::with_capacity(buf_capacity, writer_dest);
+    let mut writer = TokBufWriter::with_capacity(buf_capacity, writer_dest);
 
     // Progress Bar Setup
     let pb = if args.quiet {
@@ -1924,131 +2195,6 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
-    }
-}
-
-async fn run_with_args(args: Args) -> Result<()> {
-    // Combine URLs from args and input file
-    let mut all_urls = args.urls.clone();
-
-    env_logger::init();
-    if let Some(ref input_path) = args.input_file {
-        let reader: Box<dyn BufRead> = if input_path == "-" {
-            Box::new(BufReader::new(std::io::stdin()))
-        } else {
-            let f = File::open(input_path).context("Failed to open input file")?;
-            Box::new(BufReader::new(f))
-        };
-
-        for line in reader.lines() {
-            let line = line?;
-            let trimmed = line.trim();
-            if !trimmed.is_empty() {
-                all_urls.push(trimmed.to_string());
-            }
-        }
-    }
-
-    // Deduplicate URLs automatically if --output is not specified
-    let urls: Vec<String> = if args.output.is_none() {
-        let mut seen = HashSet::new();
-        all_urls.iter().filter(|url| seen.insert(*url)).cloned().collect()
-    } else {
-        all_urls
-    };
-
-    if args.output.is_some() && urls.len() > 1 {
-        return Err(PermanentError::InvalidArguments("--output cannot be used with multiple URLs".to_string()).into())
-    }
-
-    if let Err(e) = apply_security_sandbox() {
-        eprintln!("Failed to apply seccomp filter: {}", e);
-        std::process::exit(1);
-    }
-
-    // Cache map to store Clients pinned to specific hosts/IPs for reuse
-    let mut client_cache: HashMap<String, Client> = HashMap::new();
-
-    let mut overall_success = true;
-    let max_retries = if args.retries == 0 { u64::MAX } else { args.retries };
-
-    for url_str in &urls {
-        let url = match Url::parse(url_str) {
-            Ok(u) => u,
-            Err(e) => {
-                eprintln!("Error parsing URL '{}': {}", url_str, e);
-                overall_success = false;
-                continue;
-            }
-        };
-
-        if !args.quiet {
-            eprintln!("Starting download: {}", url);
-        }
-
-        let mut attempt = 0;
-        loop {
-            // If we are retrying (attempt > 0), force resume logic to true
-            // so we don't restart the file from scratch if possible.
-            let mut current_args = args.clone();
-            if attempt > 0 {
-                current_args.resume = true;
-            }
-
-            // Pass the cache to be used/updated
-            let result = async {
-                match resolve_final_url_and_client(url.clone(), &current_args, &mut client_cache).await {
-                    Ok((client, final_url, content_length, content_disposition)) => {
-                        if current_args.verbose && final_url != url {
-                            eprintln!("Final URL: {}", final_url);
-                        }
-
-                        if let (Some(max), Some(size)) = (current_args.max_size, content_length)
-                            && size > max {
-                                return Err(PermanentError::FileSizeExceedsLimit { size, max, url: final_url.to_string() }.into())
-                            }
-                        download_file(&client, &final_url, &current_args, content_length, content_disposition.as_deref()).await
-                    }
-                    Err(e) => Err(e),
-                }
-            }.await;
-
-            match result {
-                Ok(()) => break, // Success
-                Err(e) => {
-                    // Don't retry permanent errors
-                    if is_permanent_error(&e) {
-                        eprintln!("Failed to download {}: {:#}", url, e);
-                        overall_success = false;
-                        break;
-                    }
-
-                    if attempt >= max_retries {
-                         eprintln!("Failed to download {}: {:#}", url, e);
-                         overall_success = false;
-                         break;
-                    }
-
-                    eprintln!("Error: {}. Retrying (attempt {}/{})...", e, attempt + 1, if args.retries == 0 { "\u{221e}".to_string() } else { args.retries.to_string() });
-                    attempt += 1;
-
-                    // Exponential backoff: 2^attempt (capped at 64s)
-                    let delay = 1u64 << attempt.clamp(0, 6);
-                    sleep(Duration::from_secs(delay)).await;
-                }
-            }
-        }
-
-        // Add a newline between downloads for better readability
-        if !args.quiet && urls.len() > 1 {
-            eprintln!();
-        }
-    }
-
-    if overall_success {
-        Ok(())
-    } else {
-        bail!("One or more downloads failed")
     }
 }
 

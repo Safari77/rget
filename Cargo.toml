@@ -48,9 +48,9 @@ sha3 = "0.10"
 # For base32 encoding of temp filenames
 data-encoding = "2"
 
-# For expanding ~ in paths
 dirs = "6"
-
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 nix = { version = "0", features = ["fs", "user"] } 
 
 [target.'cfg(target_os = "linux")'.dependencies]

@@ -31,6 +31,9 @@ fn make_args() -> Args {
         insecure_owner: false,
         tempnamelen: 16,
         filemode: None,
+        hsts_file: None,
+        cert: None,
+        key: None,
     }
 }
 
