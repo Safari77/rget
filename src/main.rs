@@ -489,27 +489,55 @@ fn is_ip_allowed(addr: &SocketAddr, args: &Args) -> bool {
 
 /// Resolve DNS manually to handle SSRF protection, DNS rebinding, and IP version enforcement
 async fn resolve_safe_ip(url: &Url, args: &Args) -> Result<SocketAddr> {
-    let host = url.host_str().ok_or_else(|| anyhow::anyhow!("URL has no host"))?;
     let port = url.port_or_known_default().unwrap_or(443);
 
-    // Perform DNS lookup
-    let addrs = tokio::net::lookup_host((host, port))
-        .await
-        .context("Failed to resolve hostname")?;
-
-    for addr in addrs {
-        if is_ip_allowed(&addr, args) {
-            return Ok(addr); // Return the first valid IP
+    // Helper to generate consistent error messages
+    let make_error = |host_str: &str| {
+        if args.ipv4_only {
+            PermanentError::NoSafeIpv4(host_str.to_string()).into()
+        } else if args.ipv6_only {
+            PermanentError::NoSafeIpv6(host_str.to_string()).into()
+        } else {
+            PermanentError::NoSafePublicIp(host_str.to_string()).into()
         }
-    }
+    };
 
-    // Build specific error messages for better UX
-    if args.ipv4_only {
-        Err(PermanentError::NoSafeIpv4(host.to_string()).into())
-    } else if args.ipv6_only {
-        Err(PermanentError::NoSafeIpv6(host.to_string()).into())
-    } else {
-       Err(PermanentError::NoSafePublicIp(host.to_string()).into())
+    match url.host() {
+        // 1. Handle Domain Names (DNS Lookup)
+        Some(url::Host::Domain(host_str)) => {
+            let addrs = tokio::net::lookup_host((host_str, port))
+                .await
+                .context("Failed to resolve hostname")?;
+
+            for addr in addrs {
+                if is_ip_allowed(&addr, args) {
+                    return Ok(addr);
+                }
+            }
+            Err(make_error(host_str))
+        }
+
+        // 2. Handle IPv4 Literals directly (No DNS)
+        Some(url::Host::Ipv4(addr)) => {
+            let sa = SocketAddr::new(std::net::IpAddr::V4(addr), port);
+            if is_ip_allowed(&sa, args) {
+                Ok(sa)
+            } else {
+                Err(make_error(&addr.to_string()))
+            }
+        }
+
+        // 3. Handle IPv6 Literals directly
+        Some(url::Host::Ipv6(addr)) => {
+            let sa = SocketAddr::new(std::net::IpAddr::V6(addr), port);
+            if is_ip_allowed(&sa, args) {
+                Ok(sa)
+            } else {
+                Err(make_error(&addr.to_string()))
+            }
+        }
+
+        None => Err(anyhow::anyhow!("URL has no host")),
     }
 }
 
@@ -1282,6 +1310,7 @@ fn is_permanent_error(err: &anyhow::Error) -> bool {
             | Some(libc::ELOOP)  // Too many levels of symbolic links
             | Some(libc::EEXIST) // With O_CREAT|O_EXCL|O_NOFOLLOW
             | Some(libc::ENAMETOOLONG)
+            | Some(libc::EISDIR)
         );
     }
 
