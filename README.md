@@ -25,7 +25,11 @@
 * **Progress Bar:** Beautiful, informative progress indicators via `indicatif`.
 
 ### **Setup**
+Unix:
 mkdir -p ~/.config/rget && uuidgen > ~/.config/rget/resumekey.conf
+
+Windows:
+$dir = "$env:APPDATA\rget"; New-Item -ItemType Directory -Force -Path $dir | Out-Null; $b=new-object byte[] 16; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b); [BitConverter]::ToString($b).Replace('-','').ToLower() | Set-Content -Path "$dir\resumekey.conf"
 
 ### **Notes**
 

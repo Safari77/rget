@@ -39,7 +39,7 @@ static GLOBAL: Jemalloc = Jemalloc;
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter};
+use std::io::{BufRead, BufReader, BufWriter, ErrorKind};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -210,9 +210,9 @@ const MAX_FILENAME_BYTES: usize = 255;
 /// - Windows: C:\Users\<User>\AppData\Roaming\rget\resumekey.conf
 const RESUME_KEY_FILENAME: &str = "resumekey.conf";
 
-/// Check if an io::Error is ENAMETOOLONG
+/// Check if io::Error is ENAMETOOLONG or equivalent
 fn is_name_too_long(err: &std::io::Error) -> bool {
-    err.raw_os_error() == Some(libc::ENAMETOOLONG)
+    err.kind() == std::io::ErrorKind::InvalidFilename
 }
 
 /// Apply safe open flags (O_NOFOLLOW | O_NOCTTY) on Unix
@@ -401,10 +401,9 @@ fn load_hsts_db(path: &Path) -> HstsMap {
             map.retain(|_, entry| entry.expiry > now);
             map
         }
-        Err(_) => {
-            // Silently fail on parse error (e.g., empty file or old format), return empty map
-            // You can uncomment the line below for debugging
-            // eprintln!("[DEBUG] HSTS JSON parse error: {}", e);
+        Err(e) => {
+            eprintln!("Warning: Failed to parse HSTS cache '{}', starting fresh. Error: {}",
+                path.display(), e);
             HashMap::new()
         }
     }
@@ -1352,10 +1351,10 @@ fn check_file_after_open(
     Ok(())
 }
 
-// Windows stub implementations - device checks are Unix-specific
+// Windows stub implementations
 #[cfg(not(unix))]
-fn check_path_before_open(_path: &Path) -> Result<bool> {
-    Ok(false) // Assume file doesn't exist, let open() figure it out
+fn check_path_before_open(path: &Path) -> Result<bool> {
+    Ok(path.exists())
 }
 
 #[cfg(not(unix))]
@@ -1445,7 +1444,10 @@ fn rename_noreplace(from: &Path, to: &Path, debug: bool) -> std::io::Result<()> 
         if to.exists() {
             return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
         }
-        std::fs::rename(from, to)
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "rename_noreplace failed: destination exists or hard linking not supported"
+        ));
     }
 
     #[cfg(all(unix, not(target_os = "linux"), not(target_os = "android")))]
@@ -1462,14 +1464,11 @@ fn rename_noreplace(from: &Path, to: &Path, debug: bool) -> std::io::Result<()> 
 
     #[cfg(windows)]
     {
-        if debug { eprintln!("[DEBUG] rename_noreplace: using hard_link fallback (windows)"); }
-        match std::fs::hard_link(from, to) {
-            Ok(()) => {
-                std::fs::remove_file(from)?;
-                Ok(())
-            }
-            Err(e) => Err(e),
+        if debug { eprintln!("[DEBUG] rename_noreplace: using rename fallback (windows)"); }
+        if to.exists() {
+            return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "Destination exists"));
         }
+        std::fs::rename(from, to)
     }
 }
 
@@ -1496,11 +1495,9 @@ fn perform_atomic_move(temp_path: &Path, target_path: &Path, args: &Args) -> Res
         Ok(_) => Ok(target_path.to_path_buf()),
 
         // Handle "File Exists" logic (from rename_noreplace OR fs::rename failure)
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists
-               || e.raw_os_error() == Some(libc::EEXIST) => {
-
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             if args.overwrite || args.resume {
-                // If we are here and overwrite/resume is TRUE, then this EEXIST is
+                // If we are here and overwrite/resume is TRUE, then this error is
                 // a hard error (e.g. destination is a directory, or permission denied),
                 // because fs::rename would normally have succeeded in replacing a file.
                 Err(e.into())
@@ -1528,8 +1525,7 @@ fn perform_atomic_move(temp_path: &Path, target_path: &Path, args: &Args) -> Res
             match try_move(temp_path, &truncated) {
                 Ok(_) => Ok(truncated),
                 // If the truncated filename also exists:
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists
-                       || e.raw_os_error() == Some(libc::EEXIST) => {
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     Err(PermanentError::TruncatedFilenameExists(truncated).into())
                 },
                 Err(e) => Err(e).context("Failed to rename to truncated path"),
@@ -1539,7 +1535,7 @@ fn perform_atomic_move(temp_path: &Path, target_path: &Path, args: &Args) -> Res
         // Handle TOCTOU race (File appeared during download) special error mapping.
         // This catches cases where the file didn't exist when we started, but does now.
         Err(e) if !args.overwrite && !args.resume
-            && (e.kind() == std::io::ErrorKind::AlreadyExists || e.raw_os_error() == Some(libc::EEXIST)) => {
+            && (e.kind() == std::io::ErrorKind::AlreadyExists) => {
              Err(PermanentError::FileAppearedDuringDownload(target_path.to_path_buf()).into())
         }
 
@@ -1563,25 +1559,25 @@ fn parse_content_range(header_value: &str) -> Option<u64> {
 
 /// Check if an error is permanent (should not be retried)
 fn is_permanent_error(err: &anyhow::Error) -> bool {
-    // Check for our explicit permanent errors
     if err.downcast_ref::<PermanentError>().is_some() {
         return true;
     }
 
-    // Check for IO errors with permanent causes
+    // Check for IO errors using portable ErrorKinds
     if let Some(io_err) = err.root_cause().downcast_ref::<std::io::Error>() {
         return matches!(
-            io_err.raw_os_error(),
-            Some(libc::EFBIG)    // File too large
-            | Some(libc::ENOSPC) // No space left on device
-            | Some(libc::EDQUOT) // Disk quota exceeded
-            | Some(libc::EROFS)  // Read-only filesystem
-            | Some(libc::EACCES) // Permission denied
-            | Some(libc::EPERM)  // Operation not permitted
-            | Some(libc::ELOOP)  // Too many levels of symbolic links
-            | Some(libc::EEXIST) // With O_CREAT|O_EXCL|O_NOFOLLOW
-            | Some(libc::ENAMETOOLONG)
-            | Some(libc::EISDIR)
+            io_err.kind(),
+              ErrorKind::InvalidInput
+            | ErrorKind::PermissionDenied
+            | ErrorKind::AlreadyExists
+         // | ErrorKind::FilesystemLoop
+            | ErrorKind::ReadOnlyFilesystem
+            | ErrorKind::FileTooLarge
+            | ErrorKind::NotSeekable
+            | ErrorKind::IsADirectory
+            | ErrorKind::StorageFull
+            | ErrorKind::BrokenPipe
+            | ErrorKind::QuotaExceeded // Rust 1.74
         );
     }
 
@@ -1834,7 +1830,7 @@ async fn download_file(
 /// - Uses O_EXCL (create_new) when starting fresh to prevent race conditions.
 /// - Uses mode defined by --filemode or umask (default) for security.
 /// - Handles resuming via Append mode.
-fn open_temp_file_safely(path: &Path, args: &Args, start_byte: u64, force_truncate: bool) -> std::io::Result<File> {
+fn open_temp_file_safely(path: &Path, _args: &Args, start_byte: u64, force_truncate: bool) -> std::io::Result<File> {
     // Case 1: Resuming an existing download
     if start_byte > 0 && !force_truncate {
         let mut opts = OpenOptions::new();
@@ -1851,7 +1847,7 @@ fn open_temp_file_safely(path: &Path, args: &Args, start_byte: u64, force_trunca
 
     apply_safe_flags(&mut opts);
     #[cfg(unix)]
-    apply_file_mode(&mut opts, args);
+    apply_file_mode(&mut opts, _args);
 
     match opts.open(path) {
         Ok(f) => Ok(f),
@@ -1863,7 +1859,7 @@ fn open_temp_file_safely(path: &Path, args: &Args, start_byte: u64, force_trunca
 
             apply_safe_flags(&mut opts);
             #[cfg(unix)]
-            apply_file_mode(&mut opts, args);
+            apply_file_mode(&mut opts, _args);
             opts.open(path)
         }
         Err(e) => Err(e),
@@ -1919,23 +1915,30 @@ async fn download_to_temp(
     };
     drop(async_file); // Close file handle before rename
 
-    let final_path = perform_atomic_move(&temp_path, output_path, args)?;
-    // -------------------------------
-
-    // Clear temp path since we successfully renamed
+    let move_result = perform_atomic_move(&temp_path, output_path, args);
     {
         let mut guard = CURRENT_TEMP_PATH.lock().unwrap();
         *guard = None;
     }
-
-    if !args.quiet {
-        eprintln!("Downloaded {} to {}", HumanBytes(bytes_written + actual_start_byte), final_path.display());
-        if bytes_written == 0 {
-            eprintln!("(No new data written)");
+    match move_result {
+        Ok(path) => {
+            // SUCCESS: Log the output and return the path
+            if !args.quiet {
+                eprintln!("Downloaded {} to {}", HumanBytes(bytes_written + actual_start_byte), path.display());
+                if bytes_written == 0 {
+                    eprintln!("(No new data written)");
+                }
+            }
+            Ok(path)
+        },
+        Err(e) => {
+            // FAILURE: Clean up the temp file (unless --keep-temp is set)
+            if !args.keep_temp && temp_path.exists() {
+                let _ = std::fs::remove_file(&temp_path);
+            }
+            Err(e)
         }
     }
-
-    Ok(final_path)
 }
 
 async fn download_direct(
