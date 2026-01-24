@@ -1700,16 +1700,16 @@ fn is_permanent_error(err: &anyhow::Error) -> bool {
         return matches!(
             io_err.kind(),
             ErrorKind::InvalidInput
-            | ErrorKind::PermissionDenied
-            | ErrorKind::AlreadyExists
-         // | ErrorKind::FilesystemLoop
-            | ErrorKind::ReadOnlyFilesystem
-            | ErrorKind::FileTooLarge
-            | ErrorKind::NotSeekable
-            | ErrorKind::IsADirectory
-            | ErrorKind::StorageFull
-            | ErrorKind::BrokenPipe
-            | ErrorKind::QuotaExceeded // Rust 1.74
+                | ErrorKind::PermissionDenied
+                | ErrorKind::AlreadyExists
+                // | ErrorKind::FilesystemLoop // https://github.com/rust-lang/rust/issues/86442
+                | ErrorKind::ReadOnlyFilesystem
+                | ErrorKind::FileTooLarge
+                | ErrorKind::NotSeekable
+                | ErrorKind::IsADirectory
+                | ErrorKind::StorageFull
+                | ErrorKind::BrokenPipe
+                | ErrorKind::QuotaExceeded // Rust 1.74
         );
     }
 

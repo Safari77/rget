@@ -1195,14 +1195,20 @@ fn test_permanent_error_filesystem_variants() {
         libc::EROFS,  // Read-only filesystem
         libc::EACCES, // Permission denied
         libc::EPERM,  // Operation not permitted
-        libc::ELOOP,  // Too many symbolic links
+        //libc::ELOOP,  // Too many symbolic links
         libc::EEXIST, // File exists (with O_EXCL)
     ];
 
     for code in permanent_codes {
         let io_err = std::io::Error::from_raw_os_error(code);
         let err = anyhow::Error::new(io_err);
-        assert!(is_permanent_error(&err), "Error code {} should be permanent", code);
+        assert!(
+            is_permanent_error(&err),
+            "Error code {} ({}) mapped to ErrorKind::{:?} was not classified as permanent",
+            code,
+            err,
+            std::io::Error::from_raw_os_error(code).kind()
+        );
     }
 }
 
