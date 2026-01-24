@@ -6,12 +6,11 @@
 //
 // Adapted for local use to fix RFC 6266 precedence issues.
 
-use std::collections::{BTreeMap, HashMap};
 use charset::Charset;
+use std::collections::{BTreeMap, HashMap};
 
 /// The possible disposition types in a Content-Disposition header.
-#[derive(Debug, Clone, PartialEq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum DispositionType {
     #[default]
     Inline,
@@ -19,7 +18,6 @@ pub enum DispositionType {
     FormData,
     Extension(String),
 }
-
 
 /// Convert the string represented disposition type to enum.
 fn parse_disposition_type(disposition: &str) -> DispositionType {
@@ -68,10 +66,7 @@ impl ParsedContentDisposition {
 pub fn parse_content_disposition(header: &str) -> ParsedContentDisposition {
     let params = parse_param_content(header);
     let disposition = parse_disposition_type(&params.value);
-    ParsedContentDisposition {
-        disposition,
-        params: params.params,
-    }
+    ParsedContentDisposition { disposition, params: params.params }
 }
 
 /// Used to store params for content-type and content-disposition
@@ -120,11 +115,8 @@ fn parse_param_content(content: &str) -> ParamContent {
         .collect();
 
     // Decode charset encoding, as described in RFC 2184, Section 4.
-    let decode_key_list: Vec<String> = map
-        .keys()
-        .filter_map(|k| k.strip_suffix('*'))
-        .map(String::from)
-        .collect();
+    let decode_key_list: Vec<String> =
+        map.keys().filter_map(|k| k.strip_suffix('*')).map(String::from).collect();
 
     let encodings = compute_parameter_encodings(&map, &decode_key_list);
 
@@ -144,11 +136,8 @@ fn parse_param_content(content: &str) -> ParamContent {
     }
 
     // Unwrap parameter value continuations, as described in RFC 2184, Section 3.
-    let unwrap_key_list: Vec<String> = map
-        .keys()
-        .filter_map(|k| k.strip_suffix("*0"))
-        .map(String::from)
-        .collect();
+    let unwrap_key_list: Vec<String> =
+        map.keys().filter_map(|k| k.strip_suffix("*0")).map(String::from).collect();
 
     for unwrap_key in unwrap_key_list {
         let mut unwrapped_value = String::new();
@@ -160,10 +149,7 @@ fn parse_param_content(content: &str) -> ParamContent {
         let _old_value = map.insert(unwrap_key, unwrapped_value);
     }
 
-    ParamContent {
-        value: value.into(),
-        params: map,
-    }
+    ParamContent { value: value.into(), params: map }
 }
 
 fn compute_parameter_encodings(
@@ -173,12 +159,8 @@ fn compute_parameter_encodings(
     let mut encodings: HashMap<String, (String, bool)> = HashMap::new();
     for decode_key in decode_key_list {
         if let Some(unwrap_key) = decode_key.strip_suffix("*0") {
-            let encoding = map
-                .get(&format!("{}*", decode_key))
-                .unwrap()
-                .split('\'')
-                .next()
-                .unwrap_or("");
+            let encoding =
+                map.get(&format!("{}*", decode_key)).unwrap().split('\'').next().unwrap_or("");
             let continuation_prefix = format!("{}*", unwrap_key);
             for continuation_key in decode_key_list {
                 if continuation_key.starts_with(&continuation_prefix) {
@@ -601,7 +583,8 @@ mod tests {
 
     #[test]
     fn test_multiple_parameters() {
-        let header = r#"attachment; filename="test.txt"; size=1234; creation-date="Thu, 01 Jan 2024""#;
+        let header =
+            r#"attachment; filename="test.txt"; size=1234; creation-date="Thu, 01 Jan 2024""#;
         let dis = parse_content_disposition(header);
         assert_eq!(dis.params.get("filename"), Some(&"test.txt".to_string()));
         assert_eq!(dis.params.get("size"), Some(&"1234".to_string()));
@@ -668,7 +651,8 @@ mod tests {
     #[test]
     fn test_parameter_continuation() {
         // RFC 2184 Section 3: parameter value continuations
-        let header = "attachment; filename*0=\"very\"; filename*1=\"long\"; filename*2=\"name.txt\"";
+        let header =
+            "attachment; filename*0=\"very\"; filename*1=\"long\"; filename*2=\"name.txt\"";
         let dis = parse_content_disposition(header);
         assert_eq!(dis.params.get("filename"), Some(&"verylongname.txt".to_string()));
     }
@@ -697,10 +681,7 @@ mod tests {
             " attachment; x=y; charset=\"fake\" ; x2=y2; name=\"King Joffrey.death\"",
         );
         assert_eq!(dis.disposition, DispositionType::Attachment);
-        assert_eq!(
-            dis.params.get("name"),
-            Some(&"King Joffrey.death".to_string())
-        );
+        assert_eq!(dis.params.get("name"), Some(&"King Joffrey.death".to_string()));
         assert_eq!(dis.params.get("filename"), None);
     }
 }

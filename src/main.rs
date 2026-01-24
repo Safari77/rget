@@ -39,26 +39,31 @@ static GLOBAL: Jemalloc = Jemalloc;
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
+use std::io::IsTerminal;
 use std::io::{BufRead, BufReader, BufWriter, ErrorKind};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use std::io::IsTerminal;
 
-use anyhow::{bail, Context, Result};
+use crate::content_disposition::{DispositionType, parse_content_disposition};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use clap::builder::TypedValueParser;
-use crate::content_disposition::{parse_content_disposition, DispositionType};
 use data_encoding::BASE32_NOPAD;
 use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
-use reqwest::header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, LOCATION, RANGE, STRICT_TRANSPORT_SECURITY};
+use reqwest::header::{
+    CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, LOCATION, RANGE, STRICT_TRANSPORT_SECURITY,
+};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-use reqwest::{Client, Response, StatusCode, Identity};
-use sha3::{Shake256, digest::{Update, ExtendableOutput, XofReader}};
-use tokio::time::{sleep, Instant};
+use reqwest::{Client, Identity, Response, StatusCode};
+use sha3::{
+    Shake256,
+    digest::{ExtendableOutput, Update, XofReader},
+};
 use tokio::io::{AsyncWrite, AsyncWriteExt, BufWriter as TokBufWriter};
+use tokio::time::{Instant, sleep};
 use tokio_stream::StreamExt;
 use url::Url;
 
@@ -97,7 +102,7 @@ pub enum PermanentError {
     RedirectOnGet { status: u16, location: String },
 
     // HTTP errors (4xx = permanent, 5xx = transient)
-    HttpClientError(u16),  // 4xx errors
+    HttpClientError(u16), // 4xx errors
 
     // TOCTOU: file appeared during download
     FileAppearedDuringDownload(PathBuf),
@@ -120,15 +125,23 @@ impl std::fmt::Display for PermanentError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::FileSizeExceedsLimit { size, max, url } => {
-                write!(f, "File size ({}) exceeds limit ({}) for {}",
-                    HumanBytes(*size), HumanBytes(*max), url)
+                write!(
+                    f,
+                    "File size ({}) exceeds limit ({}) for {}",
+                    HumanBytes(*size),
+                    HumanBytes(*max),
+                    url
+                )
             }
             Self::DownloadExceedsLimit { max } => {
                 write!(f, "Download exceeded maximum allowed size ({})", HumanBytes(*max))
             }
             Self::FileAlreadyExists(path) => {
-                write!(f, "File '{}' already exists. Use --continue to resume or --overwrite to replace.",
-                    path.display())
+                write!(
+                    f,
+                    "File '{}' already exists. Use --continue to resume or --overwrite to replace.",
+                    path.display()
+                )
             }
             Self::TruncatedFilenameExists(path) => {
                 write!(f, "Truncated filename '{}' already exists.", path.display())
@@ -155,21 +168,31 @@ impl std::fmt::Display for PermanentError {
                 write!(f, "Too many redirects (maximum: {})", max)
             }
             Self::ContentRangeMismatch { requested, received } => {
-                write!(f, "Content-Range mismatch: requested byte {}, server returned byte {}. Aborting to prevent file corruption.",
-                    requested, received)
+                write!(
+                    f,
+                    "Content-Range mismatch: requested byte {}, server returned byte {}. Aborting to prevent file corruption.",
+                    requested, received
+                )
             }
             Self::RedirectWithoutLocation(status) => {
                 write!(f, "Server returned redirect ({}) but no Location header", status)
             }
             Self::RedirectOnGet { status, location } => {
-                write!(f, "Server returned redirect on GET ({}). This may indicate HEAD/GET inconsistency. Redirect target: {}",
-                    status, location)
+                write!(
+                    f,
+                    "Server returned redirect on GET ({}). This may indicate HEAD/GET inconsistency. Redirect target: {}",
+                    status, location
+                )
             }
             Self::HttpClientError(status) => {
                 write!(f, "Download failed with HTTP status: {}", status)
             }
             Self::FileAppearedDuringDownload(path) => {
-                write!(f, "File '{}' appeared during download (TOCTOU race). Use --overwrite to replace.", path.display())
+                write!(
+                    f,
+                    "File '{}' appeared during download (TOCTOU race). Use --overwrite to replace.",
+                    path.display()
+                )
             }
             Self::InvalidArguments(msg) => {
                 write!(f, "{}", msg)
@@ -181,8 +204,13 @@ impl std::fmt::Display for PermanentError {
                 write!(f, "Refusing to write to character device: '{}'", path.display())
             }
             Self::FileOwnerMismatch { path, expected_uid, actual_uid } => {
-                write!(f, "File '{}' owner mismatch: expected UID {}, got UID {}. Use --insecure-owner to allow.",
-                    path.display(), expected_uid, actual_uid)
+                write!(
+                    f,
+                    "File '{}' owner mismatch: expected UID {}, got UID {}. Use --insecure-owner to allow.",
+                    path.display(),
+                    expected_uid,
+                    actual_uid
+                )
             }
             Self::ClientCertError(msg) => {
                 write!(f, "Client certificate/key error: {}", msg)
@@ -229,9 +257,10 @@ fn apply_safe_flags(_opts: &mut OpenOptions) {}
 fn apply_file_mode(opts: &mut OpenOptions, args: &Args) {
     use std::os::unix::fs::OpenOptionsExt;
     if let Some(ref mode_str) = args.filemode
-        && let Ok(mode) = u32::from_str_radix(mode_str, 8) {
-            opts.mode(mode);
-        }
+        && let Ok(mode) = u32::from_str_radix(mode_str, 8)
+    {
+        opts.mode(mode);
+    }
 }
 
 /// HSTS database filename
@@ -239,8 +268,12 @@ const HSTS_DB_FILENAME: &str = "hsts.json";
 
 const VERSION_MESSAGE: &str = concat!(
     env!("CARGO_PKG_VERSION"),
-    "\nLicense: ", env!("CARGO_PKG_LICENSE"),
-    "\nCopyright ", env!("BUILD_YEAR"), " ", env!("CARGO_PKG_AUTHORS"),
+    "\nLicense: ",
+    env!("CARGO_PKG_LICENSE"),
+    "\nCopyright ",
+    env!("BUILD_YEAR"),
+    " ",
+    env!("CARGO_PKG_AUTHORS"),
 );
 
 /// Secure file downloader - works like wget
@@ -264,11 +297,21 @@ struct Args {
     no_proxy: bool,
 
     /// Resolve name to IPv4 address
-    #[arg(short = '4', long = "ipv4", conflicts_with = "ipv6_only", help = "Connect only to IPv4 addresses")]
+    #[arg(
+        short = '4',
+        long = "ipv4",
+        conflicts_with = "ipv6_only",
+        help = "Connect only to IPv4 addresses"
+    )]
     ipv4_only: bool,
 
     /// Resolve name to IPv6 address
-    #[arg(short = '6', long = "ipv6", conflicts_with = "ipv4_only", help = "Connect only to IPv6 addresses")]
+    #[arg(
+        short = '6',
+        long = "ipv6",
+        conflicts_with = "ipv4_only",
+        help = "Connect only to IPv6 addresses"
+    )]
     ipv6_only: bool,
 
     /// Overwrite existing file without prompting
@@ -276,7 +319,10 @@ struct Args {
     overwrite: bool,
 
     /// Write to a temporary file first, then atomically rename
-    #[arg(long = "temp", help = "Use atomic write via temporary file (supports resuming with --continue, see resumekey.conf)")]
+    #[arg(
+        long = "temp",
+        help = "Use atomic write via temporary file (supports resuming with --continue, see resumekey.conf)"
+    )]
     temp: bool,
 
     /// Length of the random characters in temporary filename
@@ -368,7 +414,10 @@ struct Args {
     key: Option<String>,
 
     /// HSTS cache file path
-    #[arg(long = "hsts-file", help = "Path to HSTS cache file (default: ~/.config/rget/hsts.conf)")]
+    #[arg(
+        long = "hsts-file",
+        help = "Path to HSTS cache file (default: ~/.config/rget/hsts.conf)"
+    )]
     hsts_file: Option<String>,
 }
 
@@ -402,8 +451,11 @@ fn load_hsts_db(path: &Path) -> HstsMap {
             map
         }
         Err(e) => {
-            eprintln!("Warning: Failed to parse HSTS cache '{}', starting fresh. Error: {}",
-                path.display(), e);
+            eprintln!(
+                "Warning: Failed to parse HSTS cache '{}', starting fresh. Error: {}",
+                path.display(),
+                e
+            );
             HashMap::new()
         }
     }
@@ -412,9 +464,10 @@ fn load_hsts_db(path: &Path) -> HstsMap {
 fn save_hsts_db(path: &Path, map: &HstsMap) {
     // Attempt to create parent directories
     if let Some(parent) = path.parent()
-        && let Err(e) = fs::create_dir_all(parent) {
-             eprintln!("Warning: Failed to create HSTS config directory '{}': {}", parent.display(), e);
-        }
+        && let Err(e) = fs::create_dir_all(parent)
+    {
+        eprintln!("Warning: Failed to create HSTS config directory '{}': {}", parent.display(), e);
+    }
 
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
 
@@ -442,8 +495,10 @@ fn check_hsts(map: &HstsMap, host: &str) -> bool {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
 
     // Check exact match
-    if let Some(entry) = map.get(host) && entry.expiry > now {
-            return true;
+    if let Some(entry) = map.get(host)
+        && entry.expiry > now
+    {
+        return true;
     }
 
     // Check superdomains if they have includeSubDomains set
@@ -452,9 +507,11 @@ fn check_hsts(map: &HstsMap, host: &str) -> bool {
         parts.remove(0); // Remove subdomain
         let superdomain = parts.join(".");
         if let Some(entry) = map.get(&superdomain)
-             && entry.include_subdomains && entry.expiry > now {
-                 return true;
-             }
+            && entry.include_subdomains
+            && entry.expiry > now
+        {
+            return true;
+        }
     }
 
     false
@@ -462,39 +519,40 @@ fn check_hsts(map: &HstsMap, host: &str) -> bool {
 
 fn update_hsts(map: &mut HstsMap, url: &Url, headers: &HeaderMap, debug: bool) {
     if let Some(hsts_val) = headers.get(STRICT_TRANSPORT_SECURITY)
-        && let Ok(hsts_str) = hsts_val.to_str() {
-            let mut max_age = None;
-            let mut include_subdomains = false;
+        && let Ok(hsts_str) = hsts_val.to_str()
+    {
+        let mut max_age = None;
+        let mut include_subdomains = false;
 
-            for part in hsts_str.split(';') {
-                let part = part.trim();
-                if part.eq_ignore_ascii_case("includeSubDomains") {
-                    include_subdomains = true;
-                } else if part.to_lowercase().starts_with("max-age=")
-                    && let Ok(age) = part["max-age=".len()..].trim().parse::<u64>() {
-                        max_age = Some(age);
-                    }
+        for part in hsts_str.split(';') {
+            let part = part.trim();
+            if part.eq_ignore_ascii_case("includeSubDomains") {
+                include_subdomains = true;
+            } else if part.to_lowercase().starts_with("max-age=")
+                && let Ok(age) = part["max-age=".len()..].trim().parse::<u64>()
+            {
+                max_age = Some(age);
             }
+        }
 
-            if let Some(age) = max_age {
-                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-                let expiry = now + age;
-                if let Some(host) = url.host_str() {
-                     map.insert(host.to_string(), HstsEntry { expiry, include_subdomains });
+        if let Some(age) = max_age {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            let expiry = now + age;
+            if let Some(host) = url.host_str() {
+                map.insert(host.to_string(), HstsEntry { expiry, include_subdomains });
 
-                     if debug {
-                         eprintln!("[DEBUG] HSTS: Added/Updated entry for '{}' (max-age={}, includeSubDomains={})",
-                            host, age, include_subdomains);
-                     }
+                if debug {
+                    eprintln!(
+                        "[DEBUG] HSTS: Added/Updated entry for '{}' (max-age={}, includeSubDomains={})",
+                        host, age, include_subdomains
+                    );
                 }
             }
         }
+    }
 }
 
-fn build_client(
-    args: &Args,
-    resolve_override: Option<(&str, SocketAddr)>
-) -> Result<Client> {
+fn build_client(args: &Args, resolve_override: Option<(&str, SocketAddr)>) -> Result<Client> {
     let mut builder = Client::builder()
         .redirect(reqwest::redirect::Policy::none()) // Manual redirects
         .user_agent(args.user_agent.as_deref().unwrap_or(concat!(env!("CARGO_PKG_NAME"), "/1.0")))
@@ -510,9 +568,7 @@ fn build_client(
 
     // Handle Security
     if args.insecure {
-        builder = builder
-            .danger_accept_invalid_certs(true)
-            .danger_accept_invalid_hostnames(true);
+        builder = builder.danger_accept_invalid_certs(true).danger_accept_invalid_hostnames(true);
     } else {
         builder = builder.use_rustls_tls();
     }
@@ -524,13 +580,19 @@ fn build_client(
             eprintln!("[DEBUG] Loading private key: {}", key_path);
         }
 
-        let cert_pem = fs::read(cert_path).map_err(|e|
-            PermanentError::ClientCertError(format!("Failed to read certificate file '{}': {}", cert_path, e))
-        )?;
+        let cert_pem = fs::read(cert_path).map_err(|e| {
+            PermanentError::ClientCertError(format!(
+                "Failed to read certificate file '{}': {}",
+                cert_path, e
+            ))
+        })?;
 
-        let key_pem = fs::read(key_path).map_err(|e|
-            PermanentError::ClientCertError(format!("Failed to read key file '{}': {}", key_path, e))
-        )?;
+        let key_pem = fs::read(key_path).map_err(|e| {
+            PermanentError::ClientCertError(format!(
+                "Failed to read key file '{}': {}",
+                key_path, e
+            ))
+        })?;
 
         // Combine cert and key for reqwest/rustls identity
         let mut combined_pem = cert_pem;
@@ -554,7 +616,9 @@ fn build_client(
     }
     for h in &args.header {
         if let Some((k, v)) = h.split_once(':') {
-            if let (Ok(k_name), Ok(v_val)) = (HeaderName::from_bytes(k.trim().as_bytes()), HeaderValue::from_str(v.trim())) {
+            if let (Ok(k_name), Ok(v_val)) =
+                (HeaderName::from_bytes(k.trim().as_bytes()), HeaderValue::from_str(v.trim()))
+            {
                 headers.insert(k_name, v_val);
             } else {
                 eprintln!("Warning: Invalid header ignored: {}", h);
@@ -588,12 +652,13 @@ async fn resolve_final_url_and_client(
         // HSTS Upgrade Check
         if current_url.scheme() == "http"
             && let Some(host) = current_url.host_str()
-                && check_hsts(hsts_db, host) {
-                    if args.verbose {
-                        eprintln!("HSTS: Upgrading insecure request to {}", host);
-                    }
-                    let _ = current_url.set_scheme("https");
-                }
+            && check_hsts(hsts_db, host)
+        {
+            if args.verbose {
+                eprintln!("HSTS: Upgrading insecure request to {}", host);
+            }
+            let _ = current_url.set_scheme("https");
+        }
         if redirect_count >= MAX_REDIRECTS {
             return Err(PermanentError::TooManyRedirects(MAX_REDIRECTS).into());
         }
@@ -604,8 +669,10 @@ async fn resolve_final_url_and_client(
             eprintln!("-> Requesting: {}", current_url);
         }
 
-        let client = if !args.no_proxy && (std::env::var("HTTP_PROXY").is_ok() || std::env::var("HTTPS_PROXY").is_ok()) {
-             build_client(args, None)?
+        let client = if !args.no_proxy
+            && (std::env::var("HTTP_PROXY").is_ok() || std::env::var("HTTPS_PROXY").is_ok())
+        {
+            build_client(args, None)?
         } else {
             let host = current_url.host_str().ok_or_else(|| anyhow::anyhow!("No host in URL"))?;
 
@@ -614,32 +681,36 @@ async fn resolve_final_url_and_client(
             let cache_key = format!("{}:{}", host, port);
 
             if let Some(cached_client) = client_cache.get(&cache_key) {
-                 if args.verbose { eprintln!("   Reusing connection for {}", host); }
-                 cached_client.clone()
+                if args.verbose {
+                    eprintln!("   Reusing connection for {}", host);
+                }
+                cached_client.clone()
             } else {
-                 let safe_ip = resolve_safe_ip(&current_url, args).await?;
-                 if !args.quiet { eprintln!("Connecting to {} ({})", host, safe_ip.ip()); }
-                 let new_client = build_client(args, Some((host, safe_ip)))?;
-                 client_cache.insert(cache_key, new_client.clone());
-                 new_client
+                let safe_ip = resolve_safe_ip(&current_url, args).await?;
+                if !args.quiet {
+                    eprintln!("Connecting to {} ({})", host, safe_ip.ip());
+                }
+                let new_client = build_client(args, Some((host, safe_ip)))?;
+                client_cache.insert(cache_key, new_client.clone());
+                new_client
             }
         };
 
         let mut request = client.head(current_url.clone());
         if let Some(ref u) = args.user {
-             request = request.basic_auth(u, args.password.as_deref());
+            request = request.basic_auth(u, args.password.as_deref());
         }
 
         let mut response = request.send().await.context("Failed to send HEAD request")?;
         if response.status() == StatusCode::METHOD_NOT_ALLOWED {
-             if args.debug {
+            if args.debug {
                 eprintln!("[DEBUG] HEAD status: 405 Method Not Allowed. Retrying with GET...");
-             }
-             let mut get_request = client.get(current_url.clone());
-             if let Some(ref u) = args.user {
+            }
+            let mut get_request = client.get(current_url.clone());
+            if let Some(ref u) = args.user {
                 get_request = get_request.basic_auth(u, args.password.as_deref());
-             }
-             response = get_request.send().await.context("Failed to send GET request")?;
+            }
+            response = get_request.send().await.context("Failed to send GET request")?;
         }
 
         update_hsts(hsts_db, &current_url, response.headers(), args.debug);
@@ -652,32 +723,39 @@ async fn resolve_final_url_and_client(
                 eprintln!("[DEBUG]   {}: {:?}", name, value);
             }
             if response.headers().contains_key("transfer-encoding") {
-                eprintln!("[DEBUG]   WARNING: Transfer-Encoding detected. Content-Length might be missing.");
+                eprintln!(
+                    "[DEBUG]   WARNING: Transfer-Encoding detected. Content-Length might be missing."
+                );
             }
         }
 
         let status = response.status();
         let headers = response.headers().clone();
 
-        if status.is_redirection() && let Some(location) = headers.get(LOCATION) {
-             let location_str = location.to_str().context("Invalid Location header")?;
-             let next_url = current_url.join(location_str).context("Failed to resolve redirect URL")?;
-             if args.verbose { eprintln!("   Redirecting to: {}", next_url); }
-             current_url = next_url;
-             redirect_count += 1;
-             continue;
+        if status.is_redirection()
+            && let Some(location) = headers.get(LOCATION)
+        {
+            let location_str = location.to_str().context("Invalid Location header")?;
+            let next_url =
+                current_url.join(location_str).context("Failed to resolve redirect URL")?;
+            if args.verbose {
+                eprintln!("   Redirecting to: {}", next_url);
+            }
+            current_url = next_url;
+            redirect_count += 1;
+            continue;
         }
 
-        let content_length = headers.get(CONTENT_LENGTH)
-             .and_then(|v| v.to_str().ok())
-             .and_then(|s| s.parse::<u64>().ok());
+        let content_length = headers
+            .get(CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
 
-        let content_disposition = headers.get(CONTENT_DISPOSITION)
-             .and_then(|v| v.to_str().ok())
-             .map(|s| s.to_string());
+        let content_disposition =
+            headers.get(CONTENT_DISPOSITION).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
 
         if status.is_success() || status.is_client_error() || status.is_server_error() {
-             return Ok((client, current_url, content_length, content_disposition));
+            return Ok((client, current_url, content_length, content_disposition));
         }
 
         bail!("Unexpected status code: {}", status);
@@ -714,7 +792,10 @@ async fn run_with_args(args: Args) -> Result<()> {
     };
 
     if args.output.is_some() && urls.len() > 1 {
-        return Err(PermanentError::InvalidArguments("--output cannot be used with multiple URLs".to_string()).into())
+        return Err(PermanentError::InvalidArguments(
+            "--output cannot be used with multiple URLs".to_string(),
+        )
+        .into());
     }
 
     if let Err(e) = apply_security_sandbox() {
@@ -723,11 +804,8 @@ async fn run_with_args(args: Args) -> Result<()> {
     }
 
     // Load HSTS Database
-    let hsts_path = if let Some(p) = &args.hsts_file {
-        PathBuf::from(p)
-    } else {
-        get_default_hsts_path()
-    };
+    let hsts_path =
+        if let Some(p) = &args.hsts_file { PathBuf::from(p) } else { get_default_hsts_path() };
     let mut hsts_db = load_hsts_db(&hsts_path);
 
     let mut client_cache: HashMap<String, Client> = HashMap::new();
@@ -738,51 +816,85 @@ async fn run_with_args(args: Args) -> Result<()> {
         let url = match Url::parse(url_str) {
             Ok(u) => u,
             Err(e) => {
-                 eprintln!("Error parsing URL '{}': {}", url_str, e);
-                 overall_success = false;
-                 continue;
+                eprintln!("Error parsing URL '{}': {}", url_str, e);
+                overall_success = false;
+                continue;
             }
         };
 
-        if !args.quiet { eprintln!("Starting download: {}", url); }
+        if !args.quiet {
+            eprintln!("Starting download: {}", url);
+        }
 
         let mut attempt = 0;
         loop {
             let mut current_args = args.clone();
-            if attempt > 0 { current_args.resume = true; }
+            if attempt > 0 {
+                current_args.resume = true;
+            }
 
             // Pass the cache to be used/updated
             let result = async {
-                match resolve_final_url_and_client(url.clone(), &current_args, &mut client_cache, &mut hsts_db).await {
+                match resolve_final_url_and_client(
+                    url.clone(),
+                    &current_args,
+                    &mut client_cache,
+                    &mut hsts_db,
+                )
+                .await
+                {
                     Ok((client, final_url, content_length, content_disposition)) => {
                         if current_args.verbose && final_url != url {
                             eprintln!("Final URL: {}", final_url);
                         }
 
                         if let (Some(max), Some(size)) = (current_args.max_size, content_length)
-                            && size > max {
-                                return Err(PermanentError::FileSizeExceedsLimit { size, max, url: final_url.to_string() }.into())
+                            && size > max
+                        {
+                            return Err(PermanentError::FileSizeExceedsLimit {
+                                size,
+                                max,
+                                url: final_url.to_string(),
                             }
-                        download_file(&client, &final_url, &current_args, content_length, content_disposition.as_deref()).await
+                            .into());
+                        }
+                        download_file(
+                            &client,
+                            &final_url,
+                            &current_args,
+                            content_length,
+                            content_disposition.as_deref(),
+                        )
+                        .await
                     }
                     Err(e) => Err(e),
                 }
-            }.await;
+            }
+            .await;
 
             match result {
                 Ok(()) => break,
                 Err(e) => {
                     if is_permanent_error(&e) {
-                         eprintln!("Failed to download {}: {:#}", url, e);
-                         overall_success = false;
-                         break;
+                        eprintln!("Failed to download {}: {:#}", url, e);
+                        overall_success = false;
+                        break;
                     }
                     if attempt >= max_retries {
-                         eprintln!("Failed to download {}: {:#}", url, e);
-                         overall_success = false;
-                         break;
+                        eprintln!("Failed to download {}: {:#}", url, e);
+                        overall_success = false;
+                        break;
                     }
-                    eprintln!("Error: {}. Retrying (attempt {}/{})...", e, attempt + 1, if args.retries == 0 { "\u{221e}".to_string() } else { args.retries.to_string() });
+                    eprintln!(
+                        "Error: {}. Retrying (attempt {}/{})...",
+                        e,
+                        attempt + 1,
+                        if args.retries == 0 {
+                            "\u{221e}".to_string()
+                        } else {
+                            args.retries.to_string()
+                        }
+                    );
                     attempt += 1;
 
                     // Exponential backoff: 2^attempt (capped at 64s)
@@ -791,7 +903,9 @@ async fn run_with_args(args: Args) -> Result<()> {
                 }
             }
         }
-        if !args.quiet && urls.len() > 1 { eprintln!(); }
+        if !args.quiet && urls.len() > 1 {
+            eprintln!();
+        }
     }
 
     save_hsts_db(&hsts_path, &hsts_db);
@@ -970,21 +1084,13 @@ async fn resolve_safe_ip(url: &Url, args: &Args) -> Result<SocketAddr> {
         // 2. Handle IPv4 Literals directly (No DNS)
         Some(url::Host::Ipv4(addr)) => {
             let sa = SocketAddr::new(std::net::IpAddr::V4(addr), port);
-            if is_ip_allowed(&sa, args) {
-                Ok(sa)
-            } else {
-                Err(make_error(&addr.to_string()))
-            }
+            if is_ip_allowed(&sa, args) { Ok(sa) } else { Err(make_error(&addr.to_string())) }
         }
 
         // 3. Handle IPv6 Literals directly
         Some(url::Host::Ipv6(addr)) => {
             let sa = SocketAddr::new(std::net::IpAddr::V6(addr), port);
-            if is_ip_allowed(&sa, args) {
-                Ok(sa)
-            } else {
-                Err(make_error(&addr.to_string()))
-            }
+            if is_ip_allowed(&sa, args) { Ok(sa) } else { Err(make_error(&addr.to_string())) }
         }
 
         None => Err(anyhow::anyhow!("URL has no host")),
@@ -1011,9 +1117,9 @@ fn parse_content_disposition_header(header_value: &str) -> Option<String> {
         let parts: Vec<&str> = raw_ext.split('\'').collect();
         // The last part contains the encoded text (UTF-8''%E2%9C%93.txt -> %E2%9C%93.txt)
         if let Some(encoded) = parts.last() {
-             // CALL THE HELPER HERE
-             let decoded = percent_decode_str(encoded);
-             return Some(sanitize_filename(&decoded));
+            // CALL THE HELPER HERE
+            let decoded = percent_decode_str(encoded);
+            return Some(sanitize_filename(&decoded));
         }
     }
 
@@ -1071,10 +1177,7 @@ fn percent_decode_str(input: &str) -> String {
 
 fn sanitize_filename(filename: &str) -> String {
     // 1. Manually handle both / and \ as separators for cross-platform robustness
-    let filename = filename
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(filename);
+    let filename = filename.rsplit(['/', '\\']).next().unwrap_or(filename);
 
     // 2. Basic Character Sanitization
     let mut sanitized: String = filename
@@ -1094,24 +1197,19 @@ fn sanitize_filename(filename: &str) -> String {
     {
         use std::path::Path;
 
-        let stem = Path::new(&sanitized)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_uppercase();
+        let stem =
+            Path::new(&sanitized).file_stem().and_then(|s| s.to_str()).unwrap_or("").to_uppercase();
 
         let reserved_names = [
-            "CON", "PRN", "AUX", "NUL",
-            "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "COM0",
-            "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", "LPT0",
+            "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+            "COM8", "COM9", "COM0", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8",
+            "LPT9", "LPT0",
         ];
 
         if reserved_names.contains(&stem.as_str()) {
             // Replace ONLY the reserved word with '_', preserving extension
-            let extension = Path::new(&sanitized)
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("");
+            let extension =
+                Path::new(&sanitized).extension().and_then(|e| e.to_str()).unwrap_or("");
 
             if !extension.is_empty() {
                 sanitized = format!("_.{}", extension);
@@ -1121,21 +1219,14 @@ fn sanitize_filename(filename: &str) -> String {
         }
     }
 
-    if sanitized.is_empty() {
-        "download".to_string()
-    } else {
-        sanitized
-    }
+    if sanitized.is_empty() { "download".to_string() } else { sanitized }
 }
 
 fn filename_from_url(url: &Url) -> String {
     let path = url.path();
     let decoded_path = percent_decode_str(path);
-    let filename = decoded_path
-        .rsplit('/')
-        .next()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("index.html");
+    let filename =
+        decoded_path.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or("index.html");
     let filename = filename.split('?').next().unwrap_or(filename);
     let filename = filename.split('#').next().unwrap_or(filename);
     sanitize_filename(filename)
@@ -1149,8 +1240,8 @@ fn filename_from_url(url: &Url) -> String {
 /// - macOS: ~/Library/Application Support/rget/resumekey.conf
 /// - Windows: C:\Users\<User>\AppData\Roaming\rget\resumekey.conf
 fn read_personalization_key() -> String {
-    let config_path = dirs::config_dir()
-        .map(|d| d.join(env!("CARGO_PKG_NAME")).join(RESUME_KEY_FILENAME));
+    let config_path =
+        dirs::config_dir().map(|d| d.join(env!("CARGO_PKG_NAME")).join(RESUME_KEY_FILENAME));
 
     let Some(path) = config_path else {
         return DEFAULT_PERSONALIZATION.to_string();
@@ -1192,7 +1283,11 @@ fn generate_deterministic_temp_filename(
 
     if debug {
         eprintln!("[DEBUG] SHAKE256 inputs for temp filename:");
-        eprintln!("[DEBUG]   [domain separation]: {:?} {:?}", env!("CARGO_PKG_NAME"), domain_version);
+        eprintln!(
+            "[DEBUG]   [domain separation]: {:?} {:?}",
+            env!("CARGO_PKG_NAME"),
+            domain_version
+        );
         eprintln!("[DEBUG]   personalization_key: {:?}", personalization_key);
         eprintln!("[DEBUG]   target length: {}", temp_name_len);
         eprintln!("[DEBUG]   url: {:?}", url.as_str());
@@ -1221,16 +1316,16 @@ fn generate_deterministic_temp_filename(
     let encoded = BASE32_NOPAD.encode(&output).to_lowercase();
     // Truncate to the exact requested length
     // (since byte alignment might produce slightly more chars than requested)
-    let final_hash = if encoded.len() > temp_name_len {
-        &encoded[..temp_name_len]
-    } else {
-        &encoded
-    };
+    let final_hash =
+        if encoded.len() > temp_name_len { &encoded[..temp_name_len] } else { &encoded };
 
     let filename = format!(".{}.{}.tmp", final_hash, env!("CARGO_PKG_NAME"));
 
     if debug {
-        eprintln!("[DEBUG]   output hash (hex): {}", output.iter().map(|b| format!("{:02x}", b)).collect::<String>());
+        eprintln!(
+            "[DEBUG]   output hash (hex): {}",
+            output.iter().map(|b| format!("{:02x}", b)).collect::<String>()
+        );
         eprintln!("[DEBUG]   temp filename: {}", filename);
     }
 
@@ -1241,7 +1336,9 @@ fn validate_url(url: &Url, insecure: bool) -> Result<()> {
     match url.scheme() {
         "https" => Ok(()),
         "http" => {
-            if insecure { Ok(()) } else {
+            if insecure {
+                Ok(())
+            } else {
                 Err(PermanentError::InsecureUrl(url.to_string()).into())
             }
         }
@@ -1251,17 +1348,24 @@ fn validate_url(url: &Url, insecure: bool) -> Result<()> {
 
 fn determine_filename(args: &Args, url: &Url, content_disposition: Option<&str>) -> String {
     if let Some(ref output) = args.output {
-        if args.debug { eprintln!("[DEBUG] Filename source: --output argument"); }
+        if args.debug {
+            eprintln!("[DEBUG] Filename source: --output argument");
+        }
         return output.clone();
     }
     if let Some(cd) = content_disposition
-        && let Some(filename) = parse_content_disposition_header(cd) {
-            if args.debug { eprintln!("[DEBUG] Filename source: Content-Disposition ('{}')", filename); }
-            return filename;
+        && let Some(filename) = parse_content_disposition_header(cd)
+    {
+        if args.debug {
+            eprintln!("[DEBUG] Filename source: Content-Disposition ('{}')", filename);
         }
+        return filename;
+    }
 
     let url_name = filename_from_url(url);
-    if args.debug { eprintln!("[DEBUG] Filename source: URL path ('{}')", url_name); }
+    if args.debug {
+        eprintln!("[DEBUG] Filename source: URL path ('{}')", url_name);
+    }
     url_name
 }
 
@@ -1344,7 +1448,8 @@ fn check_file_after_open(
                 path: path.to_path_buf(),
                 expected_uid: process_uid,
                 actual_uid: file_uid,
-            }.into());
+            }
+            .into());
         }
     }
 
@@ -1367,7 +1472,12 @@ fn check_file_after_open(
     Ok(())
 }
 
-fn open_file_safely(path: &Path, args: &Args, start_byte: u64, force_truncate: bool) -> Result<File> {
+fn open_file_safely(
+    path: &Path,
+    args: &Args,
+    start_byte: u64,
+    force_truncate: bool,
+) -> Result<File> {
     // Pre-open check: stat() to reject block/char devices AND determine if file exists
     let file_existed = check_path_before_open(path)?;
     let is_append = start_byte > 0;
@@ -1409,23 +1519,28 @@ fn rename_noreplace(from: &Path, to: &Path, debug: bool) -> std::io::Result<()> 
         // renameat2 is not available in nix on Android, so we skip this step there.
         #[cfg(target_os = "linux")]
         {
-            use nix::fcntl::{renameat2, RenameFlags};
+            use nix::fcntl::{RenameFlags, renameat2};
             use std::os::fd::BorrowedFd;
             let cwd = unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) };
 
             // Passing 'None' for dirfd is equivalent to AT_FDCWD
             match renameat2(cwd, from, cwd, to, RenameFlags::RENAME_NOREPLACE) {
                 Ok(_) => {
-                    if debug { eprintln!("[DEBUG] renameat2 succeeded"); }
+                    if debug {
+                        eprintln!("[DEBUG] renameat2 succeeded");
+                    }
                     return Ok(());
-                },
+                }
                 Err(e) => {
                     if debug {
-                        eprintln!("[DEBUG] renameat2 failed: {} (errno: {}). Checking fallback...", e, e as i32);
+                        eprintln!(
+                            "[DEBUG] renameat2 failed: {} (errno: {}). Checking fallback...",
+                            e, e as i32
+                        );
                     }
                     // If the OS explicitly says "File Exists", respect it immediately.
                     if e == nix::errno::Errno::EEXIST {
-                         return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
+                        return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
                     }
                 }
             }
@@ -1433,26 +1548,32 @@ fn rename_noreplace(from: &Path, to: &Path, debug: bool) -> std::io::Result<()> 
 
         // 2. Fallback: Hard Link + Unlink (POSIX atomic standard)
         // This fails on Android /sdcard (FAT/Emulated)
-        if debug { eprintln!("[DEBUG] Attempting fallback: hard link + unlink"); }
+        if debug {
+            eprintln!("[DEBUG] Attempting fallback: hard link + unlink");
+        }
         if std::fs::hard_link(from, to).is_ok() {
             let _ = std::fs::remove_file(from);
             return Ok(());
         }
 
         // 3. Last Resort
-        if debug { eprintln!("[DEBUG] Attempting last resort: rename (if dst missing)"); }
+        if debug {
+            eprintln!("[DEBUG] Attempting last resort: rename (if dst missing)");
+        }
         if to.exists() {
             return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
         }
-        return Err(std::io::Error::new(
+        Err(std::io::Error::new(
             std::io::ErrorKind::Other,
-            "rename_noreplace failed: destination exists or hard linking not supported"
-        ));
+            "rename_noreplace failed: destination exists or hard linking not supported",
+        ))
     }
 
     #[cfg(all(unix, not(target_os = "linux"), not(target_os = "android")))]
     {
-        if debug { eprintln!("[DEBUG] rename_noreplace: using hard_link fallback (non-linux)"); }
+        if debug {
+            eprintln!("[DEBUG] rename_noreplace: using hard_link fallback (non-linux)");
+        }
         match std::fs::hard_link(from, to) {
             Ok(()) => {
                 std::fs::remove_file(from)?;
@@ -1464,9 +1585,14 @@ fn rename_noreplace(from: &Path, to: &Path, debug: bool) -> std::io::Result<()> 
 
     #[cfg(windows)]
     {
-        if debug { eprintln!("[DEBUG] rename_noreplace: using rename fallback (windows)"); }
+        if debug {
+            eprintln!("[DEBUG] rename_noreplace: using rename fallback (windows)");
+        }
         if to.exists() {
-            return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "Destination exists"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "Destination exists",
+            ));
         }
         std::fs::rename(from, to)
     }
@@ -1481,8 +1607,11 @@ fn perform_atomic_move(temp_path: &Path, target_path: &Path, args: &Args) -> Res
         // have permission to replace the destination file.
         if args.overwrite || args.resume {
             if args.debug {
-                eprintln!("[DEBUG] Force rename (overwrite/resume): '{}' -> '{}'",
-                          src.display(), dst.display());
+                eprintln!(
+                    "[DEBUG] Force rename (overwrite/resume): '{}' -> '{}'",
+                    src.display(),
+                    dst.display()
+                );
             }
             std::fs::rename(src, dst)
         } else {
@@ -1514,7 +1643,7 @@ fn perform_atomic_move(temp_path: &Path, target_path: &Path, args: &Args) -> Res
 
             // Safety check: if truncation didn't actually shorten it, stop to avoid infinite loop
             if truncated == target_path {
-                 return Err(PermanentError::FilenameTooLong.into());
+                return Err(PermanentError::FilenameTooLong.into());
             }
 
             if !args.quiet {
@@ -1527,16 +1656,19 @@ fn perform_atomic_move(temp_path: &Path, target_path: &Path, args: &Args) -> Res
                 // If the truncated filename also exists:
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     Err(PermanentError::TruncatedFilenameExists(truncated).into())
-                },
+                }
                 Err(e) => Err(e).context("Failed to rename to truncated path"),
             }
         }
 
         // Handle TOCTOU race (File appeared during download) special error mapping.
         // This catches cases where the file didn't exist when we started, but does now.
-        Err(e) if !args.overwrite && !args.resume
-            && (e.kind() == std::io::ErrorKind::AlreadyExists) => {
-             Err(PermanentError::FileAppearedDuringDownload(target_path.to_path_buf()).into())
+        Err(e)
+            if !args.overwrite
+                && !args.resume
+                && (e.kind() == std::io::ErrorKind::AlreadyExists) =>
+        {
+            Err(PermanentError::FileAppearedDuringDownload(target_path.to_path_buf()).into())
         }
 
         // Catch-all for other I/O errors
@@ -1567,7 +1699,7 @@ fn is_permanent_error(err: &anyhow::Error) -> bool {
     if let Some(io_err) = err.root_cause().downcast_ref::<std::io::Error>() {
         return matches!(
             io_err.kind(),
-              ErrorKind::InvalidInput
+            ErrorKind::InvalidInput
             | ErrorKind::PermissionDenied
             | ErrorKind::AlreadyExists
          // | ErrorKind::FilesystemLoop
@@ -1583,12 +1715,13 @@ fn is_permanent_error(err: &anyhow::Error) -> bool {
 
     // Check for HTTP client errors (4xx except 429)
     if let Some(reqwest_err) = err.root_cause().downcast_ref::<reqwest::Error>()
-        && let Some(status) = reqwest_err.status() {
-            // 4xx errors are permanent (except 429 Too Many Requests)
-            if status.is_client_error() && status.as_u16() != 429 {
-                return true;
-            }
+        && let Some(status) = reqwest_err.status()
+    {
+        // 4xx errors are permanent (except 429 Too Many Requests)
+        if status.is_client_error() && status.as_u16() != 429 {
+            return true;
         }
+    }
 
     false
 }
@@ -1626,7 +1759,7 @@ async fn download_file(
             &final_filename, // Use the sanitized filename for hash
             parent,
             args.tempnamelen,
-            args.debug
+            args.debug,
         ))
     } else {
         None
@@ -1642,19 +1775,25 @@ async fn download_file(
                 start_byte = metadata.len();
 
                 if args.debug {
-                   eprintln!("[DEBUG] Found existing temp file. Size: {}. Resume: true. New Start Byte: {}",
-                             start_byte, start_byte);
+                    eprintln!(
+                        "[DEBUG] Found existing temp file. Size: {}. Resume: true. New Start Byte: {}",
+                        start_byte, start_byte
+                    );
                 }
                 if let Some(total) = expected_length {
                     if start_byte >= total {
                         if !args.quiet {
-                            eprintln!("Temp file '{}' already fully downloaded, finalizing...", tp.display());
+                            eprintln!(
+                                "Temp file '{}' already fully downloaded, finalizing...",
+                                tp.display()
+                            );
                         }
                         perform_atomic_move(tp, &output_path, args)?;
                         return Ok(());
                     }
                     if !args.quiet {
-                        eprintln!("Resuming temp file '{}' from byte {} ({:.1}%)",
+                        eprintln!(
+                            "Resuming temp file '{}' from byte {} ({:.1}%)",
                             tp.display(),
                             start_byte,
                             (start_byte as f64 / total as f64) * 100.0
@@ -1668,12 +1807,18 @@ async fn download_file(
                 // Temp file exists but --continue not specified
                 // We'll overwrite it since it's our temp file
                 if !args.quiet {
-                    eprintln!("Existing temp file '{}' found, starting fresh (use --continue to resume)",
-                              tp.display());
+                    eprintln!(
+                        "Existing temp file '{}' found, starting fresh (use --continue to resume)",
+                        tp.display()
+                    );
                 }
             } else if args.debug {
-                eprintln!("[DEBUG] Temp file state: Exists={}, Resume={}, Overwrite={}. Start Byte: 0",
-                          tp.exists(), args.resume, args.overwrite);
+                eprintln!(
+                    "[DEBUG] Temp file state: Exists={}, Resume={}, Overwrite={}. Start Byte: 0",
+                    tp.exists(),
+                    args.resume,
+                    args.overwrite
+                );
             }
 
             // Also check if output file already exists (for temp mode)
@@ -1683,10 +1828,13 @@ async fn download_file(
 
                 // Check if file is already complete
                 if let Some(total) = expected_length
-                    && existing_size >= total {
-                        if !args.quiet { eprintln!("File already fully downloaded."); }
-                        return Ok(());
+                    && existing_size >= total
+                {
+                    if !args.quiet {
+                        eprintln!("File already fully downloaded.");
                     }
+                    return Ok(());
+                }
 
                 // Output file exists but is incomplete
                 if !args.resume && !args.overwrite {
@@ -1702,10 +1850,13 @@ async fn download_file(
 
             // Check if file is already complete (when we know expected size)
             if let Some(total) = expected_length
-                && existing_size >= total {
-                    if !args.quiet { eprintln!("File already fully downloaded."); }
-                    return Ok(());
+                && existing_size >= total
+            {
+                if !args.quiet {
+                    eprintln!("File already fully downloaded.");
                 }
+                return Ok(());
+            }
 
             // File exists but is incomplete (or unknown size)
             if args.resume {
@@ -1713,7 +1864,8 @@ async fn download_file(
                 start_byte = existing_size;
                 if let Some(total) = expected_length {
                     if !args.quiet {
-                        eprintln!("Resuming from byte {} ({:.1}%)",
+                        eprintln!(
+                            "Resuming from byte {} ({:.1}%)",
                             start_byte,
                             (start_byte as f64 / total as f64) * 100.0
                         );
@@ -1748,19 +1900,23 @@ async fn download_file(
             let location_str = location.to_str().unwrap_or("<invalid>");
             return Err(PermanentError::RedirectOnGet {
                 status: status.as_u16(),
-                location: location_str.to_string()
-            }.into());
+                location: location_str.to_string(),
+            }
+            .into());
         }
         return Err(PermanentError::RedirectWithoutLocation(status.as_u16()).into());
     }
 
     if status == StatusCode::RANGE_NOT_SATISFIABLE {
-        if !args.quiet { eprintln!("File already fully downloaded."); }
+        if !args.quiet {
+            eprintln!("File already fully downloaded.");
+        }
         // If we were using a temp file, rename it
         if let Some(ref tp) = temp_path
-            && tp.exists() {
-                perform_atomic_move(tp, &output_path, args)?;
-            }
+            && tp.exists()
+        {
+            perform_atomic_move(tp, &output_path, args)?;
+        }
         return Ok(());
     }
 
@@ -1768,7 +1924,10 @@ async fn download_file(
     if status.is_client_error() || status.is_server_error() {
         if args.content_on_error {
             if !args.quiet {
-                eprintln!("Warning: HTTP {} returned. Saving error body to file due to --content-on-error.", status);
+                eprintln!(
+                    "Warning: HTTP {} returned. Saving error body to file due to --content-on-error.",
+                    status
+                );
             }
         } else {
             return Err(PermanentError::HttpClientError(status.as_u16()).into());
@@ -1779,24 +1938,30 @@ async fn download_file(
     // Validate Content-Range when resuming
     if args.resume && start_byte > 0 {
         if status != StatusCode::PARTIAL_CONTENT {
-            if !args.quiet { eprintln!("Server doesn't support resume, restarting from scratch."); }
+            if !args.quiet {
+                eprintln!("Server doesn't support resume, restarting from scratch.");
+            }
             start_byte = 0;
             force_truncate = true;
         } else {
             // Validate Content-Range header matches our request
             if let Some(content_range) = response.headers().get(CONTENT_RANGE)
                 && let Ok(range_str) = content_range.to_str()
-                    && let Some(server_start) = parse_content_range(range_str)
-                        && server_start != start_byte {
-                            return Err(PermanentError::ContentRangeMismatch {
-                                requested: start_byte,
-                                received: server_start
-                            }.into());
-                        }
+                && let Some(server_start) = parse_content_range(range_str)
+                && server_start != start_byte
+            {
+                return Err(PermanentError::ContentRangeMismatch {
+                    requested: start_byte,
+                    received: server_start,
+                }
+                .into());
+            }
         }
     }
 
-    let content_length = response.headers().get(CONTENT_LENGTH)
+    let content_length = response
+        .headers()
+        .get(CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok());
 
@@ -1806,20 +1971,31 @@ async fn download_file(
     let remaining_bytes = content_length;
 
     if is_stdout && std::io::stdout().is_terminal() {
-            bail!("Refusing to write binary data to the terminal.");
+        bail!("Refusing to write binary data to the terminal.");
     }
     // If writing to stdout, bypass file/temp logic
     if is_stdout {
         let mut stdout = tokio::io::stdout();
-        write_response_to_file(response, &mut stdout, args, remaining_bytes, start_byte, "-").await?;
+        write_response_to_file(response, &mut stdout, args, remaining_bytes, start_byte, "-")
+            .await?;
         return Ok(());
     }
 
     if args.temp {
         let path_buf = temp_path.clone().expect("Logic error: temp path missing");
-        download_to_temp(response, &output_path, args, start_byte, remaining_bytes, force_truncate, path_buf).await?;
+        download_to_temp(
+            response,
+            &output_path,
+            args,
+            start_byte,
+            remaining_bytes,
+            force_truncate,
+            path_buf,
+        )
+        .await?;
     } else {
-        download_direct(response, &output_path, args, start_byte, remaining_bytes, force_truncate).await?;
+        download_direct(response, &output_path, args, start_byte, remaining_bytes, force_truncate)
+            .await?;
     }
 
     Ok(())
@@ -1830,7 +2006,12 @@ async fn download_file(
 /// - Uses O_EXCL (create_new) when starting fresh to prevent race conditions.
 /// - Uses mode defined by --filemode or umask (default) for security.
 /// - Handles resuming via Append mode.
-fn open_temp_file_safely(path: &Path, _args: &Args, start_byte: u64, force_truncate: bool) -> std::io::Result<File> {
+fn open_temp_file_safely(
+    path: &Path,
+    _args: &Args,
+    start_byte: u64,
+    force_truncate: bool,
+) -> std::io::Result<File> {
     // Case 1: Resuming an existing download
     if start_byte > 0 && !force_truncate {
         let mut opts = OpenOptions::new();
@@ -1904,13 +2085,20 @@ async fn download_to_temp(
         .context("Failed to open temp file")?;
 
     let mut async_file = tokio::fs::File::from_std(std_file);
-    let bytes_written = write_response_to_file(response, &mut async_file, args, remaining_bytes, actual_start_byte,
-                                               output_path.to_str().unwrap_or("")).await?;
+    let bytes_written = write_response_to_file(
+        response,
+        &mut async_file,
+        args,
+        remaining_bytes,
+        actual_start_byte,
+        output_path.to_str().unwrap_or(""),
+    )
+    .await?;
 
     match async_file.sync_all().await {
-        Ok(_) => {},
-        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {},
-        Err(e) if e.raw_os_error() == Some(libc::ENOTSUP) => {},
+        Ok(_) => {}
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {}
+        Err(e) if e.raw_os_error() == Some(libc::ENOTSUP) => {}
         Err(e) => return Err(e.into()),
     };
     drop(async_file); // Close file handle before rename
@@ -1924,13 +2112,17 @@ async fn download_to_temp(
         Ok(path) => {
             // SUCCESS: Log the output and return the path
             if !args.quiet {
-                eprintln!("Downloaded {} to {}", HumanBytes(bytes_written + actual_start_byte), path.display());
+                eprintln!(
+                    "Downloaded {} to {}",
+                    HumanBytes(bytes_written + actual_start_byte),
+                    path.display()
+                );
                 if bytes_written == 0 {
                     eprintln!("(No new data written)");
                 }
             }
             Ok(path)
-        },
+        }
         Err(e) => {
             // FAILURE: Clean up the temp file (unless --keep-temp is set)
             if !args.keep_temp && temp_path.exists() {
@@ -1949,39 +2141,52 @@ async fn download_direct(
     remaining_bytes: Option<u64>,
     force_truncate: bool,
 ) -> Result<PathBuf> {
-    let (std_file, actual_path) = match open_file_safely(output_path, args, start_byte, force_truncate) {
-        Ok(f) => (f, output_path.to_path_buf()),
-        Err(e) => {
-            // Check if the root cause is ENAMETOOLONG
-            let is_too_long = e.chain()
-                .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
-                .any(is_name_too_long);
+    let (std_file, actual_path) =
+        match open_file_safely(output_path, args, start_byte, force_truncate) {
+            Ok(f) => (f, output_path.to_path_buf()),
+            Err(e) => {
+                // Check if the root cause is ENAMETOOLONG
+                let is_too_long = e
+                    .chain()
+                    .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+                    .any(is_name_too_long);
 
-            if is_too_long {
-                let truncated = resolve_output_path(output_path)?;
-                if truncated == output_path {
-                    return Err(PermanentError::FilenameTooLong.into());
+                if is_too_long {
+                    let truncated = resolve_output_path(output_path)?;
+                    if truncated == output_path {
+                        return Err(PermanentError::FilenameTooLong.into());
+                    }
+                    eprintln!("Filename too long, truncating to: {}", truncated.display());
+                    (open_file_safely(&truncated, args, start_byte, force_truncate)?, truncated)
+                } else {
+                    return Err(e);
                 }
-                eprintln!("Filename too long, truncating to: {}", truncated.display());
-                (open_file_safely(&truncated, args, start_byte, force_truncate)?, truncated)
-            } else {
-                return Err(e);
             }
-        }
-    };
+        };
 
     let mut file = tokio::fs::File::from_std(std_file);
-    let bytes_written = write_response_to_file(response, &mut file, args, remaining_bytes, start_byte,
-                                               output_path.to_str().unwrap_or("")).await?;
+    let bytes_written = write_response_to_file(
+        response,
+        &mut file,
+        args,
+        remaining_bytes,
+        start_byte,
+        output_path.to_str().unwrap_or(""),
+    )
+    .await?;
     match file.sync_all().await {
-        Ok(_) => {},
-        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {},
-        Err(e) if e.raw_os_error() == Some(libc::ENOTSUP) => {},
+        Ok(_) => {}
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {}
+        Err(e) if e.raw_os_error() == Some(libc::ENOTSUP) => {}
         Err(e) => return Err(e.into()),
     };
 
     if !args.quiet {
-        eprintln!("Downloaded {} to {}", HumanBytes(bytes_written + start_byte), actual_path.display());
+        eprintln!(
+            "Downloaded {} to {}",
+            HumanBytes(bytes_written + start_byte),
+            actual_path.display()
+        );
     }
 
     Ok(actual_path)
@@ -2010,8 +2215,10 @@ async fn write_response_to_file<W: AsyncWrite + Unpin>(
         pb
     } else {
         let pb = ProgressBar::new_spinner();
-        pb.set_style(ProgressStyle::default_spinner()
-            .template("{spinner:.green} [{elapsed_precise}] {bytes} ({bytes_per_sec})")?);
+        pb.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner:.green} [{elapsed_precise}] {bytes} ({bytes_per_sec})")?,
+        );
         pb
     };
 
@@ -2040,8 +2247,9 @@ async fn write_response_to_file<W: AsyncWrite + Unpin>(
                 let chunk_len = chunk.len() as u64;
 
                 if let Some(max_size) = args.max_size
-                    && start_byte + bytes_written + chunk_len > max_size {
-                        return Err(PermanentError::DownloadExceedsLimit { max: max_size }.into())
+                    && start_byte + bytes_written + chunk_len > max_size
+                {
+                    return Err(PermanentError::DownloadExceedsLimit { max: max_size }.into());
                 }
 
                 if let Err(e) = writer.write_all(&chunk).await {
@@ -2057,7 +2265,9 @@ async fn write_response_to_file<W: AsyncWrite + Unpin>(
 
                 // Throttled UI updates
                 if last_update.elapsed().as_millis() > 25 {
-                    if !args.quiet { pb.inc(accumulated_bytes); }
+                    if !args.quiet {
+                        pb.inc(accumulated_bytes);
+                    }
                     accumulated_bytes = 0;
                     sleep_timer.as_mut().reset(Instant::now() + Duration::from_secs(args.timeout));
                     last_update = Instant::now();
@@ -2068,20 +2278,25 @@ async fn write_response_to_file<W: AsyncWrite + Unpin>(
         }
     }
 
-    if !args.quiet && accumulated_bytes > 0 { pb.inc(accumulated_bytes); }
+    if !args.quiet && accumulated_bytes > 0 {
+        pb.inc(accumulated_bytes);
+    }
     // Flush and ignore BrokenPipe on flush too
     if let Err(e) = writer.flush().await
-        && e.kind() != std::io::ErrorKind::BrokenPipe {
-             return Err(e.into());
-        }
-    if !args.quiet { pb.finish_with_message("Download complete"); }
+        && e.kind() != std::io::ErrorKind::BrokenPipe
+    {
+        return Err(e.into());
+    }
+    if !args.quiet {
+        pb.finish_with_message("Download complete");
+    }
 
     Ok(bytes_written)
 }
 
 #[cfg(all(target_os = "linux", not(target_os = "android")))]
 pub fn apply_security_sandbox() -> Result<(), Box<dyn std::error::Error>> {
-    use libseccomp::{ScmpFilterContext, ScmpAction, ScmpSyscall, ScmpArgCompare, ScmpCompareOp};
+    use libseccomp::{ScmpAction, ScmpArgCompare, ScmpCompareOp, ScmpFilterContext, ScmpSyscall};
 
     let mut ctx = ScmpFilterContext::new(ScmpAction::Allow)?;
 
@@ -2095,13 +2310,8 @@ pub fn apply_security_sandbox() -> Result<(), Box<dyn std::error::Error>> {
     ctx.add_rule(ScmpAction::Errno(libc::EPERM), ScmpSyscall::from_name("ptrace")?)?;
 
     // Block specific socket families
-    let blocked_families = [
-        libc::AF_UNIX,
-        libc::AF_NETLINK,
-        libc::AF_PACKET,
-        libc::AF_BLUETOOTH,
-        libc::AF_VSOCK,
-    ];
+    let blocked_families =
+        [libc::AF_UNIX, libc::AF_NETLINK, libc::AF_PACKET, libc::AF_BLUETOOTH, libc::AF_VSOCK];
 
     for family in blocked_families {
         ctx.add_rule_conditional(
@@ -2178,9 +2388,7 @@ async fn main() -> ExitCode {
 /// Helper to listen for Ctrl+C (SIGINT) and SIGTERM (Unix)
 async fn shutdown_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
+        tokio::signal::ctrl_c().await.expect("failed to install Ctrl+C handler");
     };
 
     #[cfg(unix)]

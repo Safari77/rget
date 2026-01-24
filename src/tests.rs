@@ -136,10 +136,7 @@ fn test_ipv6_link_local_full_range() {
 #[test]
 fn test_ipv6_teredo_blocked() {
     // Teredo is 2001:0::/32
-    let teredo_addresses = [
-        "2001:0:4136:e378:8000:63bf:3fff:fdd2",
-        "2001:0000:1234:5678::",
-    ];
+    let teredo_addresses = ["2001:0:4136:e378:8000:63bf:3fff:fdd2", "2001:0000:1234:5678::"];
 
     for ip_str in teredo_addresses {
         let ip: IpAddr = ip_str.parse().unwrap();
@@ -284,7 +281,7 @@ async fn test_resolve_safe_ip_ipv6_literal() {
     match url.host() {
         Some(url::Host::Ipv6(addr)) => {
             assert_eq!(addr.to_string(), "::1"); // No brackets in the Addr object
-        },
+        }
         _ => panic!("Should be parsed as Ipv6 host"),
     }
 }
@@ -331,8 +328,14 @@ fn test_sanitize_filename_path_traversal() {
 #[test]
 fn test_is_private_ip_ranges() {
     let private_ips = [
-        "127.0.0.1", "10.0.0.5", "192.168.1.1", "172.16.0.1",
-        "169.254.0.1", "::1", "fd00::1", "fe80::1",
+        "127.0.0.1",
+        "10.0.0.5",
+        "192.168.1.1",
+        "172.16.0.1",
+        "169.254.0.1",
+        "::1",
+        "fd00::1",
+        "fe80::1",
     ];
 
     for ip_str in private_ips {
@@ -340,9 +343,7 @@ fn test_is_private_ip_ranges() {
         assert!(is_private_ip(&ip), "IP {} should be private", ip);
     }
 
-    let public_ips = [
-        "8.8.8.8", "1.1.1.1", "142.250.187.238", "2606:4700:4700::1111",
-    ];
+    let public_ips = ["8.8.8.8", "1.1.1.1", "142.250.187.238", "2606:4700:4700::1111"];
 
     for ip_str in public_ips {
         let ip: IpAddr = ip_str.parse().unwrap();
@@ -407,7 +408,6 @@ fn test_content_disposition_valid_headers() {
     // RFC 5987 with language tag (ignoring the 'en')
     let cd = "attachment; filename*=UTF-8'en'%E2%9C%93.txt";
     assert_eq!(parse_content_disposition_header(cd), Some("✓.txt".to_string()));
-
 }
 
 #[test]
@@ -793,7 +793,8 @@ fn test_validate_url_security() {
 
     // 3. FTP - Always Blocked (Unsupported scheme)
     let url = Url::parse("ftp://example.com").unwrap();
-    match validate_url(&url, true) { // Even with insecure flag
+    match validate_url(&url, true) {
+        // Even with insecure flag
         Err(e) => assert!(e.to_string().contains("Unsupported URL scheme")),
         Ok(_) => panic!("Should reject FTP"),
     }
@@ -806,10 +807,10 @@ fn test_ipv4_mapped_ipv6_addresses() {
     // IPv4-mapped IPv6: ::ffff:x.x.x.x
     // These can bypass naive IPv6 checks while still targeting IPv4 addresses
     let mapped_private = [
-        "::ffff:127.0.0.1",      // Loopback
-        "::ffff:192.168.1.1",    // Private
-        "::ffff:10.0.0.1",       // Private
-        "::ffff:169.254.0.1",    // Link-local
+        "::ffff:127.0.0.1",   // Loopback
+        "::ffff:192.168.1.1", // Private
+        "::ffff:10.0.0.1",    // Private
+        "::ffff:169.254.0.1", // Link-local
     ];
 
     for ip_str in mapped_private {
@@ -851,8 +852,7 @@ fn test_sanitize_filename_control_characters() {
     for c in 0u8..=31 {
         let filename = format!("file{}test.txt", c as char);
         let sanitized = sanitize_filename(&filename);
-        assert!(!sanitized.contains(c as char),
-            "Control char 0x{:02x} should be replaced", c);
+        assert!(!sanitized.contains(c as char), "Control char 0x{:02x} should be replaced", c);
     }
 
     // DEL character (0x7F)
@@ -891,7 +891,7 @@ fn test_sanitize_filename_path_traversal_variations() {
     let attacks = [
         ("..\\..\\..\\etc\\passwd", "passwd"),
         ("....//....//etc/passwd", "passwd"),
-        ("..\\..\\..", "download"),  // Results in empty after sanitization
+        ("..\\..\\..", "download"), // Results in empty after sanitization
         (".../.../", "download"),
         ("/absolute/path/file.txt", "file.txt"),
         ("C:\\Windows\\System32\\file.txt", "file.txt"),
@@ -905,8 +905,13 @@ fn test_sanitize_filename_path_traversal_variations() {
         // Should not start with dots
         assert!(!result.starts_with('.'), "Result '{}' starts with dot", result);
         // Basic sanity - either matches expected or is "download" fallback
-        assert!(result.contains(expected_contains) || result == "download",
-            "For input '{}', got '{}', expected to contain '{}'", input, result, expected_contains);
+        assert!(
+            result.contains(expected_contains) || result == "download",
+            "For input '{}', got '{}', expected to contain '{}'",
+            input,
+            result,
+            expected_contains
+        );
     }
 }
 
@@ -1003,10 +1008,10 @@ fn test_content_disposition_null_in_filename() {
 fn test_content_disposition_invalid_percent_encoding() {
     // Various invalid percent encodings
     let test_cases = [
-        "attachment; filename*=UTF-8''%ZZ",      // Invalid hex
-        "attachment; filename*=UTF-8''%1",       // Incomplete
-        "attachment; filename*=UTF-8''%",        // Just percent
-        "attachment; filename*=UTF-8''%%%",      // Multiple percents
+        "attachment; filename*=UTF-8''%ZZ", // Invalid hex
+        "attachment; filename*=UTF-8''%1",  // Incomplete
+        "attachment; filename*=UTF-8''%",   // Just percent
+        "attachment; filename*=UTF-8''%%%", // Multiple percents
         "attachment; filename*=__''%%%",
         "attachment; filename*=''%%%",
     ];
@@ -1069,7 +1074,10 @@ fn test_validate_url_gopher_scheme() {
 #[test]
 fn test_parse_content_range_overflow() {
     // Very large numbers that might overflow
-    assert_eq!(parse_content_range("bytes 18446744073709551615-18446744073709551616/1"), Some(u64::MAX));
+    assert_eq!(
+        parse_content_range("bytes 18446744073709551615-18446744073709551616/1"),
+        Some(u64::MAX)
+    );
 
     // Number larger than u64::MAX
     let result = parse_content_range("bytes 99999999999999999999999999999-100/1");
@@ -1090,26 +1098,27 @@ fn test_parse_content_range_malformed() {
         "bytes ",
         "bytes -",
         "bytes -100",
-        "octets 0-100/200",  // Wrong unit
-        "bytes 0 - 100 / 200",  // Spaces
-        "bytes=0-100",  // Wrong separator
+        "octets 0-100/200",    // Wrong unit
+        "bytes 0 - 100 / 200", // Spaces
+        "bytes=0-100",         // Wrong separator
         "",
         "    ",
     ];
 
     for header in malformed {
-        assert_eq!(parse_content_range(header), None,
-            "Should return None for malformed header: '{}'", header);
+        assert_eq!(
+            parse_content_range(header),
+            None,
+            "Should return None for malformed header: '{}'",
+            header
+        );
     }
 }
 
 #[test]
 fn test_max_size_boundary() {
     // Test max_size at u64 boundary values
-    let args = Args {
-        max_size: Some(u64::MAX),
-        ..make_args()
-    };
+    let args = Args { max_size: Some(u64::MAX), ..make_args() };
     assert_eq!(args.max_size, Some(u64::MAX));
 }
 
@@ -1181,13 +1190,13 @@ fn test_filename_from_url_unicode_normalization() {
 fn test_permanent_error_filesystem_variants() {
     // Verify filesystem errors are correctly classified as permanent
     let permanent_codes = [
-        libc::ENOSPC,  // No space left
-        libc::EDQUOT,  // Disk quota exceeded
-        libc::EROFS,   // Read-only filesystem
-        libc::EACCES,  // Permission denied
-        libc::EPERM,   // Operation not permitted
-        libc::ELOOP,   // Too many symbolic links
-        libc::EEXIST,  // File exists (with O_EXCL)
+        libc::ENOSPC, // No space left
+        libc::EDQUOT, // Disk quota exceeded
+        libc::EROFS,  // Read-only filesystem
+        libc::EACCES, // Permission denied
+        libc::EPERM,  // Operation not permitted
+        libc::ELOOP,  // Too many symbolic links
+        libc::EEXIST, // File exists (with O_EXCL)
     ];
 
     for code in permanent_codes {
@@ -1258,15 +1267,18 @@ fn test_idn_homograph_punycode() {
     // IDN homograph attacks - Cyrillic 'а' (U+0430) looks like Latin 'a'
     // URL parser should convert to punycode
     let cases = [
-        ("https://аpple.com/", "xn--pple-43d.com"),  // Cyrillic 'а'
+        ("https://аpple.com/", "xn--pple-43d.com"), // Cyrillic 'а'
         ("https://gооgle.com/", "xn--ggle-55da.com"), // Cyrillic 'о'
     ];
 
     for (attack_url, expected_punycode) in cases {
         if let Ok(url) = Url::parse(attack_url) {
             let host = url.host_str().unwrap();
-            assert_eq!(host, expected_punycode,
-                "IDN '{}' should be converted to punycode", attack_url);
+            assert_eq!(
+                host, expected_punycode,
+                "IDN '{}' should be converted to punycode",
+                attack_url
+            );
         }
     }
 }
