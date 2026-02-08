@@ -1,14 +1,14 @@
 # vim: paste
 [package]
 name = "rget"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 description = "Secure file downloader with wget-like functionality"
 authors = ["Sami Farin"]
 license = "Apache-2.0 AND GPL-3.0-only"
 
 [dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "stream", "http2", "charset"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json", "hickory-dns"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "logging"] }
 aws-lc-rs = "1"
 charset = "0.1"
