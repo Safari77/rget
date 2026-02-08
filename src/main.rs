@@ -58,6 +58,8 @@ use reqwest::header::{
 };
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Client, Identity, Response, StatusCode};
+use rustls::ClientConfig;
+use rustls_platform_verifier::BuilderVerifierExt;
 use sha3::{
     Shake256,
     digest::{ExtendableOutput, Update, XofReader},
@@ -566,43 +568,89 @@ fn build_client(args: &Args, resolve_override: Option<(&str, SocketAddr)>) -> Re
         builder = builder.no_proxy();
     }
 
-    // Handle Security
+    // Handle Security & mTLS
     if args.insecure {
+        // Insecure Path: Allow invalid certs, use default identity handling
         builder = builder.danger_accept_invalid_certs(true).danger_accept_invalid_hostnames(true);
-    } else {
-        builder = builder.use_rustls_tls();
-    }
 
-    // Handle mTLS (Client Certificate)
-    if let (Some(cert_path), Some(key_path)) = (&args.cert, &args.key) {
-        if args.debug {
-            eprintln!("[DEBUG] Loading client certificate: {}", cert_path);
-            eprintln!("[DEBUG] Loading private key: {}", key_path);
+        if let (Some(cert_path), Some(key_path)) = (&args.cert, &args.key) {
+            if args.debug {
+                eprintln!("[DEBUG] Loading client certificate (insecure mode): {}", cert_path);
+            }
+
+            let cert_pem = fs::read(cert_path).map_err(|e| {
+                PermanentError::ClientCertError(format!(
+                    "Failed to read certificate file '{}': {}",
+                    cert_path, e
+                ))
+            })?;
+
+            let key_pem = fs::read(key_path).map_err(|e| {
+                PermanentError::ClientCertError(format!(
+                    "Failed to read key file '{}': {}",
+                    key_path, e
+                ))
+            })?;
+
+            // Combine cert and key for reqwest/rustls identity (Identity::from_pem handles both)
+            let mut combined_pem = cert_pem;
+            combined_pem.push(b'\n');
+            combined_pem.extend_from_slice(&key_pem);
+
+            let identity = Identity::from_pem(&combined_pem)
+                .context("Failed to parse client certificate/key (PEM format required)")?;
+
+            builder = builder.identity(identity);
         }
+    } else {
+        // Secure Path: Use platform verifier and manual mTLS config
+        let tls_builder = ClientConfig::builder();
 
-        let cert_pem = fs::read(cert_path).map_err(|e| {
-            PermanentError::ClientCertError(format!(
-                "Failed to read certificate file '{}': {}",
-                cert_path, e
-            ))
-        })?;
+        // Try platform verifier, fallback to WebPKI roots if failed.
+        // On Android, we explicitly skip platform verifier to avoid panics in CLI environments (missing JNI).
+        #[cfg(not(target_os = "android"))]
+        let tls_builder = match tls_builder.with_platform_verifier() {
+            Ok(builder) => builder,
+            Err(e) => {
+                if args.debug || args.verbose {
+                    eprintln!(
+                        "Warning: Platform verifier unavailable ({}). Falling back to WebPKI roots.",
+                        e
+                    );
+                }
+                let mut root_store = rustls::RootCertStore::empty();
+                root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                ClientConfig::builder().with_root_certificates(root_store)
+            }
+        };
 
-        let key_pem = fs::read(key_path).map_err(|e| {
-            PermanentError::ClientCertError(format!(
-                "Failed to read key file '{}': {}",
-                key_path, e
-            ))
-        })?;
+        #[cfg(target_os = "android")]
+        let tls_builder = {
+            if args.debug {
+                eprintln!(
+                    "[DEBUG] Android detected: Skipping platform verifier (requires JNI), using bundled WebPKI roots."
+                );
+            }
+            let mut root_store = rustls::RootCertStore::empty();
+            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            ClientConfig::builder().with_root_certificates(root_store)
+        };
 
-        // Combine cert and key for reqwest/rustls identity
-        let mut combined_pem = cert_pem;
-        combined_pem.push(b'\n');
-        combined_pem.extend_from_slice(&key_pem);
+        let client_config = if let (Some(cert_path), Some(key_path)) = (&args.cert, &args.key) {
+            if args.debug {
+                eprintln!("[DEBUG] Loading client certificate (platform-verifier): {}", cert_path);
+            }
+            let certs = load_certs(cert_path)?;
+            let key = load_key(key_path)?;
 
-        let identity = Identity::from_pem(&combined_pem)
-            .context("Failed to parse client certificate/key (PEM format required)")?;
+            tls_builder
+                .with_client_auth_cert(certs, key)
+                .context("Failed to configure client auth")?
+        } else {
+            tls_builder.with_no_client_auth()
+        };
 
-        builder = builder.identity(identity);
+        builder = builder.use_preconfigured_tls(client_config);
     }
 
     // Handle Custom Headers
@@ -637,6 +685,20 @@ fn build_client(args: &Args, resolve_override: Option<(&str, SocketAddr)>) -> Re
     }
 
     builder.build().context("Failed to build HTTP client")
+}
+
+fn load_certs(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    use rustls::pki_types::pem::PemObject;
+    rustls::pki_types::CertificateDer::pem_file_iter(path)
+        .map_err(|e| anyhow::anyhow!("Failed to open cert file '{}': {}", path, e))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("Invalid certificate in '{}': {}", path, e))
+}
+
+fn load_key(path: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {
+    use rustls::pki_types::pem::PemObject;
+    rustls::pki_types::PrivateKeyDer::from_pem_file(path)
+        .map_err(|e| anyhow::anyhow!("Invalid or missing private key in '{}': {}", path, e))
 }
 
 async fn resolve_final_url_and_client(
@@ -2333,6 +2395,13 @@ pub fn apply_security_sandbox() -> Result<(), Box<dyn std::error::Error>> {
 //#[tokio::main]
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
+    // Install the default crypto provider (aws-lc-rs) globally
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    // NOTE: rustls_platform_verifier::android::init_hosted() is NOT called here
+    // because this is a CLI binary, not a JNI library loaded by a JVM.
+    // If running on Android (e.g., Termux), we fallback to webpki-roots in build_client.
+
     // Parse args early to set keep_temp flag
     let mut args = Args::parse();
 
