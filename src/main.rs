@@ -2029,9 +2029,6 @@ async fn download_file(
     // to ensure speed/ETA calculations are correct.
     let remaining_bytes = content_length;
 
-    if is_stdout && std::io::stdout().is_terminal() {
-        bail!("Refusing to write binary data to the terminal.");
-    }
     // If writing to stdout, bypass file/temp logic
     if is_stdout {
         let mut stdout = tokio::io::stdout();
