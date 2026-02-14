@@ -1793,8 +1793,8 @@ async fn download_file(
     content_disposition: Option<&str>,
 ) -> Result<()> {
     // 1. Determine filenames first
-    let final_filename = determine_filename(args, url, content_disposition);
-    let output_path = if let Some(ref output) = args.output {
+    let mut final_filename = determine_filename(args, url, content_disposition);
+    let mut output_path = if let Some(ref output) = args.output {
         PathBuf::from(output)
     } else {
         PathBuf::from(&final_filename)
@@ -1811,7 +1811,7 @@ async fn download_file(
     }
 
     // 2. Prepare Temp Path (using sanitized filename)
-    let temp_path = if args.temp && !is_stdout {
+    let mut temp_path = if args.temp && !is_stdout {
         let parent = output_path.parent().unwrap_or(Path::new("."));
         Some(generate_deterministic_temp_filename(
             url,
@@ -2028,6 +2028,53 @@ async fn download_file(
     // we strictly want to track the *stream* size (remaining bytes)
     // to ensure speed/ETA calculations are correct.
     let remaining_bytes = content_length;
+
+    // Re-check Content-Disposition from GET response (some servers only set it on GET, not HEAD)
+    // Only relevant when no explicit --output was given
+    if args.output.is_none() && !is_stdout {
+        let get_cd = response
+            .headers()
+            .get(CONTENT_DISPOSITION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_content_disposition_header);
+
+        if let Some(ref new_name) = get_cd
+            && *new_name != final_filename
+        {
+            if args.debug {
+                eprintln!(
+                    "[DEBUG] Content-Disposition changed on GET: '{}' -> '{}'",
+                    final_filename, new_name
+                );
+            }
+            // If we were resuming with the old temp file, we must restart since
+            // the temp filename is derived from the output filename
+            if start_byte > 0 {
+                if !args.quiet {
+                    eprintln!(
+                        "Filename changed during resume ('{}' -> '{}'), restarting download.",
+                        final_filename, new_name
+                    );
+                }
+                start_byte = 0;
+                force_truncate = true;
+            }
+
+            final_filename = new_name.clone();
+            output_path = PathBuf::from(&final_filename);
+
+            if args.temp {
+                let parent = output_path.parent().unwrap_or(Path::new("."));
+                temp_path = Some(generate_deterministic_temp_filename(
+                    url,
+                    &final_filename,
+                    parent,
+                    args.tempnamelen,
+                    args.debug,
+                ));
+            }
+        }
+    }
 
     // If writing to stdout, bypass file/temp logic
     if is_stdout {
