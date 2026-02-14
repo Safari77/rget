@@ -530,8 +530,8 @@ fn update_hsts(map: &mut HstsMap, url: &Url, headers: &HeaderMap, debug: bool) {
             let part = part.trim();
             if part.eq_ignore_ascii_case("includeSubDomains") {
                 include_subdomains = true;
-            } else if part.to_lowercase().starts_with("max-age=")
-                && let Ok(age) = part["max-age=".len()..].trim().parse::<u64>()
+            } else if let Some(age_str) = part.to_lowercase().strip_prefix("max-age=")
+                && let Ok(age) = age_str.trim().parse::<u64>()
             {
                 max_age = Some(age);
             }
