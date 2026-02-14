@@ -1618,16 +1618,14 @@ fn rename_noreplace(from: &Path, to: &Path, debug: bool) -> std::io::Result<()> 
             return Ok(());
         }
 
-        // 3. Last Resort
+        // 3. Last Resort:  plain rename (not atomic noreplace, but best we can do)
         if debug {
             eprintln!("[DEBUG] Attempting last resort: rename (if dst missing)");
         }
         if to.exists() {
             return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
         }
-        Err(std::io::Error::other(
-            "rename_noreplace failed: destination exists or hard linking not supported",
-        ))
+        std::fs::rename(from, to)
     }
 
     #[cfg(all(unix, not(target_os = "linux"), not(target_os = "android")))]
