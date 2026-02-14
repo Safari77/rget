@@ -1625,8 +1625,7 @@ fn rename_noreplace(from: &Path, to: &Path, debug: bool) -> std::io::Result<()> 
         if to.exists() {
             return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
         }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        Err(std::io::Error::other(
             "rename_noreplace failed: destination exists or hard linking not supported",
         ))
     }
