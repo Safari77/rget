@@ -2095,7 +2095,7 @@ fn open_temp_file_safely(
             // File exists, but we aren't resuming (force_truncate is true, or start_byte is 0).
             // We must truncate it.
             let mut opts = OpenOptions::new();
-            opts.write(true).truncate(true);
+            opts.write(true).truncate(true).create(true);
 
             apply_safe_flags(&mut opts);
             #[cfg(unix)]
