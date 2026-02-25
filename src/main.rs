@@ -54,7 +54,8 @@ use clap::builder::TypedValueParser;
 use data_encoding::BASE32_NOPAD;
 use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
 use reqwest::header::{
-    CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, LOCATION, RANGE, STRICT_TRANSPORT_SECURITY,
+    CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, LOCATION, RANGE,
+    STRICT_TRANSPORT_SECURITY,
 };
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Client, Identity, Response, StatusCode};
@@ -121,6 +122,9 @@ pub enum PermanentError {
 
     // --cert and --key
     ClientCertError(String),
+
+    // Stdout safety
+    BinaryToTerminal,
 }
 
 impl std::fmt::Display for PermanentError {
@@ -216,6 +220,12 @@ impl std::fmt::Display for PermanentError {
             }
             Self::ClientCertError(msg) => {
                 write!(f, "Client certificate/key error: {}", msg)
+            }
+            Self::BinaryToTerminal => {
+                write!(
+                    f,
+                    "Refusing to write binary data to terminal. Use shell redirection (>) or --output."
+                )
             }
         }
     }
@@ -414,6 +424,13 @@ struct Args {
     /// Private key file (PEM) for Mutual TLS
     #[arg(long = "key", requires = "cert", help = "Private key file (PEM) for Mutual TLS")]
     key: Option<String>,
+
+    /// Force writing to terminal even for binary or unknown content types
+    #[arg(
+        long = "force-tty-write",
+        help = "Allow writing binary/unknown content to terminal with -O-"
+    )]
+    force_tty_write: bool,
 
     /// HSTS cache file path
     #[arg(
@@ -1394,6 +1411,50 @@ fn generate_deterministic_temp_filename(
     parent_dir.join(filename)
 }
 
+/// Check if a Content-Type indicates textual content that is safe to write to a terminal.
+/// Matches text/* and common textual application types like application/json, application/xml, etc.
+fn is_text_content_type(content_type: Option<&str>) -> bool {
+    let ct = match content_type {
+        Some(ct) => ct,
+        None => return false,
+    };
+
+    // Extract the media type (before any parameters like charset)
+    let media_type = ct.split(';').next().unwrap_or("").trim().to_lowercase();
+
+    if media_type.starts_with("text/") {
+        return true;
+    }
+
+    // Common textual application types
+    matches!(
+        media_type.as_str(),
+        "application/json"
+            | "application/xml"
+            | "application/xhtml+xml"
+            | "application/javascript"
+            | "application/ecmascript"
+            | "application/x-javascript"
+            | "application/ld+json"
+            | "application/manifest+json"
+            | "application/schema+json"
+            | "application/vnd.api+json"
+            | "application/graphql"
+            | "application/x-www-form-urlencoded"
+            | "application/x-ndjson"
+            | "application/x-yaml"
+            | "application/yaml"
+            | "application/toml"
+            | "application/sql"
+            | "application/atom+xml"
+            | "application/rss+xml"
+            | "application/soap+xml"
+            | "application/svg+xml"
+            | "application/mathml+xml"
+    ) || media_type.ends_with("+json")
+        || media_type.ends_with("+xml")
+}
+
 fn validate_url(url: &Url, insecure: bool) -> Result<()> {
     match url.scheme() {
         "https" => Ok(()),
@@ -1805,11 +1866,6 @@ async fn download_file(
         check_path_before_open(&output_path)?;
     }
 
-    // Safety: Refuse binary to terminal
-    if is_stdout && std::io::stdout().is_terminal() {
-        bail!("Refusing to write binary data to terminal. Use shell redirection (>) or --output.");
-    }
-
     // 2. Prepare Temp Path (using sanitized filename)
     let mut temp_path = if args.temp && !is_stdout {
         let parent = output_path.parent().unwrap_or(Path::new("."));
@@ -2078,6 +2134,14 @@ async fn download_file(
 
     // If writing to stdout, bypass file/temp logic
     if is_stdout {
+        // Safety: Refuse binary/unknown content to terminal unless --force-tty-write
+        if std::io::stdout().is_terminal() && !args.force_tty_write {
+            let get_content_type =
+                response.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok());
+            if !is_text_content_type(get_content_type) {
+                return Err(PermanentError::BinaryToTerminal.into());
+            }
+        }
         let mut stdout = tokio::io::stdout();
         write_response_to_file(response, &mut stdout, args, remaining_bytes, start_byte, "-")
             .await?;
@@ -2308,7 +2372,8 @@ async fn write_response_to_file<W: AsyncWrite + Unpin>(
     let mut writer = TokBufWriter::with_capacity(buf_capacity, writer_dest);
 
     // Progress Bar Setup
-    let pb = if args.quiet {
+    // Hide progress bar when writing to stdout to avoid polluting the output
+    let pb = if args.quiet || output_path_str == "-" {
         ProgressBar::hidden()
     } else if let Some(len) = remaining_bytes {
         let pb = ProgressBar::new(len);
