@@ -124,7 +124,7 @@ pub enum PermanentError {
     ClientCertError(String),
 
     // Stdout safety
-    BinaryToTerminal,
+    BinaryToTerminal(Option<String>),
 }
 
 impl std::fmt::Display for PermanentError {
@@ -221,11 +221,19 @@ impl std::fmt::Display for PermanentError {
             Self::ClientCertError(msg) => {
                 write!(f, "Client certificate/key error: {}", msg)
             }
-            Self::BinaryToTerminal => {
-                write!(
-                    f,
-                    "Refusing to write binary data to terminal. Use shell redirection (>) or --output."
-                )
+            Self::BinaryToTerminal(ct) => {
+                if let Some(ct) = ct {
+                    write!(
+                        f,
+                        "Refusing to write binary data (Content-Type: {}) to terminal. Use shell redirection (>) or --output.",
+                        ct
+                    )
+                } else {
+                    write!(
+                        f,
+                        "Refusing to write data (Content-Type: unknown) to terminal. Use shell redirection (>) or --output."
+                    )
+                }
             }
         }
     }
@@ -2139,7 +2147,10 @@ async fn download_file(
             let get_content_type =
                 response.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok());
             if !is_text_content_type(get_content_type) {
-                return Err(PermanentError::BinaryToTerminal.into());
+                return Err(PermanentError::BinaryToTerminal(
+                    get_content_type.map(|s| s.to_string()),
+                )
+                .into());
             }
         }
         let mut stdout = tokio::io::stdout();
