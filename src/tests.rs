@@ -34,6 +34,7 @@ fn make_args() -> Args {
         hsts_file: None,
         cert: None,
         key: None,
+        force_tty_write: false,
     }
 }
 
