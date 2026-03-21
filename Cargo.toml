@@ -1,7 +1,8 @@
 # vim: paste
 [package]
 name = "rget"
-version = "1.0.2"
+version = "1.0.3"
+publish = false
 edition = "2024"
 description = "Secure file downloader with wget-like functionality"
 authors = ["Sami Farin"]
