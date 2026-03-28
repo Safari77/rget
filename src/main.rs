@@ -54,8 +54,8 @@ use clap::builder::TypedValueParser;
 use data_encoding::BASE32_NOPAD;
 use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
 use reqwest::header::{
-    CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, LOCATION, RANGE,
-    STRICT_TRANSPORT_SECURITY,
+    CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, IF_MODIFIED_SINCE,
+    LAST_MODIFIED, LOCATION, RANGE, STRICT_TRANSPORT_SECURITY,
 };
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Client, Identity, Response, StatusCode};
@@ -125,6 +125,11 @@ pub enum PermanentError {
 
     // Stdout safety
     BinaryToTerminal(Option<String>),
+
+    // -N / --newer related
+    NoIfModifiedSinceWithoutNewer,
+    KeepExtensionWithoutMultipleCopies,
+    ServerFileSmallerThanLocal { server_size: u64, local_size: u64 },
 }
 
 impl std::fmt::Display for PermanentError {
@@ -145,7 +150,7 @@ impl std::fmt::Display for PermanentError {
             Self::FileAlreadyExists(path) => {
                 write!(
                     f,
-                    "File '{}' already exists. Use --continue to resume or --overwrite to replace.",
+                    "File '{}' already exists. Use --continue to resume or --overwrite to replace, --newer to download if newer, or --multiple-copies (possibly with --keep-extension) to download into different files.",
                     path.display()
                 )
             }
@@ -234,6 +239,20 @@ impl std::fmt::Display for PermanentError {
                         "Refusing to write data (Content-Type: unknown) to terminal. Use shell redirection (>) or --output."
                     )
                 }
+            }
+            Self::NoIfModifiedSinceWithoutNewer => {
+                write!(f, "--no-if-modified-since can only be used with -N (--newer)")
+            }
+            Self::KeepExtensionWithoutMultipleCopies => {
+                write!(f, "--keep-extension can only be used with --multiple-copies")
+            }
+            Self::ServerFileSmallerThanLocal { server_size, local_size } => {
+                write!(
+                    f,
+                    "Server file ({}) is smaller than local file ({}), skipping download",
+                    HumanBytes(*server_size),
+                    HumanBytes(*local_size)
+                )
             }
         }
     }
@@ -446,6 +465,38 @@ struct Args {
         help = "Path to HSTS cache file (default: ~/.config/rget/hsts.conf)"
     )]
     hsts_file: Option<String>,
+
+    /// Download only if remote file is newer than local file
+    #[arg(short = 'N', long = "newer", help = "Download only if remote file is newer than local")]
+    newer: bool,
+
+    /// Do not send If-Modified-Since header in -N mode; send preliminary HEAD request instead
+    #[arg(
+        long = "no-if-modified-since",
+        help = "In -N mode, use HEAD request instead of If-Modified-Since header"
+    )]
+    no_if_modified_since: bool,
+
+    /// After downloading, set file modification time to server's Last-Modified
+    #[arg(
+        long = "server-timestamps",
+        help = "Set file modification time to server's Last-Modified header"
+    )]
+    server_timestamps: bool,
+
+    /// Allow multiple copies when same output filename is generated during one execution
+    #[arg(
+        long = "multiple-copies",
+        help = "Rename duplicate filenames with numeric suffix (file.ext.1, file.ext.2, ...)"
+    )]
+    multiple_copies: bool,
+
+    /// Place number before extension when numbering copies (file.1.ext instead of file.ext.1)
+    #[arg(
+        long = "keep-extension",
+        help = "Place number before extension in --multiple-copies mode"
+    )]
+    keep_extension: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -731,7 +782,7 @@ async fn resolve_final_url_and_client(
     args: &Args,
     client_cache: &mut HashMap<String, Client>,
     hsts_db: &mut HstsMap,
-) -> Result<(Client, Url, Option<u64>, Option<String>)> {
+) -> Result<(Client, Url, Option<u64>, Option<String>, Option<String>)> {
     let mut current_url = initial_url;
     let mut redirect_count = 0;
 
@@ -841,8 +892,11 @@ async fn resolve_final_url_and_client(
         let content_disposition =
             headers.get(CONTENT_DISPOSITION).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
 
+        let last_modified =
+            headers.get(LAST_MODIFIED).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+
         if status.is_success() || status.is_client_error() || status.is_server_error() {
-            return Ok((client, current_url, content_length, content_disposition));
+            return Ok((client, current_url, content_length, content_disposition, last_modified));
         }
 
         bail!("Unexpected status code: {}", status);
@@ -885,6 +939,16 @@ async fn run_with_args(args: Args) -> Result<()> {
         .into());
     }
 
+    // Validate --no-if-modified-since requires -N
+    if args.no_if_modified_since && !args.newer {
+        return Err(PermanentError::NoIfModifiedSinceWithoutNewer.into());
+    }
+
+    // Validate --keep-extension requires --multiple-copies
+    if args.keep_extension && !args.multiple_copies {
+        return Err(PermanentError::KeepExtensionWithoutMultipleCopies.into());
+    }
+
     if let Err(e) = apply_security_sandbox() {
         eprintln!("Failed to apply seccomp filter: {}", e);
         std::process::exit(1);
@@ -898,6 +962,9 @@ async fn run_with_args(args: Args) -> Result<()> {
     let mut client_cache: HashMap<String, Client> = HashMap::new();
     let mut overall_success = true;
     let max_retries = if args.retries == 0 { u64::MAX } else { args.retries };
+
+    // Track used output filenames for --multiple-copies
+    let mut used_filenames: HashMap<PathBuf, u32> = HashMap::new();
 
     for url_str in &urls {
         let url = match Url::parse(url_str) {
@@ -930,7 +997,7 @@ async fn run_with_args(args: Args) -> Result<()> {
                 )
                 .await
                 {
-                    Ok((client, final_url, content_length, content_disposition)) => {
+                    Ok((client, final_url, content_length, content_disposition, last_modified)) => {
                         if current_args.verbose && final_url != url {
                             eprintln!("Final URL: {}", final_url);
                         }
@@ -951,6 +1018,8 @@ async fn run_with_args(args: Args) -> Result<()> {
                             &current_args,
                             content_length,
                             content_disposition.as_deref(),
+                            last_modified.as_deref(),
+                            &mut used_filenames,
                         )
                         .await
                     }
@@ -1854,12 +1923,215 @@ fn is_permanent_error(err: &anyhow::Error) -> bool {
     false
 }
 
+/// Parse an HTTP-date string (RFC 1123 / RFC 850 / asctime) into a SystemTime.
+/// Only RFC 1123 format is fully supported: "Sun, 06 Nov 1994 08:49:37 GMT"
+fn parse_http_date(s: &str) -> Option<SystemTime> {
+    let s = s.trim();
+    // RFC 1123: "Sun, 06 Nov 1994 08:49:37 GMT"
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.len() != 6 || parts[5] != "GMT" {
+        return None;
+    }
+    let day: u64 = parts[1].parse().ok()?;
+    let month: u64 = match parts[2] {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year: u64 = parts[3].parse().ok()?;
+    if year < 1970 || day < 1 || day > 31 {
+        return None;
+    }
+    let time_parts: Vec<&str> = parts[4].split(':').collect();
+    if time_parts.len() != 3 {
+        return None;
+    }
+    let hour: u64 = time_parts[0].parse().ok()?;
+    let min: u64 = time_parts[1].parse().ok()?;
+    let sec: u64 = time_parts[2].parse().ok()?;
+    if hour > 23 || min > 59 || sec > 60 {
+        return None;
+    }
+
+    // Convert to days since Unix epoch using the civil date algorithm
+    // Based on Howard Hinnant's chrono-compatible algorithm
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y / 400;
+    let yoe = y - era * 400;
+    let m_adj = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * m_adj + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days_since_epoch = era * 146097 + doe;
+    // Unix epoch is day 719468 in this calendar
+    let unix_days = days_since_epoch.checked_sub(719468)?;
+    let total_secs = unix_days * 86400 + hour * 3600 + min * 60 + sec;
+
+    Some(UNIX_EPOCH + Duration::from_secs(total_secs))
+}
+
+/// Format a SystemTime as an HTTP-date string (RFC 1123).
+fn format_http_date(time: SystemTime) -> Option<String> {
+    let dur = time.duration_since(UNIX_EPOCH).ok()?;
+    let secs = dur.as_secs();
+
+    let sec = secs % 60;
+    let min = (secs / 60) % 60;
+    let hour = (secs / 3600) % 24;
+    let total_days = secs / 86400;
+
+    // Day of week: Jan 1 1970 was a Thursday (4)
+    let weekday = ((total_days + 4) % 7) as usize;
+    let weekdays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+    // Convert days since epoch to civil date (Howard Hinnant's algorithm)
+    let z = total_days + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+
+    let months =
+        ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+    Some(format!(
+        "{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT",
+        weekdays[weekday], day, months[month as usize], year, hour, min, sec
+    ))
+}
+
+/// Apply server timestamp (Last-Modified) to a local file.
+/// Silently does nothing if the header is missing or unparseable.
+fn apply_server_timestamp(path: &Path, last_modified: Option<&str>, debug: bool) {
+    let Some(lm_str) = last_modified else {
+        if debug {
+            eprintln!("[DEBUG] No Last-Modified header, not setting file timestamp");
+        }
+        return;
+    };
+
+    let Some(server_time) = parse_http_date(lm_str) else {
+        if debug {
+            eprintln!("[DEBUG] Could not parse Last-Modified header: {:?}", lm_str);
+        }
+        return;
+    };
+
+    match std::fs::File::options().write(true).open(path) {
+        Ok(file) => {
+            let times = std::fs::FileTimes::new().set_modified(server_time);
+            if let Err(e) = file.set_times(times) {
+                if debug {
+                    eprintln!("[DEBUG] Failed to set file timestamp: {}", e);
+                }
+            } else if debug {
+                eprintln!("[DEBUG] Set file modification time to: {}", lm_str);
+            }
+        }
+        Err(e) => {
+            if debug {
+                eprintln!("[DEBUG] Failed to open file for timestamp update: {}", e);
+            }
+        }
+    }
+}
+
+/// Generate a numbered filename to avoid collisions.
+/// With keep_extension=false: file.ext -> file.ext.1
+/// With keep_extension=true: file.ext -> file.1.ext
+fn generate_numbered_filename(path: &Path, number: u32, keep_extension: bool) -> PathBuf {
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("download");
+
+    let new_name = if keep_extension {
+        if let Some(dot_pos) = filename.rfind('.') {
+            let base = &filename[..dot_pos];
+            let ext = &filename[dot_pos..]; // includes the dot
+            format!("{}.{}{}", base, number, ext)
+        } else {
+            format!("{}.{}", filename, number)
+        }
+    } else {
+        format!("{}.{}", filename, number)
+    };
+
+    parent.join(new_name)
+}
+
+/// Resolve a unique output path, handling --multiple-copies numbering.
+/// Returns the path to use and whether it was renamed.
+fn resolve_unique_output_path(
+    output_path: &Path,
+    args: &Args,
+    used_filenames: &mut HashMap<PathBuf, u32>,
+) -> Result<(PathBuf, bool)> {
+    let canonical_key = output_path.to_path_buf();
+
+    if args.multiple_copies {
+        // Check if this filename was already used in this execution
+        if let Some(counter) = used_filenames.get_mut(&canonical_key) {
+            // Already used, find the next available numbered variant
+            loop {
+                let numbered =
+                    generate_numbered_filename(output_path, *counter, args.keep_extension);
+                if !numbered.exists() {
+                    *counter += 1;
+                    return Ok((numbered, true));
+                }
+                *counter += 1;
+            }
+        }
+
+        // First use of this filename in this execution
+        // Check if it already exists on disk
+        if output_path.exists() && !args.overwrite && !args.resume && !args.newer {
+            let mut counter = 1u32;
+            loop {
+                let numbered =
+                    generate_numbered_filename(output_path, counter, args.keep_extension);
+                if !numbered.exists() {
+                    used_filenames.insert(canonical_key, counter + 1);
+                    return Ok((numbered, true));
+                }
+                counter += 1;
+            }
+        }
+
+        // File doesn't exist yet or overwrite/resume/newer is set, use as-is
+        used_filenames.insert(canonical_key, 1);
+        Ok((output_path.to_path_buf(), false))
+    } else {
+        // No --multiple-copies: just track usage
+        if used_filenames.contains_key(&canonical_key) {
+            return Err(PermanentError::FileAlreadyExists(output_path.to_path_buf()).into());
+        }
+        used_filenames.insert(canonical_key, 1);
+        Ok((output_path.to_path_buf(), false))
+    }
+}
+
 async fn download_file(
     client: &Client,
     url: &Url,
     args: &Args,
     expected_length: Option<u64>,
     content_disposition: Option<&str>,
+    head_last_modified: Option<&str>,
+    used_filenames: &mut HashMap<PathBuf, u32>,
 ) -> Result<()> {
     // 1. Determine filenames first
     let mut final_filename = determine_filename(args, url, content_disposition);
@@ -1870,8 +2142,60 @@ async fn download_file(
     };
 
     let is_stdout = output_path.to_str() == Some("-");
+
+    // Handle --multiple-copies: resolve unique output path before any file checks
+    if !is_stdout {
+        let (resolved_path, was_renamed) =
+            resolve_unique_output_path(&output_path, args, used_filenames)?;
+        if was_renamed && !args.quiet {
+            eprintln!(
+                "Filename collision: '{}' -> '{}'",
+                output_path.display(),
+                resolved_path.display()
+            );
+        }
+        output_path = resolved_path;
+        // Update final_filename if path changed
+        if let Some(fname) = output_path.file_name().and_then(|s| s.to_str()) {
+            final_filename = fname.to_string();
+        }
+    }
+
     if !is_stdout {
         check_path_before_open(&output_path)?;
+    }
+
+    // Handle -N (--newer) mode: check if remote file is newer than local file
+    if args.newer && !is_stdout && output_path.exists() {
+        if args.no_if_modified_since {
+            // --no-if-modified-since: Use the HEAD response's Last-Modified we already have
+            if let Some(lm_str) = head_last_modified
+                && let Some(server_time) = parse_http_date(lm_str)
+            {
+                let local_meta = fs::metadata(&output_path)?;
+                if let Ok(local_mtime) = local_meta.modified() {
+                    if server_time <= local_mtime {
+                        if !args.quiet {
+                            eprintln!(
+                                "Server file is not newer than local file '{}', skipping.",
+                                output_path.display()
+                            );
+                        }
+                        return Ok(());
+                    }
+                    if args.verbose {
+                        eprintln!(
+                            "Server file is newer than local file, proceeding with download."
+                        );
+                    }
+                }
+            } else if args.debug {
+                eprintln!(
+                    "[DEBUG] -N --no-if-modified-since: No Last-Modified from HEAD, proceeding with download"
+                );
+            }
+        }
+        // If not --no-if-modified-since, we'll add If-Modified-Since to the GET request below
     }
 
     // 2. Prepare Temp Path (using sanitized filename)
@@ -1904,6 +2228,17 @@ async fn download_file(
                     );
                 }
                 if let Some(total) = expected_length {
+                    // --continue: skip if server file is smaller than local
+                    if start_byte > total {
+                        if !args.quiet {
+                            eprintln!(
+                                "Local temp file ({}) is larger than server file ({}), skipping.",
+                                HumanBytes(start_byte),
+                                HumanBytes(total)
+                            );
+                        }
+                        return Ok(());
+                    }
                     if start_byte >= total {
                         if !args.quiet {
                             eprintln!(
@@ -1912,6 +2247,9 @@ async fn download_file(
                             );
                         }
                         perform_atomic_move(tp, &output_path, args)?;
+                        if args.server_timestamps {
+                            apply_server_timestamp(&output_path, head_last_modified, args.debug);
+                        }
                         return Ok(());
                     }
                     if !args.quiet {
@@ -1952,6 +2290,7 @@ async fn download_file(
                 // Check if file is already complete
                 if let Some(total) = expected_length
                     && existing_size >= total
+                    && !args.newer
                 {
                     if !args.quiet {
                         eprintln!("File already fully downloaded.");
@@ -1960,10 +2299,10 @@ async fn download_file(
                 }
 
                 // Output file exists but is incomplete
-                if !args.resume && !args.overwrite {
+                if !args.resume && !args.overwrite && !args.newer {
                     return Err(PermanentError::FileAlreadyExists(output_path.to_path_buf()).into());
                 }
-                // With --resume or --overwrite, we proceed (download to temp, then rename)
+                // With --resume or --overwrite or --newer, we proceed (download to temp, then rename)
                 // Note: we don't resume from the output file in temp mode, we use the temp file
             }
         } else if output_path.exists() {
@@ -1971,9 +2310,26 @@ async fn download_file(
             let metadata = fs::metadata(&output_path)?;
             let existing_size = metadata.len();
 
+            // --continue: skip if server file is smaller than local
+            if args.resume {
+                if let Some(total) = expected_length
+                    && existing_size > total
+                {
+                    if !args.quiet {
+                        eprintln!(
+                            "Local file ({}) is larger than server file ({}), skipping.",
+                            HumanBytes(existing_size),
+                            HumanBytes(total)
+                        );
+                    }
+                    return Ok(());
+                }
+            }
+
             // Check if file is already complete (when we know expected size)
             if let Some(total) = expected_length
                 && existing_size >= total
+                && !args.newer
             {
                 if !args.quiet {
                     eprintln!("File already fully downloaded.");
@@ -1997,6 +2353,8 @@ async fn download_file(
                 } else if !args.quiet {
                     eprintln!("Resuming from byte {}", start_byte);
                 }
+            } else if args.newer {
+                // -N mode: we'll overwrite if server is newer (handled above or via If-Modified-Since)
             } else if !args.overwrite {
                 // File exists, no --continue, no --overwrite: clear error
                 return Err(PermanentError::FileAlreadyExists(output_path.to_path_buf()).into());
@@ -2010,12 +2368,37 @@ async fn download_file(
         request = request.header(RANGE, format!("bytes={}-", start_byte));
     }
 
+    // -N mode without --no-if-modified-since: add If-Modified-Since header
+    if args.newer && !args.no_if_modified_since && !is_stdout && output_path.exists() {
+        let local_meta = fs::metadata(&output_path);
+        if let Ok(meta) = local_meta
+            && let Ok(local_mtime) = meta.modified()
+            && let Some(http_date) = format_http_date(local_mtime)
+        {
+            if args.verbose {
+                eprintln!("Sending If-Modified-Since: {}", http_date);
+            }
+            request = request.header(IF_MODIFIED_SINCE, http_date);
+        }
+    }
+
     if let Some(ref u) = args.user {
         request = request.basic_auth(u, args.password.as_deref());
     }
 
     let response = request.send().await.context("Failed to send GET request")?;
     let status = response.status();
+
+    // Handle 304 Not Modified (from If-Modified-Since in -N mode)
+    if status == StatusCode::NOT_MODIFIED {
+        if !args.quiet {
+            eprintln!(
+                "Server file is not newer than local file '{}', skipping.",
+                output_path.display()
+            );
+        }
+        return Ok(());
+    }
 
     // Check for redirect on GET (HEAD and GET may behave differently)
     if status.is_redirection() {
@@ -2040,6 +2423,9 @@ async fn download_file(
         {
             perform_atomic_move(tp, &output_path, args)?;
         }
+        if args.server_timestamps {
+            apply_server_timestamp(&output_path, head_last_modified, args.debug);
+        }
         return Ok(());
     }
 
@@ -2056,6 +2442,12 @@ async fn download_file(
             return Err(PermanentError::HttpClientError(status.as_u16()).into());
         }
     }
+
+    // Capture Last-Modified from the GET response (may differ from HEAD)
+    let get_last_modified =
+        response.headers().get(LAST_MODIFIED).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+    // Prefer GET's Last-Modified, fallback to HEAD's
+    let effective_last_modified = get_last_modified.as_deref().or(head_last_modified);
 
     let mut force_truncate = false;
     // Validate Content-Range when resuming
@@ -2159,12 +2551,18 @@ async fn download_file(
         return Ok(());
     }
 
-    if args.temp {
+    // In -N mode, force overwrite since we've already determined the file needs updating
+    let mut effective_args = args.clone();
+    if args.newer && output_path.exists() {
+        effective_args.overwrite = true;
+    }
+
+    if effective_args.temp {
         let path_buf = temp_path.clone().expect("Logic error: temp path missing");
         download_to_temp(
             response,
             &output_path,
-            args,
+            &effective_args,
             start_byte,
             remaining_bytes,
             force_truncate,
@@ -2172,8 +2570,20 @@ async fn download_file(
         )
         .await?;
     } else {
-        download_direct(response, &output_path, args, start_byte, remaining_bytes, force_truncate)
-            .await?;
+        download_direct(
+            response,
+            &output_path,
+            &effective_args,
+            start_byte,
+            remaining_bytes,
+            force_truncate,
+        )
+        .await?;
+    }
+
+    // Apply server timestamps after successful download
+    if args.server_timestamps {
+        apply_server_timestamp(&output_path, effective_last_modified, args.debug);
     }
 
     Ok(())
