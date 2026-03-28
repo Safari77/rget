@@ -1015,7 +1015,7 @@ async fn resolve_final_url_and_client(
     }
 }
 
-async fn run_with_args(args: Args) -> Result<()> {
+async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
     let mut all_urls = args.urls.clone();
 
     env_logger::init();
@@ -1086,11 +1086,6 @@ async fn run_with_args(args: Args) -> Result<()> {
         std::process::exit(1);
     }
 
-    // Load HSTS Database
-    let hsts_path =
-        if let Some(p) = &args.hsts_file { PathBuf::from(p) } else { get_default_hsts_path() };
-    let mut hsts_db = load_hsts_db(&hsts_path);
-
     let mut client_cache: HashMap<String, Client> = HashMap::new();
     let mut overall_success = true;
     let max_retries = if args.retries == 0 { u64::MAX } else { args.retries };
@@ -1123,7 +1118,7 @@ async fn run_with_args(args: Args) -> Result<()> {
                         url.clone(),
                         &current_args,
                         &mut client_cache,
-                        &mut hsts_db,
+                        hsts_db,
                     )
                     .await
                     {
@@ -1142,7 +1137,7 @@ async fn run_with_args(args: Args) -> Result<()> {
                                 &final_url,
                                 &current_args,
                                 &mut client_cache,
-                                &mut hsts_db,
+                                hsts_db,
                                 &mut used_filenames,
                             )
                             .await
@@ -1201,7 +1196,7 @@ async fn run_with_args(args: Args) -> Result<()> {
                     url.clone(),
                     &current_args,
                     &mut client_cache,
-                    &mut hsts_db,
+                    hsts_db,
                 )
                 .await
                 {
@@ -1272,8 +1267,6 @@ async fn run_with_args(args: Args) -> Result<()> {
             eprintln!();
         }
     }
-
-    save_hsts_db(&hsts_path, &hsts_db);
 
     if overall_success { Ok(()) } else { bail!("One or more downloads failed") }
 }
@@ -3681,8 +3674,13 @@ async fn main() -> ExitCode {
     // Set global flag for signal handler
     KEEP_TEMP_ON_CANCEL.store(args.keep_temp, Ordering::SeqCst);
 
-    tokio::select! {
-        result = run_with_args(args) => {
+    // Load HSTS database once at startup
+    let hsts_path =
+        if let Some(ref p) = args.hsts_file { PathBuf::from(p) } else { get_default_hsts_path() };
+    let mut hsts_db = load_hsts_db(&hsts_path);
+
+    let exit_code = tokio::select! {
+        result = run_with_args(args, &mut hsts_db) => {
             match result {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
@@ -3719,7 +3717,12 @@ async fn main() -> ExitCode {
             }
             ExitCode::FAILURE
         }
-    }
+    };
+
+    // Save HSTS database exactly once, regardless of how we exited
+    save_hsts_db(&hsts_path, &hsts_db);
+
+    exit_code
 }
 
 /// Helper to listen for Ctrl+C (SIGINT) and SIGTERM (Unix)
