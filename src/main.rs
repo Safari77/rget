@@ -40,7 +40,7 @@ static GLOBAL: Jemalloc = Jemalloc;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::IsTerminal;
-use std::io::{BufRead, BufReader, BufWriter, ErrorKind};
+use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Read};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -53,6 +53,7 @@ use clap::Parser;
 use clap::builder::TypedValueParser;
 use data_encoding::BASE32_NOPAD;
 use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
+use regex::Regex;
 use reqwest::header::{
     CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, IF_MODIFIED_SINCE,
     LAST_MODIFIED, LOCATION, RANGE, STRICT_TRANSPORT_SECURITY,
@@ -61,6 +62,7 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Client, Identity, Response, StatusCode};
 use rustls::ClientConfig;
 use rustls_platform_verifier::BuilderVerifierExt;
+use sha2::{Digest as Sha2Digest, Sha256};
 use sha3::{
     Shake256,
     digest::{ExtendableOutput, Update, XofReader},
@@ -130,6 +132,19 @@ pub enum PermanentError {
     NoIfModifiedSinceWithoutNewer,
     KeepExtensionWithoutMultipleCopies,
     ServerFileSmallerThanLocal { server_size: u64, local_size: u64 },
+
+    // --json-parse related
+    JsonContentTypeExpected(String),
+    JsonParseError(String),
+    JsonPathError(String),
+    JsonNoUrlsExtracted,
+    JsonUrlHashCountMismatch { urls: usize, hashes: usize },
+    JsonUrlNameCountMismatch { urls: usize, names: usize },
+    JsonHashMissing(String),
+    JsonHashMismatch { file: String, expected: String, actual: String },
+    JsonHashUnsupportedAlgo(String),
+    JsonVerifyHashWithoutHashField,
+    JsonUrlFieldRequired,
 }
 
 impl std::fmt::Display for PermanentError {
@@ -155,7 +170,11 @@ impl std::fmt::Display for PermanentError {
                 )
             }
             Self::TruncatedFilenameExists(path) => {
-                write!(f, "Truncated filename '{}' already exists.", path.display())
+                write!(
+                    f,
+                    "Truncated filename '{}' already exists. Use --overwrite to replace or --multiple-copies to save with a different name.",
+                    path.display()
+                )
             }
             Self::FilenameTooLong => {
                 write!(f, "Filename too long and cannot be truncated")
@@ -201,7 +220,7 @@ impl std::fmt::Display for PermanentError {
             Self::FileAppearedDuringDownload(path) => {
                 write!(
                     f,
-                    "File '{}' appeared during download (TOCTOU race). Use --overwrite to replace.",
+                    "File '{}' appeared during download (TOCTOU race). Use --overwrite to replace or --multiple-copies to save with a different name.",
                     path.display()
                 )
             }
@@ -253,6 +272,59 @@ impl std::fmt::Display for PermanentError {
                     HumanBytes(*server_size),
                     HumanBytes(*local_size)
                 )
+            }
+            Self::JsonContentTypeExpected(actual) => {
+                write!(
+                    f,
+                    "--json-parse requires Content-Type: application/json but got: {}",
+                    actual
+                )
+            }
+            Self::JsonParseError(msg) => {
+                write!(f, "Failed to parse JSON response: {}", msg)
+            }
+            Self::JsonPathError(msg) => {
+                write!(f, "JSON path expression error: {}", msg)
+            }
+            Self::JsonNoUrlsExtracted => {
+                write!(f, "No download URLs were extracted from JSON (after filtering)")
+            }
+            Self::JsonUrlHashCountMismatch { urls, hashes } => {
+                write!(
+                    f,
+                    "--json-url-field extracted {} URLs but --json-hash-field extracted {} hashes (must be equal)",
+                    urls, hashes
+                )
+            }
+            Self::JsonUrlNameCountMismatch { urls, names } => {
+                write!(
+                    f,
+                    "--json-url-field extracted {} URLs but --json-name-field extracted {} names (must be equal)",
+                    urls, names
+                )
+            }
+            Self::JsonHashMissing(file) => {
+                write!(f, "--json-verify-hash: no hash found in JSON for file '{}'", file)
+            }
+            Self::JsonHashMismatch { file, expected, actual } => {
+                write!(
+                    f,
+                    "SHA256 verification FAILED for '{}': expected {} got {}",
+                    file, expected, actual
+                )
+            }
+            Self::JsonHashUnsupportedAlgo(algo) => {
+                write!(
+                    f,
+                    "Unsupported hash algorithm in JSON digest field: '{}' (only sha256 supported)",
+                    algo
+                )
+            }
+            Self::JsonVerifyHashWithoutHashField => {
+                write!(f, "--json-verify-hash requires --json-hash-field")
+            }
+            Self::JsonUrlFieldRequired => {
+                write!(f, "--json-parse requires --json-url-field")
             }
         }
     }
@@ -497,6 +569,46 @@ struct Args {
         help = "Place number before extension in --multiple-copies mode"
     )]
     keep_extension: bool,
+
+    /// Parse JSON response and extract download URLs
+    #[arg(long = "json-parse", help = "Parse JSON response to extract and download file URLs")]
+    json_parse: bool,
+
+    /// JSON path expression to extract download URLs (required with --json-parse)
+    /// Uses jq-like dot notation: .assets[].browser_download_url
+    #[arg(
+        long = "json-url-field",
+        help = "JSON path to download URL field (e.g. .assets[].browser_download_url)"
+    )]
+    json_url_field: Option<String>,
+
+    /// JSON path expression to extract hash digests (parallel to --json-url-field)
+    #[arg(
+        long = "json-hash-field",
+        help = "JSON path to hash digest field (e.g. .assets[].digest)"
+    )]
+    json_hash_field: Option<String>,
+
+    /// JSON path expression to extract output filenames (parallel to --json-url-field)
+    #[arg(
+        long = "json-name-field",
+        help = "JSON path to output filename field (e.g. .assets[].name)"
+    )]
+    json_name_field: Option<String>,
+
+    /// Regex to filter URLs extracted from JSON
+    #[arg(
+        long = "json-filter",
+        help = "Regex to filter URLs extracted from JSON (e.g. '\\.mmdb$')"
+    )]
+    json_filter: Option<String>,
+
+    /// Verify SHA256 hash of downloaded files against JSON hash field
+    #[arg(
+        long = "json-verify-hash",
+        help = "Verify SHA256 of downloaded files against hash from JSON"
+    )]
+    json_verify_hash: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -932,7 +1044,7 @@ async fn run_with_args(args: Args) -> Result<()> {
         all_urls
     };
 
-    if args.output.is_some() && urls.len() > 1 {
+    if args.output.is_some() && urls.len() > 1 && !args.json_parse {
         return Err(PermanentError::InvalidArguments(
             "--output cannot be used with multiple URLs".to_string(),
         )
@@ -947,6 +1059,26 @@ async fn run_with_args(args: Args) -> Result<()> {
     // Validate --keep-extension requires --multiple-copies
     if args.keep_extension && !args.multiple_copies {
         return Err(PermanentError::KeepExtensionWithoutMultipleCopies.into());
+    }
+
+    // Validate --json-parse requirements
+    if args.json_parse && args.json_url_field.is_none() {
+        return Err(PermanentError::JsonUrlFieldRequired.into());
+    }
+    if args.json_verify_hash && args.json_hash_field.is_none() {
+        return Err(PermanentError::JsonVerifyHashWithoutHashField.into());
+    }
+    // --json-hash-field, --json-name-field, --json-filter, --json-verify-hash imply --json-parse
+    if (args.json_url_field.is_some()
+        || args.json_hash_field.is_some()
+        || args.json_name_field.is_some()
+        || args.json_filter.is_some()
+        || args.json_verify_hash)
+        && !args.json_parse
+    {
+        return Err(PermanentError::InvalidArguments(
+            "--json-url-field, --json-hash-field, --json-name-field, --json-filter, and --json-verify-hash require --json-parse".to_string()
+        ).into());
     }
 
     if let Err(e) = apply_security_sandbox() {
@@ -980,6 +1112,82 @@ async fn run_with_args(args: Args) -> Result<()> {
             eprintln!("Starting download: {}", url);
         }
 
+        // JSON parse mode: fetch JSON, extract URLs, download them
+        if args.json_parse {
+            let mut attempt = 0;
+            loop {
+                let current_args = args.clone();
+
+                let result = async {
+                    match resolve_final_url_and_client(
+                        url.clone(),
+                        &current_args,
+                        &mut client_cache,
+                        &mut hsts_db,
+                    )
+                    .await
+                    {
+                        Ok((
+                            client,
+                            final_url,
+                            _content_length,
+                            _content_disposition,
+                            _last_modified,
+                        )) => {
+                            if current_args.verbose && final_url != url {
+                                eprintln!("Final URL: {}", final_url);
+                            }
+                            process_json_downloads(
+                                &client,
+                                &final_url,
+                                &current_args,
+                                &mut client_cache,
+                                &mut hsts_db,
+                                &mut used_filenames,
+                            )
+                            .await
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                .await;
+
+                match result {
+                    Ok(()) => break,
+                    Err(e) => {
+                        if is_permanent_error(&e) {
+                            eprintln!("Failed: {:#}", e);
+                            overall_success = false;
+                            break;
+                        }
+                        if attempt >= max_retries {
+                            eprintln!("Failed: {:#}", e);
+                            overall_success = false;
+                            break;
+                        }
+                        eprintln!(
+                            "Error: {}. Retrying (attempt {}/{})...",
+                            e,
+                            attempt + 1,
+                            if args.retries == 0 {
+                                "\u{221e}".to_string()
+                            } else {
+                                args.retries.to_string()
+                            }
+                        );
+                        attempt += 1;
+                        let delay = 1u64 << attempt.clamp(0, 6);
+                        sleep(Duration::from_secs(delay)).await;
+                    }
+                }
+            }
+            if !args.quiet && urls.len() > 1 {
+                eprintln!();
+            }
+            continue;
+        }
+
+        // Normal (non-JSON) download mode
         let mut attempt = 0;
         loop {
             let mut current_args = args.clone();
@@ -1020,6 +1228,7 @@ async fn run_with_args(args: Args) -> Result<()> {
                             content_disposition.as_deref(),
                             last_modified.as_deref(),
                             &mut used_filenames,
+                            None,
                         )
                         .await
                     }
@@ -1949,7 +2158,7 @@ fn parse_http_date(s: &str) -> Option<SystemTime> {
         _ => return None,
     };
     let year: u64 = parts[3].parse().ok()?;
-    if year < 1970 || day < 1 || day > 31 {
+    if year < 1970 || !(1..=31).contains(&day) {
         return None;
     }
     let time_parts: Vec<&str> = parts[4].split(':').collect();
@@ -2124,6 +2333,525 @@ fn resolve_unique_output_path(
     }
 }
 
+/// Evaluate a simplified jq-like path expression against a serde_json::Value.
+/// Supports: .field, .field[], .field[].subfield, .field[N], chained paths.
+/// Returns a list of matching leaf values as strings.
+fn json_path_extract(value: &serde_json::Value, path: &str) -> Result<Vec<String>> {
+    let path = path.trim();
+    if path.is_empty() || path == "." {
+        return match value {
+            serde_json::Value::String(s) => Ok(vec![s.clone()]),
+            other => Ok(vec![other.to_string()]),
+        };
+    }
+
+    // Parse the path into segments
+    let segments = parse_jq_path(path)?;
+    let mut results = Vec::new();
+    collect_values(value, &segments, &mut results);
+    Ok(results)
+}
+
+#[derive(Debug)]
+enum JqSegment {
+    Field(String),
+    ArrayIter,         // []
+    ArrayIndex(usize), // [N]
+}
+
+/// Parse a jq-like path into segments.
+/// Examples:
+///   ".assets[].browser_download_url" -> [Field("assets"), ArrayIter, Field("browser_download_url")]
+///   ".digest" -> [Field("digest")]
+///   ".data[0].url" -> [Field("data"), ArrayIndex(0), Field("url")]
+fn parse_jq_path(path: &str) -> Result<Vec<JqSegment>> {
+    let path = path.strip_prefix('.').unwrap_or(path);
+    let mut segments = Vec::new();
+    let mut chars = path.chars().peekable();
+    let mut current_field = String::new();
+
+    while let Some(&ch) = chars.peek() {
+        match ch {
+            '.' => {
+                // Flush current field
+                if !current_field.is_empty() {
+                    segments.push(JqSegment::Field(current_field.clone()));
+                    current_field.clear();
+                }
+                chars.next();
+            }
+            '[' => {
+                // Flush current field
+                if !current_field.is_empty() {
+                    segments.push(JqSegment::Field(current_field.clone()));
+                    current_field.clear();
+                }
+                chars.next(); // consume '['
+                let mut bracket_content = String::new();
+                while let Some(&bc) = chars.peek() {
+                    if bc == ']' {
+                        chars.next(); // consume ']'
+                        break;
+                    }
+                    bracket_content.push(bc);
+                    chars.next();
+                }
+                if bracket_content.is_empty() {
+                    segments.push(JqSegment::ArrayIter);
+                } else if let Ok(idx) = bracket_content.parse::<usize>() {
+                    segments.push(JqSegment::ArrayIndex(idx));
+                } else {
+                    return Err(PermanentError::JsonPathError(format!(
+                        "Invalid array index: [{}]",
+                        bracket_content
+                    ))
+                    .into());
+                }
+            }
+            '|' => {
+                // Pipe operator: treat as segment separator (skip whitespace around it)
+                if !current_field.is_empty() {
+                    segments.push(JqSegment::Field(current_field.clone()));
+                    current_field.clear();
+                }
+                chars.next(); // consume '|'
+                // Skip whitespace after pipe
+                while let Some(&wc) = chars.peek() {
+                    if wc.is_whitespace() {
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                // Skip leading dot after pipe if present
+                if let Some(&'.') = chars.peek() {
+                    chars.next();
+                }
+            }
+            c if c.is_whitespace() => {
+                chars.next(); // skip whitespace
+            }
+            c => {
+                current_field.push(c);
+                chars.next();
+            }
+        }
+    }
+
+    // Flush remaining field
+    if !current_field.is_empty() {
+        segments.push(JqSegment::Field(current_field));
+    }
+
+    if segments.is_empty() {
+        return Err(PermanentError::JsonPathError("Empty path expression".to_string()).into());
+    }
+
+    Ok(segments)
+}
+
+/// Recursively collect string values matching the segment path.
+fn collect_values(value: &serde_json::Value, segments: &[JqSegment], results: &mut Vec<String>) {
+    if segments.is_empty() {
+        match value {
+            serde_json::Value::String(s) => results.push(s.clone()),
+            serde_json::Value::Null => {} // skip nulls
+            other => results.push(other.to_string()),
+        }
+        return;
+    }
+
+    match &segments[0] {
+        JqSegment::Field(name) => {
+            if let Some(child) = value.get(name.as_str()) {
+                collect_values(child, &segments[1..], results);
+            }
+        }
+        JqSegment::ArrayIter => {
+            if let serde_json::Value::Array(arr) = value {
+                for item in arr {
+                    collect_values(item, &segments[1..], results);
+                }
+            }
+        }
+        JqSegment::ArrayIndex(idx) => {
+            if let serde_json::Value::Array(arr) = value
+                && let Some(item) = arr.get(*idx)
+            {
+                collect_values(item, &segments[1..], results);
+            }
+        }
+    }
+}
+
+/// Parse a digest field like "sha256:3f79a2a5..." into (algorithm, hex_hash).
+fn parse_digest_field(digest: &str) -> Option<(&str, &str)> {
+    let digest = digest.trim();
+    if let Some(colon_pos) = digest.find(':') {
+        let algo = &digest[..colon_pos];
+        let hash = &digest[colon_pos + 1..];
+        if !hash.is_empty() {
+            return Some((algo, hash));
+        }
+    }
+    // If no colon, treat entire string as a bare SHA256 hex hash (if it looks like one)
+    if digest.len() == 64 && digest.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Some(("sha256", digest));
+    }
+    None
+}
+
+/// Compute SHA256 hex digest of a file.
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = File::open(path).context("Failed to open file for hash verification")?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        sha2::Digest::update(&mut hasher, &buf[..n]);
+    }
+    let hash = hasher.finalize();
+    Ok(hash.iter().map(|b| format!("{:02x}", b)).collect::<String>())
+}
+
+/// Verify SHA256 of a file against an expected hex hash.
+/// Returns Ok(()) on match, PermanentError::JsonHashMismatch on mismatch.
+fn verify_sha256_file(path: &Path, expected_hex: &str, quiet: bool) -> Result<()> {
+    if !quiet {
+        eprintln!("Verifying SHA256 for '{}'...", path.display());
+    }
+    let actual_hash = sha256_file(path)?;
+    let expected_lower = expected_hex.to_lowercase();
+    if actual_hash != expected_lower {
+        return Err(PermanentError::JsonHashMismatch {
+            file: path.display().to_string(),
+            expected: expected_lower,
+            actual: actual_hash,
+        }
+        .into());
+    }
+    if !quiet {
+        eprintln!("SHA256 OK: {} {}", actual_hash, path.display());
+    }
+    Ok(())
+}
+
+/// Represents a single download entry extracted from JSON.
+#[derive(Debug)]
+struct JsonDownloadEntry {
+    url: String,
+    name: Option<String>,
+    hash: Option<String>, // raw digest field value
+}
+
+/// Fetch JSON body from a URL (using existing client/redirect infrastructure).
+async fn fetch_json_body(client: &Client, url: &Url, args: &Args) -> Result<String> {
+    let mut request = client.get(url.clone());
+    if let Some(ref u) = args.user {
+        request = request.basic_auth(u, args.password.as_deref());
+    }
+
+    let response = request.send().await.context("Failed to send GET request for JSON")?;
+    let status = response.status();
+
+    // Check for redirect on GET
+    if status.is_redirection() {
+        if let Some(location) = response.headers().get(LOCATION) {
+            let location_str = location.to_str().unwrap_or("<invalid>");
+            return Err(PermanentError::RedirectOnGet {
+                status: status.as_u16(),
+                location: location_str.to_string(),
+            }
+            .into());
+        }
+        return Err(PermanentError::RedirectWithoutLocation(status.as_u16()).into());
+    }
+
+    if !status.is_success() {
+        return Err(PermanentError::HttpClientError(status.as_u16()).into());
+    }
+
+    // Validate Content-Type: application/json
+    let content_type =
+        response.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+
+    let media_type = content_type.split(';').next().unwrap_or("").trim().to_lowercase();
+    if media_type != "application/json" {
+        return Err(PermanentError::JsonContentTypeExpected(content_type.to_string()).into());
+    }
+
+    let body = response.text().await.context("Failed to read JSON response body")?;
+    Ok(body)
+}
+
+/// Process JSON mode: parse JSON, extract entries, download each, optionally verify hashes.
+async fn process_json_downloads(
+    client: &Client,
+    json_url: &Url,
+    args: &Args,
+    client_cache: &mut HashMap<String, Client>,
+    hsts_db: &mut HstsMap,
+    used_filenames: &mut HashMap<PathBuf, u32>,
+) -> Result<()> {
+    let json_url_field = args.json_url_field.as_ref().expect("--json-url-field required");
+
+    // 1. Fetch JSON body
+    if args.verbose {
+        eprintln!("Fetching JSON from: {}", json_url);
+    }
+    let body = fetch_json_body(client, json_url, args).await?;
+
+    if args.debug {
+        eprintln!("[DEBUG] JSON response body length: {} bytes", body.len());
+    }
+
+    // 2. Parse JSON
+    let json_value: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| PermanentError::JsonParseError(e.to_string()))?;
+
+    // 3. Extract URLs
+    let urls = json_path_extract(&json_value, json_url_field)?;
+    if args.debug {
+        eprintln!("[DEBUG] Extracted {} URL(s) from JSON path '{}':", urls.len(), json_url_field);
+        for (i, u) in urls.iter().enumerate() {
+            eprintln!("[DEBUG]   [{}] {}", i, u);
+        }
+    }
+
+    // 4. Extract hashes (if specified)
+    let hashes: Option<Vec<String>> = if let Some(ref hash_field) = args.json_hash_field {
+        let h = json_path_extract(&json_value, hash_field)?;
+        if args.debug {
+            eprintln!("[DEBUG] Extracted {} hash(es) from JSON path '{}':", h.len(), hash_field);
+            for (i, hv) in h.iter().enumerate() {
+                eprintln!("[DEBUG]   [{}] {}", i, hv);
+            }
+        }
+        if h.len() != urls.len() {
+            return Err(PermanentError::JsonUrlHashCountMismatch {
+                urls: urls.len(),
+                hashes: h.len(),
+            }
+            .into());
+        }
+        Some(h)
+    } else {
+        None
+    };
+
+    // 5. Extract names (if specified)
+    let names: Option<Vec<String>> = if let Some(ref name_field) = args.json_name_field {
+        let n = json_path_extract(&json_value, name_field)?;
+        if args.debug {
+            eprintln!("[DEBUG] Extracted {} name(s) from JSON path '{}':", n.len(), name_field);
+            for (i, nv) in n.iter().enumerate() {
+                eprintln!("[DEBUG]   [{}] {}", i, nv);
+            }
+        }
+        if n.len() != urls.len() {
+            return Err(PermanentError::JsonUrlNameCountMismatch {
+                urls: urls.len(),
+                names: n.len(),
+            }
+            .into());
+        }
+        Some(n)
+    } else {
+        None
+    };
+
+    // 6. Build entries
+    let mut entries: Vec<JsonDownloadEntry> = Vec::new();
+    for (i, url_str) in urls.iter().enumerate() {
+        entries.push(JsonDownloadEntry {
+            url: url_str.clone(),
+            name: names.as_ref().map(|n| n[i].clone()),
+            hash: hashes.as_ref().map(|h| h[i].clone()),
+        });
+    }
+
+    // 7. Apply regex filter
+    if let Some(ref filter_pattern) = args.json_filter {
+        let re = Regex::new(filter_pattern).map_err(|e| {
+            PermanentError::InvalidArguments(format!(
+                "Invalid --json-filter regex '{}': {}",
+                filter_pattern, e
+            ))
+        })?;
+
+        let before_count = entries.len();
+        entries.retain(|e| re.is_match(&e.url));
+        if args.debug {
+            eprintln!(
+                "[DEBUG] --json-filter '{}': {} -> {} entries",
+                filter_pattern,
+                before_count,
+                entries.len()
+            );
+        }
+    }
+
+    if entries.is_empty() {
+        return Err(PermanentError::JsonNoUrlsExtracted.into());
+    }
+
+    // 8. Print summary
+    if !args.quiet {
+        eprintln!("JSON: {} file(s) to download:", entries.len());
+        for (i, entry) in entries.iter().enumerate() {
+            let display_name = entry.name.as_deref().unwrap_or("(from URL)");
+            eprintln!("  [{}] {} ({})", i + 1, display_name, entry.url);
+            if let Some(ref hash) = entry.hash {
+                eprintln!("      hash: {}", hash);
+            }
+        }
+    }
+
+    // 9. Download each entry
+    let max_retries = if args.retries == 0 { u64::MAX } else { args.retries };
+    let mut overall_success = true;
+
+    for entry in &entries {
+        let url = match Url::parse(&entry.url) {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("Error parsing URL '{}': {}", entry.url, e);
+                overall_success = false;
+                continue;
+            }
+        };
+
+        if !args.quiet {
+            eprintln!();
+            eprintln!("Starting download: {}", url);
+        }
+
+        // Build per-entry args: set --output if json-name-field was provided
+        // Clear json_parse to prevent any accidental re-entry
+        let mut entry_args = args.clone();
+        entry_args.json_parse = false;
+        if let Some(ref name) = entry.name {
+            entry_args.output = Some(name.clone());
+        }
+
+        let mut attempt = 0;
+
+        // Pre-parse and validate digest before download attempt
+        let parsed_sha256: Option<String> = if args.json_verify_hash {
+            if let Some(ref digest_str) = entry.hash {
+                if let Some((algo, hex_hash)) = parse_digest_field(digest_str) {
+                    if algo != "sha256" {
+                        eprintln!(
+                            "Failed: {}",
+                            PermanentError::JsonHashUnsupportedAlgo(algo.to_string())
+                        );
+                        overall_success = false;
+                        continue;
+                    }
+                    Some(hex_hash.to_lowercase())
+                } else {
+                    eprintln!("Warning: Could not parse digest field: {:?}", digest_str);
+                    None
+                }
+            } else {
+                eprintln!("{}", PermanentError::JsonHashMissing(entry.url.clone()));
+                overall_success = false;
+                continue;
+            }
+        } else {
+            None
+        };
+
+        loop {
+            let mut current_args = entry_args.clone();
+            if attempt > 0 {
+                current_args.resume = true;
+            }
+
+            let result = async {
+                match resolve_final_url_and_client(
+                    url.clone(),
+                    &current_args,
+                    client_cache,
+                    hsts_db,
+                )
+                .await
+                {
+                    Ok((
+                        dl_client,
+                        final_url,
+                        content_length,
+                        content_disposition,
+                        last_modified,
+                    )) => {
+                        if current_args.verbose && final_url != url {
+                            eprintln!("Final URL: {}", final_url);
+                        }
+
+                        if let (Some(max), Some(size)) = (current_args.max_size, content_length)
+                            && size > max
+                        {
+                            return Err(PermanentError::FileSizeExceedsLimit {
+                                size,
+                                max,
+                                url: final_url.to_string(),
+                            }
+                            .into());
+                        }
+                        download_file(
+                            &dl_client,
+                            &final_url,
+                            &current_args,
+                            content_length,
+                            content_disposition.as_deref(),
+                            last_modified.as_deref(),
+                            used_filenames,
+                            parsed_sha256.as_deref(),
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            .await;
+
+            match result {
+                Ok(()) => break,
+                Err(e) => {
+                    if is_permanent_error(&e) {
+                        eprintln!("Failed to download {}: {:#}", url, e);
+                        overall_success = false;
+                        break;
+                    }
+                    if attempt >= max_retries {
+                        eprintln!("Failed to download {}: {:#}", url, e);
+                        overall_success = false;
+                        break;
+                    }
+                    eprintln!(
+                        "Error: {}. Retrying (attempt {}/{})...",
+                        e,
+                        attempt + 1,
+                        if args.retries == 0 {
+                            "\u{221e}".to_string()
+                        } else {
+                            args.retries.to_string()
+                        }
+                    );
+                    attempt += 1;
+                    let delay = 1u64 << attempt.clamp(0, 6);
+                    sleep(Duration::from_secs(delay)).await;
+                }
+            }
+        }
+    }
+
+    if overall_success { Ok(()) } else { bail!("One or more JSON downloads failed") }
+}
+
 async fn download_file(
     client: &Client,
     url: &Url,
@@ -2132,6 +2860,7 @@ async fn download_file(
     content_disposition: Option<&str>,
     head_last_modified: Option<&str>,
     used_filenames: &mut HashMap<PathBuf, u32>,
+    expected_sha256: Option<&str>,
 ) -> Result<()> {
     // 1. Determine filenames first
     let mut final_filename = determine_filename(args, url, content_disposition);
@@ -2166,37 +2895,33 @@ async fn download_file(
     }
 
     // Handle -N (--newer) mode: check if remote file is newer than local file
-    if args.newer && !is_stdout && output_path.exists() {
-        if args.no_if_modified_since {
-            // --no-if-modified-since: Use the HEAD response's Last-Modified we already have
-            if let Some(lm_str) = head_last_modified
-                && let Some(server_time) = parse_http_date(lm_str)
-            {
-                let local_meta = fs::metadata(&output_path)?;
-                if let Ok(local_mtime) = local_meta.modified() {
-                    if server_time <= local_mtime {
-                        if !args.quiet {
-                            eprintln!(
-                                "Server file is not newer than local file '{}', skipping.",
-                                output_path.display()
-                            );
-                        }
-                        return Ok(());
-                    }
-                    if args.verbose {
+    if args.newer && !is_stdout && output_path.exists() && args.no_if_modified_since {
+        // --no-if-modified-since: Use the HEAD response's Last-Modified we already have
+        if let Some(lm_str) = head_last_modified
+            && let Some(server_time) = parse_http_date(lm_str)
+        {
+            let local_meta = fs::metadata(&output_path)?;
+            if let Ok(local_mtime) = local_meta.modified() {
+                if server_time <= local_mtime {
+                    if !args.quiet {
                         eprintln!(
-                            "Server file is newer than local file, proceeding with download."
+                            "Server file is not newer than local file '{}', skipping.",
+                            output_path.display()
                         );
                     }
+                    return Ok(());
                 }
-            } else if args.debug {
-                eprintln!(
-                    "[DEBUG] -N --no-if-modified-since: No Last-Modified from HEAD, proceeding with download"
-                );
+                if args.verbose {
+                    eprintln!("Server file is newer than local file, proceeding with download.");
+                }
             }
+        } else if args.debug {
+            eprintln!(
+                "[DEBUG] -N --no-if-modified-since: No Last-Modified from HEAD, proceeding with download"
+            );
         }
-        // If not --no-if-modified-since, we'll add If-Modified-Since to the GET request below
     }
+    // If not --no-if-modified-since, we'll add If-Modified-Since to the GET request below
 
     // 2. Prepare Temp Path (using sanitized filename)
     let mut temp_path = if args.temp && !is_stdout {
@@ -2311,19 +3036,18 @@ async fn download_file(
             let existing_size = metadata.len();
 
             // --continue: skip if server file is smaller than local
-            if args.resume {
-                if let Some(total) = expected_length
-                    && existing_size > total
-                {
-                    if !args.quiet {
-                        eprintln!(
-                            "Local file ({}) is larger than server file ({}), skipping.",
-                            HumanBytes(existing_size),
-                            HumanBytes(total)
-                        );
-                    }
-                    return Ok(());
+            if args.resume
+                && let Some(total) = expected_length
+                && existing_size > total
+            {
+                if !args.quiet {
+                    eprintln!(
+                        "Local file ({}) is larger than server file ({}), skipping.",
+                        HumanBytes(existing_size),
+                        HumanBytes(total)
+                    );
                 }
+                return Ok(());
             }
 
             // Check if file is already complete (when we know expected size)
@@ -2567,6 +3291,7 @@ async fn download_file(
             remaining_bytes,
             force_truncate,
             path_buf,
+            expected_sha256,
         )
         .await?;
     } else {
@@ -2577,6 +3302,7 @@ async fn download_file(
             start_byte,
             remaining_bytes,
             force_truncate,
+            expected_sha256,
         )
         .await?;
     }
@@ -2643,6 +3369,7 @@ async fn download_to_temp(
     remaining_bytes: Option<u64>,
     force_truncate: bool,
     temp_path: PathBuf,
+    expected_sha256: Option<&str>,
 ) -> Result<PathBuf> {
     // Store temp path for potential cleanup on signal
     {
@@ -2691,6 +3418,12 @@ async fn download_to_temp(
     };
     drop(async_file); // Close file handle before rename
 
+    // Verify SHA256 on the temp file BEFORE renaming to the final path.
+    // This way a corrupt download never overwrites a good file.
+    if let Some(expected) = expected_sha256 {
+        verify_sha256_file(&temp_path, expected, args.quiet)?;
+    }
+
     let move_result = perform_atomic_move(&temp_path, output_path, args);
     {
         let mut guard = CURRENT_TEMP_PATH.lock().unwrap();
@@ -2728,6 +3461,7 @@ async fn download_direct(
     start_byte: u64,
     remaining_bytes: Option<u64>,
     force_truncate: bool,
+    expected_sha256: Option<&str>,
 ) -> Result<PathBuf> {
     let (std_file, actual_path) =
         match open_file_safely(output_path, args, start_byte, force_truncate) {
@@ -2768,6 +3502,13 @@ async fn download_direct(
         Err(e) if e.raw_os_error() == Some(libc::ENOTSUP) => {}
         Err(e) => return Err(e.into()),
     };
+    // Must drop the async file handle so the blocking SHA256 read can open it
+    drop(file);
+
+    // Verify SHA256 after writing and syncing
+    if let Some(expected) = expected_sha256 {
+        verify_sha256_file(&actual_path, expected, args.quiet)?;
+    }
 
     if !args.quiet {
         eprintln!(
