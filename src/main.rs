@@ -38,7 +38,9 @@ static GLOBAL: Jemalloc = Jemalloc;
 */
 
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File, OpenOptions};
+#[cfg(not(target_os = "linux"))]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::IsTerminal;
 use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Read};
 use std::net::{IpAddr, SocketAddr};
@@ -80,6 +82,13 @@ static KEEP_TEMP_ON_CANCEL: AtomicBool = AtomicBool::new(false);
 /// Global storage for temp file path during download (for cleanup decision)
 static CURRENT_TEMP_PATH: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
+// A cache to keep directory file descriptors permanently open during the run
+#[cfg(target_os = "linux")]
+type DirCache = std::collections::HashMap<PathBuf, std::os::fd::OwnedFd>;
+
+#[cfg(not(target_os = "linux"))]
+type DirCache = (); // Dummy type for macOS/Windows
+
 #[derive(Debug)]
 pub enum PermanentError {
     // Size limits
@@ -91,9 +100,10 @@ pub enum PermanentError {
     TruncatedFilenameExists(PathBuf),
     FilenameTooLong,
 
-    // URL/scheme errors
+    // URL/scheme/TLS builder errors
     InsecureUrl(String),
     UnsupportedScheme(String),
+    ClientBuilderError(String),
 
     // DNS resolution (user config mismatch)
     NoSafeIpv4(String),
@@ -132,6 +142,10 @@ pub enum PermanentError {
     NoIfModifiedSinceWithoutNewer,
     KeepExtensionWithoutMultipleCopies,
     ServerFileSmallerThanLocal { server_size: u64, local_size: u64 },
+
+    // --output-dir related
+    OutputDirNotFound(PathBuf),
+    OutputDirNotADirectory(PathBuf),
 
     // --json-parse related
     JsonContentTypeExpected(String),
@@ -182,6 +196,7 @@ impl std::fmt::Display for PermanentError {
             Self::InsecureUrl(url) => {
                 write!(f, "Refusing insecure HTTP URL: {}. Use --insecure to allow.", url)
             }
+            Self::ClientBuilderError(msg) => write!(f, "Failed to initialize HTTP client: {}", msg),
             Self::UnsupportedScheme(scheme) => {
                 write!(f, "Unsupported URL scheme: {}", scheme)
             }
@@ -273,6 +288,16 @@ impl std::fmt::Display for PermanentError {
                     HumanBytes(*local_size)
                 )
             }
+            Self::OutputDirNotFound(path) => {
+                write!(
+                    f,
+                    "Output directory '{}' does not exist (will not create it automatically)",
+                    path.display()
+                )
+            }
+            Self::OutputDirNotADirectory(path) => {
+                write!(f, "Output path '{}' is not a directory", path.display())
+            }
             Self::JsonContentTypeExpected(actual) => {
                 write!(
                     f,
@@ -354,8 +379,8 @@ fn is_name_too_long(err: &std::io::Error) -> bool {
     err.kind() == std::io::ErrorKind::InvalidFilename
 }
 
-/// Apply safe open flags (O_NOFOLLOW | O_NOCTTY) on Unix
-#[cfg(unix)]
+/// Apply safe open flags (O_NOFOLLOW | O_NOCTTY) on Unix (excluding Linux, which uses openat2)
+#[cfg(all(unix, not(target_os = "linux")))]
 fn apply_safe_flags(opts: &mut OpenOptions) {
     use std::os::unix::fs::OpenOptionsExt;
     opts.custom_flags(libc::O_NOFOLLOW | libc::O_NOCTTY);
@@ -364,7 +389,7 @@ fn apply_safe_flags(opts: &mut OpenOptions) {
 #[cfg(not(unix))]
 fn apply_safe_flags(_opts: &mut OpenOptions) {}
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn apply_file_mode(opts: &mut OpenOptions, args: &Args) {
     use std::os::unix::fs::OpenOptionsExt;
     if let Some(ref mode_str) = args.filemode
@@ -398,6 +423,14 @@ struct Args {
     /// Output filename (optional, derived from URL or Content-Disposition if not specified)
     #[arg(short = 'O', long = "output")]
     output: Option<String>,
+
+    /// Output directory for downloads (must already exist, will not be created)
+    #[arg(
+        short = 'P',
+        long = "output-dir",
+        help = "Output directory (must exist, not created automatically)"
+    )]
+    output_dir: Option<String>,
 
     /// Allow insecure connections (HTTP and invalid certificates)
     #[arg(long = "insecure", help = "Allow insecure HTTP and invalid certificates")]
@@ -742,8 +775,67 @@ fn update_hsts(map: &mut HstsMap, url: &Url, headers: &HeaderMap, debug: bool) {
     }
 }
 
-fn build_client(args: &Args, resolve_override: Option<(&str, SocketAddr)>) -> Result<Client> {
+/// Build the TLS ClientConfig once per invocation.
+/// Returns None in --insecure mode (no rustls config needed).
+fn build_tls_config(args: &Args) -> Result<Option<ClientConfig>> {
+    if args.insecure {
+        return Ok(None);
+    }
+
+    let tls_builder = ClientConfig::builder();
+
+    // Try platform verifier, fallback to WebPKI roots if failed.
+    // On Android, we explicitly skip platform verifier to avoid panics in CLI environments (missing JNI).
+    #[cfg(not(target_os = "android"))]
+    let tls_builder = match tls_builder.with_platform_verifier() {
+        Ok(builder) => builder,
+        Err(e) => {
+            if args.debug || args.verbose {
+                eprintln!(
+                    "Warning: Platform verifier unavailable ({}). Falling back to WebPKI roots.",
+                    e
+                );
+            }
+            let mut root_store = rustls::RootCertStore::empty();
+            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            ClientConfig::builder().with_root_certificates(root_store)
+        }
+    };
+
+    #[cfg(target_os = "android")]
+    let tls_builder = {
+        if args.debug {
+            eprintln!(
+                "[DEBUG] Android detected: Skipping platform verifier (requires JNI), using bundled WebPKI roots."
+            );
+        }
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        ClientConfig::builder().with_root_certificates(root_store)
+    };
+
+    let client_config = if let (Some(cert_path), Some(key_path)) = (&args.cert, &args.key) {
+        if args.debug {
+            eprintln!("[DEBUG] Loading client certificate (platform-verifier): {}", cert_path);
+        }
+        let certs = load_certs(cert_path)?;
+        let key = load_key(key_path)?;
+
+        tls_builder.with_client_auth_cert(certs, key).context("Failed to configure client auth")?
+    } else {
+        tls_builder.with_no_client_auth()
+    };
+
+    Ok(Some(client_config))
+}
+
+fn build_client(
+    args: &Args,
+    resolve_override: Option<(&str, SocketAddr)>,
+    tls_config: &Option<ClientConfig>,
+) -> Result<Client> {
     let mut builder = Client::builder()
+        .use_rustls_tls()
         .redirect(reqwest::redirect::Policy::none()) // Manual redirects
         .user_agent(args.user_agent.as_deref().unwrap_or(concat!(env!("CARGO_PKG_NAME"), "/1.0")))
         .connect_timeout(Duration::from_secs(30))
@@ -791,54 +883,9 @@ fn build_client(args: &Args, resolve_override: Option<(&str, SocketAddr)>) -> Re
             builder = builder.identity(identity);
         }
     } else {
-        // Secure Path: Use platform verifier and manual mTLS config
-        let tls_builder = ClientConfig::builder();
-
-        // Try platform verifier, fallback to WebPKI roots if failed.
-        // On Android, we explicitly skip platform verifier to avoid panics in CLI environments (missing JNI).
-        #[cfg(not(target_os = "android"))]
-        let tls_builder = match tls_builder.with_platform_verifier() {
-            Ok(builder) => builder,
-            Err(e) => {
-                if args.debug || args.verbose {
-                    eprintln!(
-                        "Warning: Platform verifier unavailable ({}). Falling back to WebPKI roots.",
-                        e
-                    );
-                }
-                let mut root_store = rustls::RootCertStore::empty();
-                root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-                ClientConfig::builder().with_root_certificates(root_store)
-            }
-        };
-
-        #[cfg(target_os = "android")]
-        let tls_builder = {
-            if args.debug {
-                eprintln!(
-                    "[DEBUG] Android detected: Skipping platform verifier (requires JNI), using bundled WebPKI roots."
-                );
-            }
-            let mut root_store = rustls::RootCertStore::empty();
-            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            ClientConfig::builder().with_root_certificates(root_store)
-        };
-
-        let client_config = if let (Some(cert_path), Some(key_path)) = (&args.cert, &args.key) {
-            if args.debug {
-                eprintln!("[DEBUG] Loading client certificate (platform-verifier): {}", cert_path);
-            }
-            let certs = load_certs(cert_path)?;
-            let key = load_key(key_path)?;
-
-            tls_builder
-                .with_client_auth_cert(certs, key)
-                .context("Failed to configure client auth")?
-        } else {
-            tls_builder.with_no_client_auth()
-        };
-
-        builder = builder.use_preconfigured_tls(client_config);
+        // Secure Path: reuse the pre-built TLS config (platform verifier + mTLS)
+        let config = tls_config.as_ref().expect("secure mode requires cached TLS config");
+        builder = builder.use_preconfigured_tls(config.clone());
     }
 
     // Handle Custom Headers
@@ -872,7 +919,9 @@ fn build_client(args: &Args, resolve_override: Option<(&str, SocketAddr)>) -> Re
         builder = builder.resolve(host, addr);
     }
 
-    builder.build().context("Failed to build HTTP client")
+    builder
+        .build()
+        .map_err(|e| PermanentError::ClientBuilderError(format!("TLS/Builder error: {}", e)).into())
 }
 
 fn load_certs(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
@@ -894,6 +943,7 @@ async fn resolve_final_url_and_client(
     args: &Args,
     client_cache: &mut HashMap<String, Client>,
     hsts_db: &mut HstsMap,
+    tls_config: &Option<ClientConfig>,
 ) -> Result<(Client, Url, Option<u64>, Option<String>, Option<String>)> {
     let mut current_url = initial_url;
     let mut redirect_count = 0;
@@ -922,7 +972,7 @@ async fn resolve_final_url_and_client(
         let client = if !args.no_proxy
             && (std::env::var("HTTP_PROXY").is_ok() || std::env::var("HTTPS_PROXY").is_ok())
         {
-            build_client(args, None)?
+            build_client(args, None, tls_config)?
         } else {
             let host = current_url.host_str().ok_or_else(|| anyhow::anyhow!("No host in URL"))?;
 
@@ -940,7 +990,7 @@ async fn resolve_final_url_and_client(
                 if !args.quiet {
                     eprintln!("Connecting to {} ({})", host, safe_ip.ip());
                 }
-                let new_client = build_client(args, Some((host, safe_ip)))?;
+                let new_client = build_client(args, Some((host, safe_ip)), tls_config)?;
                 client_cache.insert(cache_key, new_client.clone());
                 new_client
             }
@@ -1018,7 +1068,13 @@ async fn resolve_final_url_and_client(
 async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
     let mut all_urls = args.urls.clone();
 
-    env_logger::init();
+    let mut log_builder =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("off"));
+    if args.debug {
+        log_builder.filter_level(log::LevelFilter::Debug);
+    }
+    log_builder.init();
+
     if let Some(ref input_path) = args.input_file {
         let reader: Box<dyn BufRead> = if input_path == "-" {
             Box::new(BufReader::new(std::io::stdin()))
@@ -1086,12 +1142,68 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
         std::process::exit(1);
     }
 
+    // Validate --output-dir: must exist and be a directory (never create it)
+    if let Some(ref dir_str) = args.output_dir {
+        let dir_path = Path::new(dir_str);
+        match fs::metadata(dir_path) {
+            Ok(meta) => {
+                if !meta.is_dir() {
+                    return Err(
+                        PermanentError::OutputDirNotADirectory(dir_path.to_path_buf()).into()
+                    );
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                return Err(PermanentError::OutputDirNotFound(dir_path.to_path_buf()).into());
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "Cannot access output directory '{}': {}",
+                    dir_path.display(),
+                    e
+                ));
+            }
+        }
+    }
+
+    // Validate --output-dir + --output=-  is contradictory
+    if args.output_dir.is_some() && args.output.as_deref() == Some("-") {
+        return Err(PermanentError::InvalidArguments(
+            "--output-dir cannot be used with --output - (stdout)".to_string(),
+        )
+        .into());
+    }
+
     let mut client_cache: HashMap<String, Client> = HashMap::new();
     let mut overall_success = true;
     let max_retries = if args.retries == 0 { u64::MAX } else { args.retries };
 
     // Track used output filenames for --multiple-copies
     let mut used_filenames: HashMap<PathBuf, u32> = HashMap::new();
+    let mut dir_cache = DirCache::default();
+
+    // Pre-populate DirCache with --output-dir fd so all downloads reuse it
+    #[cfg(target_os = "linux")]
+    if let Some(ref dir_str) = args.output_dir {
+        use nix::fcntl::{OFlag, open};
+        use nix::sys::stat::Mode;
+
+        let dir_path = Path::new(dir_str);
+        let dir_fd =
+            open(dir_path, OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC, Mode::empty())
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to open output directory '{}': {}",
+                        dir_path.display(),
+                        std::io::Error::from_raw_os_error(e as i32)
+                    )
+                })?;
+        dir_cache.insert(dir_path.to_path_buf(), dir_fd);
+    }
+
+    // Build TLS config once (platform verifier + mTLS) and reuse for all clients.
+    // This avoids re-running rustls_platform_verifier for every new connection.
+    let tls_config = build_tls_config(&args)?;
 
     for url_str in &urls {
         let url = match Url::parse(url_str) {
@@ -1119,6 +1231,7 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                         &current_args,
                         &mut client_cache,
                         hsts_db,
+                        &tls_config,
                     )
                     .await
                     {
@@ -1139,6 +1252,8 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                                 &mut client_cache,
                                 hsts_db,
                                 &mut used_filenames,
+                                &mut dir_cache,
+                                &tls_config,
                             )
                             .await
                         }
@@ -1189,6 +1304,8 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
             if attempt > 0 {
                 current_args.resume = true;
             }
+            // 1. Snapshot the cache before the attempt begins
+            let mut attempt_used_filenames = used_filenames.clone();
 
             // Pass the cache to be used/updated
             let result = async {
@@ -1197,6 +1314,7 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                     &current_args,
                     &mut client_cache,
                     hsts_db,
+                    &tls_config,
                 )
                 .await
                 {
@@ -1222,8 +1340,9 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                             content_length,
                             content_disposition.as_deref(),
                             last_modified.as_deref(),
-                            &mut used_filenames,
+                            &mut attempt_used_filenames,
                             None,
+                            &mut dir_cache,
                         )
                         .await
                     }
@@ -1233,7 +1352,11 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
             .await;
 
             match result {
-                Ok(()) => break,
+                Ok(()) => {
+                    // 3. Commit the cache ONLY if the download was successful
+                    used_filenames = attempt_used_filenames;
+                    break;
+                }
                 Err(e) => {
                     if is_permanent_error(&e) {
                         eprintln!("Failed to download {}: {:#}", url, e);
@@ -1787,36 +1910,6 @@ fn is_block_or_char_device(mode: u32) -> Option<&'static str> {
     }
 }
 
-/// Pre-open check: stat() the path to reject block/char devices before opening.
-/// Returns Ok(true) if file exists, Ok(false) if it doesn't exist.
-/// This performs exactly one stat() call for existing files.
-/// Returns error if file is a block or char device.
-#[cfg(unix)]
-fn check_path_before_open(path: &Path) -> Result<bool> {
-    use std::os::unix::fs::MetadataExt;
-
-    match fs::metadata(path) {
-        Ok(metadata) => {
-            // File exists - check if it's a device
-            if let Some(device_type) = is_block_or_char_device(metadata.mode()) {
-                return if device_type == "block" {
-                    Err(PermanentError::BlockDeviceNotAllowed(path.to_path_buf()).into())
-                } else {
-                    Err(PermanentError::CharDeviceNotAllowed(path.to_path_buf()).into())
-                };
-            }
-            Ok(true) // File exists and is not a device
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Ok(false) // File doesn't exist
-        }
-        Err(_) => {
-            // Other error (permission denied, etc.) - let open() handle it
-            Ok(false)
-        }
-    }
-}
-
 /// Post-open check: fstat() the open file descriptor for TOCTOU protection.
 /// Verifies the file is not a block/char device after opening.
 /// When appending, also verifies the file owner matches the current process UID
@@ -1858,12 +1951,89 @@ fn check_file_after_open(
     Ok(())
 }
 
-// Windows stub implementations
-#[cfg(not(unix))]
-fn check_path_before_open(path: &Path) -> Result<bool> {
-    Ok(path.exists())
+// Unified fallback for both macOS (Unix, non-Linux) and Windows (non-Unix)
+#[cfg(not(target_os = "linux"))]
+fn check_path_before_open(path: &Path, _cache: &mut DirCache) -> Result<bool> {
+    match std::fs::metadata(path) {
+        Ok(_metadata) => {
+            #[cfg(unix)]
+            if let Some(device_type) =
+                is_block_or_char_device(std::os::unix::fs::MetadataExt::mode(&_metadata))
+            {
+                return if device_type == "block" {
+                    Err(PermanentError::BlockDeviceNotAllowed(path.to_path_buf()).into())
+                } else {
+                    Err(PermanentError::CharDeviceNotAllowed(path.to_path_buf()).into())
+                };
+            }
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Ok(false),
+    }
 }
 
+/// File metadata obtained through the DirCache (avoids AT_FDCWD stat calls).
+struct FileInfo {
+    size: u64,
+    modified: Option<SystemTime>,
+}
+
+/// Stat a file through the DirCache, using fstatat on the pinned directory fd.
+/// Returns None if the file does not exist.
+#[cfg(target_os = "linux")]
+fn stat_file_via_cache(path: &Path, cache: &mut DirCache) -> Result<Option<FileInfo>> {
+    use nix::fcntl::{AtFlags, OFlag, open};
+    use nix::sys::stat::fstatat;
+
+    let mut parent = path.parent().unwrap_or_else(|| Path::new("."));
+    if parent.as_os_str().is_empty() {
+        parent = Path::new(".");
+    }
+    let filename = path.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "Path has no filename")
+    })?;
+
+    let canonical_parent = parent.to_path_buf();
+    if !cache.contains_key(&canonical_parent) {
+        let dir_fd = match open(
+            parent,
+            OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            nix::sys::stat::Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(e) if e == nix::errno::Errno::ENOENT => return Ok(None),
+            Err(e) => return Err(std::io::Error::from_raw_os_error(e as i32).into()),
+        };
+        cache.insert(canonical_parent.clone(), dir_fd);
+    }
+
+    let dir_fd = cache.get(&canonical_parent).unwrap();
+
+    match fstatat(dir_fd, filename, AtFlags::AT_SYMLINK_NOFOLLOW) {
+        Ok(stat) => {
+            let modified = if stat.st_mtime >= 0 {
+                Some(UNIX_EPOCH + Duration::new(stat.st_mtime as u64, stat.st_mtime_nsec as u32))
+            } else {
+                None
+            };
+            Ok(Some(FileInfo { size: stat.st_size as u64, modified }))
+        }
+        Err(e) if e == nix::errno::Errno::ENOENT => Ok(None),
+        Err(e) => Err(std::io::Error::from_raw_os_error(e as i32).into()),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn stat_file_via_cache(path: &Path, _cache: &mut DirCache) -> Result<Option<FileInfo>> {
+    match fs::metadata(path) {
+        Ok(m) => Ok(Some(FileInfo { size: m.len(), modified: m.modified().ok() })),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+// Windows stub for post-open checks
 #[cfg(not(unix))]
 fn check_file_after_open(
     _file: &File,
@@ -1874,24 +2044,23 @@ fn check_file_after_open(
     Ok(())
 }
 
-fn open_file_safely(
+#[cfg(not(target_os = "linux"))]
+fn open_file_securely(
     path: &Path,
     args: &Args,
     start_byte: u64,
     force_truncate: bool,
-) -> Result<File> {
-    // Pre-open check: stat() to reject block/char devices AND determine if file exists
-    let file_existed = check_path_before_open(path)?;
+    cache: &mut DirCache,
+) -> Result<(File, bool)> {
+    let file_existed = check_path_before_open(path, cache)?;
     let is_append = start_byte > 0;
-    let mut opts = OpenOptions::new();
 
+    let mut opts = std::fs::OpenOptions::new();
     if is_append {
         opts.append(true);
     } else if file_existed || args.overwrite || force_truncate {
-        // File exists (even if 0 bytes) OR overwrite/truncate requested: truncate
         opts.create(true).write(true).truncate(true);
     } else {
-        // File doesn't exist and no overwrite: create new (O_EXCL)
         opts.write(true).create_new(true);
     }
 
@@ -1901,55 +2070,167 @@ fn open_file_safely(
 
     let file = opts.open(path)?;
 
-    // Post-open check: fstat() for TOCTOU protection and owner verification
-    // Owner check applies when operating on EXISTING files
-    let check_owner = file_existed;
-    check_file_after_open(&file, path, check_owner, args.insecure_owner)?;
+    if file_existed {
+        check_file_after_open(&file, path, true, args.insecure_owner)?;
+    }
 
-    Ok(file)
+    Ok((file, file_existed))
+}
+
+#[cfg(target_os = "linux")]
+fn check_path_before_open(path: &Path, cache: &mut DirCache) -> Result<bool> {
+    use nix::fcntl::{AtFlags, OFlag, open};
+    use nix::sys::stat::fstatat;
+
+    let mut parent = path.parent().unwrap_or_else(|| Path::new("."));
+    if parent.as_os_str().is_empty() {
+        parent = Path::new(".");
+    }
+    let filename = path.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "Path has no filename")
+    })?;
+
+    // PIN DIRECTORY GLOBALLY
+    let canonical_parent = parent.to_path_buf();
+    if !cache.contains_key(&canonical_parent) {
+        let dir_fd = match open(
+            parent,
+            OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            nix::sys::stat::Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(e) if e == nix::errno::Errno::ENOENT => return Ok(false),
+            Err(e) => return Err(std::io::Error::from_raw_os_error(e as i32).into()),
+        };
+        cache.insert(canonical_parent.clone(), dir_fd);
+    }
+
+    let dir_fd = cache.get(&canonical_parent).unwrap(); // Get the persistent FD
+    let stat_result = fstatat(dir_fd, filename, AtFlags::AT_SYMLINK_NOFOLLOW);
+
+    match stat_result {
+        Ok(stat) => {
+            if let Some(device_type) = is_block_or_char_device(stat.st_mode) {
+                return if device_type == "block" {
+                    Err(PermanentError::BlockDeviceNotAllowed(path.to_path_buf()).into())
+                } else {
+                    Err(PermanentError::CharDeviceNotAllowed(path.to_path_buf()).into())
+                };
+            }
+            Ok(true)
+        }
+        Err(e) if e == nix::errno::Errno::ENOENT => Ok(false),
+        Err(_) => Ok(false),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn open_file_securely(
+    path: &Path,
+    args: &Args,
+    start_byte: u64,
+    force_truncate: bool,
+    cache: &mut DirCache,
+) -> Result<(File, bool)> {
+    use nix::fcntl::{AtFlags, OFlag, OpenHow, ResolveFlag, open, openat2};
+    use nix::sys::stat::{Mode, fstatat};
+
+    let mut parent = path.parent().unwrap_or_else(|| Path::new("."));
+    if parent.as_os_str().is_empty() {
+        parent = Path::new(".");
+    }
+    let filename = path.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "Path has no filename")
+    })?;
+
+    // PIN DIRECTORY GLOBALLY
+    let canonical_parent = parent.to_path_buf();
+    if !cache.contains_key(&canonical_parent) {
+        let dir_fd = match open(
+            parent,
+            OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(e) => return Err(std::io::Error::from_raw_os_error(e as i32).into()),
+        };
+        cache.insert(canonical_parent.clone(), dir_fd);
+    }
+
+    let dir_fd = cache.get(&canonical_parent).unwrap(); // Get the persistent FD
+
+    let file_existed;
+    let stat_result = fstatat(dir_fd, filename, AtFlags::AT_SYMLINK_NOFOLLOW);
+
+    match stat_result {
+        Ok(stat) => {
+            file_existed = true;
+            if let Some(device_type) = is_block_or_char_device(stat.st_mode) {
+                return if device_type == "block" {
+                    Err(PermanentError::BlockDeviceNotAllowed(path.to_path_buf()).into())
+                } else {
+                    Err(PermanentError::CharDeviceNotAllowed(path.to_path_buf()).into())
+                };
+            }
+        }
+        Err(e) if e == nix::errno::Errno::ENOENT => {
+            file_existed = false;
+        }
+        Err(e) => return Err(std::io::Error::from_raw_os_error(e as i32).into()),
+    }
+
+    let is_append = start_byte > 0;
+    let mut flags = OFlag::O_WRONLY;
+
+    if is_append {
+        flags |= OFlag::O_APPEND;
+    } else if file_existed || args.overwrite || force_truncate {
+        flags |= OFlag::O_CREAT | OFlag::O_TRUNC;
+    } else {
+        flags |= OFlag::O_CREAT | OFlag::O_EXCL;
+    }
+
+    let mut mode = Mode::S_IRUSR | Mode::S_IWUSR | Mode::S_IRGRP | Mode::S_IROTH;
+    if let Some(ref mode_str) = args.filemode
+        && let Ok(m) = u32::from_str_radix(mode_str, 8)
+    {
+        mode = Mode::from_bits_truncate(m as nix::libc::mode_t);
+    }
+
+    let resolve_flags = ResolveFlag::RESOLVE_BENEATH
+        | ResolveFlag::RESOLVE_NO_SYMLINKS
+        | ResolveFlag::RESOLVE_NO_MAGICLINKS;
+
+    let mut how =
+        OpenHow::new().flags(flags | OFlag::O_CLOEXEC | OFlag::O_NOCTTY).resolve(resolve_flags);
+
+    if flags.contains(OFlag::O_CREAT) {
+        how = how.mode(mode);
+    }
+
+    // USE PERSISTENT FD
+    let fd_result = openat2(dir_fd, filename, how);
+
+    let owned_fd = match fd_result {
+        Ok(fd) => fd,
+        Err(e) => return Err(std::io::Error::from_raw_os_error(e as i32).into()),
+    };
+
+    let file = std::fs::File::from(owned_fd);
+
+    if file_existed {
+        check_file_after_open(&file, path, true, args.insecure_owner)?;
+    }
+
+    Ok((file, file_existed))
 }
 
 /// Low-level helper: Rename a file atomically without overwriting the destination.
 /// Includes fallback for Android/FAT filesystems where renameat2 is not supported.
+#[cfg(not(target_os = "linux"))]
 fn rename_noreplace(from: &Path, to: &Path, debug: bool) -> std::io::Result<()> {
-    // Android is a "Unix" but not "Linux" in Rust `cfg` terms (target_os = "android").
-    // However, we want it to use the robust Linux logic (renameat2 if available, plus Last Resort fallback)
-    // instead of the generic Unix fallback (which relies only on hard links and fails on /sdcard).
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(target_os = "android")]
     {
-        // 1. Try atomic renameat2 via nix (Linux Only)
-        // renameat2 is not available in nix on Android, so we skip this step there.
-        #[cfg(target_os = "linux")]
-        {
-            use nix::fcntl::{RenameFlags, renameat2};
-            use std::os::fd::BorrowedFd;
-            let cwd = unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) };
-
-            // Passing 'None' for dirfd is equivalent to AT_FDCWD
-            match renameat2(cwd, from, cwd, to, RenameFlags::RENAME_NOREPLACE) {
-                Ok(_) => {
-                    if debug {
-                        eprintln!("[DEBUG] renameat2 succeeded");
-                    }
-                    return Ok(());
-                }
-                Err(e) => {
-                    if debug {
-                        eprintln!(
-                            "[DEBUG] renameat2 failed: {} (errno: {}). Checking fallback...",
-                            e, e as i32
-                        );
-                    }
-                    // If the OS explicitly says "File Exists", respect it immediately.
-                    if e == nix::errno::Errno::EEXIST {
-                        return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
-                    }
-                }
-            }
-        }
-
-        // 2. Fallback: Hard Link + Unlink (POSIX atomic standard)
-        // This fails on Android /sdcard (FAT/Emulated)
         if debug {
             eprintln!("[DEBUG] Attempting fallback: hard link + unlink");
         }
@@ -1958,7 +2239,6 @@ fn rename_noreplace(from: &Path, to: &Path, debug: bool) -> std::io::Result<()> 
             return Ok(());
         }
 
-        // 3. Last Resort:  plain rename (not atomic noreplace, but best we can do)
         if debug {
             eprintln!("[DEBUG] Attempting last resort: rename (if dst missing)");
         }
@@ -1968,7 +2248,7 @@ fn rename_noreplace(from: &Path, to: &Path, debug: bool) -> std::io::Result<()> 
         std::fs::rename(from, to)
     }
 
-    #[cfg(all(unix, not(target_os = "linux"), not(target_os = "android")))]
+    #[cfg(all(unix, not(target_os = "android")))]
     {
         if debug {
             eprintln!("[DEBUG] rename_noreplace: using hard_link fallback (non-linux)");
@@ -1999,48 +2279,155 @@ fn rename_noreplace(from: &Path, to: &Path, debug: bool) -> std::io::Result<()> 
 
 /// High-level helper: Handles the decision between overwrite vs noreplace,
 /// and handles Filename Too Long truncation logic automatically.
-fn perform_atomic_move(temp_path: &Path, target_path: &Path, args: &Args) -> Result<PathBuf> {
+fn perform_atomic_move(
+    temp_path: &Path,
+    target_path: &Path,
+    args: &Args,
+    cache: &mut DirCache,
+) -> Result<PathBuf> {
     // Helper closure to attempt the actual move operation based on flags
-    let try_move = |src: &Path, dst: &Path| -> std::io::Result<()> {
-        // If we are resuming (--continue) OR overwriting, we implicitly
-        // have permission to replace the destination file.
-        if args.overwrite || args.resume {
+    let try_move = |src: &Path, dst: &Path, cache: &mut DirCache| -> std::io::Result<()> {
+        let overwrite_or_resume = args.overwrite || args.resume;
+
+        #[cfg(target_os = "linux")]
+        {
+            use nix::fcntl::{OFlag, RenameFlags, open, renameat2};
+            use nix::sys::stat::Mode;
+            use std::os::fd::AsFd;
+
+            // 1. Split paths into directories and filenames
+            let mut parent_from = src.parent().unwrap_or_else(|| Path::new("."));
+            let mut parent_to = dst.parent().unwrap_or_else(|| Path::new("."));
+
+            if parent_from.as_os_str().is_empty() {
+                parent_from = Path::new(".");
+            }
+            if parent_to.as_os_str().is_empty() {
+                parent_to = Path::new(".");
+            }
+
+            let canon_from = parent_from.to_path_buf();
+            let canon_to = parent_to.to_path_buf();
+
+            let file_from = src.file_name().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "Missing source filename")
+            })?;
+            let file_to = dst.file_name().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Missing destination filename",
+                )
+            })?;
+
+            // 2. Ensure both parent directories are pinned in the cache
+            for d in [&canon_from, &canon_to] {
+                if !cache.contains_key(d) {
+                    let dir_fd = match open(
+                        d.as_path(),
+                        OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+                        Mode::empty(),
+                    ) {
+                        Ok(fd) => fd,
+                        Err(e) => return Err(std::io::Error::from_raw_os_error(e as i32)),
+                    };
+                    cache.insert(d.clone(), dir_fd);
+                }
+            }
+
+            // 3. Retrieve our beautiful cached file descriptors safely
+            let fd_from = cache.get(&canon_from).unwrap();
+            let borrowed_from = fd_from.as_fd();
+
+            let fd_to = cache.get(&canon_to).unwrap();
+            let borrowed_to = fd_to.as_fd();
+
+            let flags = if overwrite_or_resume {
+                RenameFlags::empty()
+            } else {
+                RenameFlags::RENAME_NOREPLACE
+            };
+
+            // 4. Perform the atomic rename using the cached dir fds
+            match renameat2(borrowed_from, file_from, borrowed_to, file_to, flags) {
+                Ok(_) => {
+                    if args.debug {
+                        eprintln!(
+                            "[DEBUG] renameat2(dirfd, {:?}, dirfd, {:?}, {:?}) succeeded",
+                            file_from, file_to, flags
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    if args.debug {
+                        eprintln!(
+                            "[DEBUG] renameat2 failed: {} (errno: {}). Checking fallback...",
+                            e, e as i32
+                        );
+                    }
+
+                    // ONLY short-circuit if NOREPLACE successfully blocked an overwrite.
+                    if e == nix::errno::Errno::EEXIST {
+                        return Err(std::io::Error::from_raw_os_error(e as i32));
+                    }
+
+                    // For EXDEV (cross-device) or EINVAL (NOREPLACE unsupported),
+                    // we intentionally fall through to the std::fs fallbacks.
+                }
+            }
+
+            // Fallback for filesystems that reject RENAME_NOREPLACE (EINVAL/ENOSYS)
             if args.debug {
-                eprintln!(
-                    "[DEBUG] Force rename (overwrite/resume): '{}' -> '{}'",
-                    src.display(),
-                    dst.display()
-                );
+                eprintln!("[DEBUG] Attempting fallback: hard link + unlink");
+            }
+            if std::fs::hard_link(src, dst).is_ok() {
+                let _ = std::fs::remove_file(src);
+                return Ok(());
+            }
+
+            if args.debug {
+                eprintln!("[DEBUG] Attempting last resort: rename");
+            }
+            if dst.exists() {
+                return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
             }
             std::fs::rename(src, dst)
-        } else {
-            rename_noreplace(src, dst, args.debug)
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = cache; // Satisfy compiler warnings on non-linux
+
+            if overwrite_or_resume {
+                if args.debug {
+                    eprintln!(
+                        "[DEBUG] Force rename (overwrite/resume): '{}' -> '{}'",
+                        src.display(),
+                        dst.display()
+                    );
+                }
+                std::fs::rename(src, dst)
+            } else {
+                rename_noreplace(src, dst, args.debug)
+            }
         }
     };
 
     // Attempt 1: Try the move
-    match try_move(temp_path, target_path) {
+    match try_move(temp_path, target_path, cache) {
         Ok(_) => Ok(target_path.to_path_buf()),
 
-        // Handle "File Exists" logic (from rename_noreplace OR fs::rename failure)
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             if args.overwrite || args.resume {
-                // If we are here and overwrite/resume is TRUE, then this error is
-                // a hard error (e.g. destination is a directory, or permission denied),
-                // because fs::rename would normally have succeeded in replacing a file.
                 Err(e.into())
             } else {
-                // If overwrite=false and resume=false, this is the intended protection.
-                // We map it to our nice error message.
                 Err(PermanentError::FileAlreadyExists(target_path.to_path_buf()).into())
             }
         }
 
-        // Handle "Filename Too Long" logic
         Err(e) if is_name_too_long(&e) => {
             let truncated = resolve_output_path(target_path)?;
 
-            // Safety check: if truncation didn't actually shorten it, stop to avoid infinite loop
             if truncated == target_path {
                 return Err(PermanentError::FilenameTooLong.into());
             }
@@ -2050,9 +2437,8 @@ fn perform_atomic_move(temp_path: &Path, target_path: &Path, args: &Args) -> Res
             }
 
             // Attempt 2: Try with truncated name
-            match try_move(temp_path, &truncated) {
+            match try_move(temp_path, &truncated, cache) {
                 Ok(_) => Ok(truncated),
-                // If the truncated filename also exists:
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     Err(PermanentError::TruncatedFilenameExists(truncated).into())
                 }
@@ -2060,8 +2446,6 @@ fn perform_atomic_move(temp_path: &Path, target_path: &Path, args: &Args) -> Res
             }
         }
 
-        // Handle TOCTOU race (File appeared during download) special error mapping.
-        // This catches cases where the file didn't exist when we started, but does now.
         Err(e)
             if !args.overwrite
                 && !args.resume
@@ -2070,7 +2454,6 @@ fn perform_atomic_move(temp_path: &Path, target_path: &Path, args: &Args) -> Res
             Err(PermanentError::FileAppearedDuringDownload(target_path.to_path_buf()).into())
         }
 
-        // Catch-all for other I/O errors
         Err(e) => Err(e).context("Failed to rename temp file"),
     }
 }
@@ -2090,35 +2473,72 @@ fn parse_content_range(header_value: &str) -> Option<u64> {
 
 /// Check if an error is permanent (should not be retried)
 fn is_permanent_error(err: &anyhow::Error) -> bool {
+    // 1. Check our custom permanent errors
     if err.downcast_ref::<PermanentError>().is_some() {
         return true;
     }
 
-    // Check for IO errors using portable ErrorKinds
-    if let Some(io_err) = err.root_cause().downcast_ref::<std::io::Error>() {
-        return matches!(
-            io_err.kind(),
-            ErrorKind::InvalidInput
-                | ErrorKind::PermissionDenied
-                | ErrorKind::AlreadyExists
-                // | ErrorKind::FilesystemLoop // https://github.com/rust-lang/rust/issues/86442
-                | ErrorKind::ReadOnlyFilesystem
-                | ErrorKind::FileTooLarge
-                | ErrorKind::NotSeekable
-                | ErrorKind::IsADirectory
-                | ErrorKind::StorageFull
-                | ErrorKind::BrokenPipe
-                | ErrorKind::QuotaExceeded // Rust 1.74
-        );
-    }
-
-    // Check for HTTP client errors (4xx except 429)
-    if let Some(reqwest_err) = err.root_cause().downcast_ref::<reqwest::Error>()
-        && let Some(status) = reqwest_err.status()
-    {
-        // 4xx errors are permanent (except 429 Too Many Requests)
-        if status.is_client_error() && status.as_u16() != 429 {
+    // 2. Walk the entire error chain to catch nested errors
+    for cause in err.chain() {
+        // --- TLS / Certificate Errors ---
+        // Catch explicit rustls errors
+        if cause.downcast_ref::<rustls::Error>().is_some() {
             return true;
+        }
+
+        // Platform verifiers sometimes wrap TLS errors in opaque IO errors.
+        // We catch them by sniffing the error message.
+        let msg = cause.to_string().to_lowercase();
+        if msg.contains("invalid peer certificate")
+            || msg.contains("certificate expired")
+            || msg.contains("unknown issuer")
+            || msg.contains("unrecognized name") // SNI error
+            || msg.contains("cert is not valid")
+        {
+            return true;
+        }
+
+        // --- Reqwest Errors ---
+        if let Some(req_err) = cause.downcast_ref::<reqwest::Error>() {
+            if req_err.is_builder() {
+                return true;
+            }
+            if let Some(status) = req_err.status() {
+                // 4xx errors are permanent (except 429 Too Many Requests)
+                if status.is_client_error() && status.as_u16() != 429 {
+                    return true;
+                }
+            }
+        }
+
+        // --- IO Errors ---
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+            if let Some(os_err) = io_err.raw_os_error() {
+                #[cfg(unix)]
+                if os_err == nix::libc::ELOOP
+                    || os_err == nix::libc::ENOTDIR
+                    || os_err == nix::libc::EISDIR
+                {
+                    return true;
+                }
+            }
+
+            if matches!(
+                io_err.kind(),
+                ErrorKind::InvalidInput
+                    | ErrorKind::NotFound
+                    | ErrorKind::PermissionDenied
+                    | ErrorKind::AlreadyExists
+                    | ErrorKind::ReadOnlyFilesystem
+                    | ErrorKind::FileTooLarge
+                    | ErrorKind::NotSeekable
+                    | ErrorKind::IsADirectory
+                    | ErrorKind::StorageFull
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::QuotaExceeded // | ErrorKind::FilesystemLoop // https://github.com/rust-lang/rust/issues/86442
+            ) {
+                return true;
+            }
         }
     }
 
@@ -2218,7 +2638,17 @@ fn format_http_date(time: SystemTime) -> Option<String> {
 
 /// Apply server timestamp (Last-Modified) to a local file.
 /// Silently does nothing if the header is missing or unparseable.
-fn apply_server_timestamp(path: &Path, last_modified: Option<&str>, debug: bool) {
+///
+/// On Linux: uses utimensat on the pinned DirCache fd with AT_SYMLINK_NOFOLLOW.
+///   No file reopen — operates directly on the directory fd + filename.
+/// On other Unix: uses utimensat with AT_FDCWD + AT_SYMLINK_NOFOLLOW.
+/// On Windows: reopens the file via std and uses FileTimes.
+fn apply_server_timestamp(
+    path: &Path,
+    last_modified: Option<&str>,
+    debug: bool,
+    cache: &mut DirCache,
+) {
     let Some(lm_str) = last_modified else {
         if debug {
             eprintln!("[DEBUG] No Last-Modified header, not setting file timestamp");
@@ -2233,23 +2663,105 @@ fn apply_server_timestamp(path: &Path, last_modified: Option<&str>, debug: bool)
         return;
     };
 
-    match std::fs::File::options().write(true).open(path) {
-        Ok(file) => {
-            let times = std::fs::FileTimes::new().set_modified(server_time);
-            if let Err(e) = file.set_times(times) {
-                if debug {
-                    eprintln!("[DEBUG] Failed to set file timestamp: {}", e);
-                }
-            } else if debug {
+    match set_file_mtime(path, server_time, cache) {
+        Ok(()) => {
+            if debug {
                 eprintln!("[DEBUG] Set file modification time to: {}", lm_str);
             }
         }
         Err(e) => {
             if debug {
-                eprintln!("[DEBUG] Failed to open file for timestamp update: {}", e);
+                eprintln!("[DEBUG] Failed to set file timestamp: {}", e);
             }
         }
     }
+}
+
+/// Set file mtime via utimensat using the DirCache dir fd + AT_SYMLINK_NOFOLLOW.
+/// No file descriptor is opened for the file itself — purely metadata operation.
+#[cfg(target_os = "linux")]
+fn set_file_mtime(path: &Path, server_time: SystemTime, cache: &mut DirCache) -> Result<()> {
+    use nix::fcntl::{OFlag, open};
+    use nix::sys::stat::{Mode, UtimensatFlags, utimensat};
+    use nix::sys::time::TimeSpec;
+
+    let dur =
+        server_time.duration_since(UNIX_EPOCH).context("Server timestamp is before Unix epoch")?;
+    let mtime = TimeSpec::new(dur.as_secs() as i64, dur.subsec_nanos() as i64);
+    let atime = TimeSpec::UTIME_OMIT;
+
+    let mut parent = path.parent().unwrap_or_else(|| Path::new("."));
+    if parent.as_os_str().is_empty() {
+        parent = Path::new(".");
+    }
+    let filename = path.file_name().ok_or_else(|| anyhow::anyhow!("Path has no filename"))?;
+
+    // Ensure parent directory fd is in cache
+    let canonical_parent = parent.to_path_buf();
+    if !cache.contains_key(&canonical_parent) {
+        let dir_fd =
+            open(parent, OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC, Mode::empty())
+                .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+        cache.insert(canonical_parent.clone(), dir_fd);
+    }
+
+    let dir_fd = cache.get(&canonical_parent).unwrap();
+
+    utimensat(dir_fd, filename, &atime, &mtime, UtimensatFlags::NoFollowSymlink)
+        .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+
+    Ok(())
+}
+
+/// Set file mtime via utimensat with AT_FDCWD + AT_SYMLINK_NOFOLLOW.
+/// The full path is used since DirCache is not available on non-Linux Unix.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn set_file_mtime(path: &Path, server_time: SystemTime, _cache: &mut DirCache) -> Result<()> {
+    use nix::sys::stat::{UtimensatFlags, utimensat};
+    use nix::sys::time::TimeSpec;
+    use std::os::fd::BorrowedFd;
+
+    let dur =
+        server_time.duration_since(UNIX_EPOCH).context("Server timestamp is before Unix epoch")?;
+    let mtime = TimeSpec::new(dur.as_secs() as i64, dur.subsec_nanos() as i64);
+    let atime = TimeSpec::new(0, libc::UTIME_OMIT as i64);
+
+    let cwd = unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) };
+    utimensat(cwd, path, &atime, &mtime, UtimensatFlags::NoFollowSymlink)
+        .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+    Ok(())
+}
+
+/// Windows fallback: reopen the file and use std FileTimes.
+#[cfg(not(unix))]
+fn set_file_mtime(path: &Path, server_time: SystemTime, _cache: &mut DirCache) -> Result<()> {
+    let file = std::fs::File::options().write(true).open(path)?;
+    let times = std::fs::FileTimes::new().set_modified(server_time);
+    file.set_times(times)?;
+    Ok(())
+}
+
+/// Apply mtime directly on an open file descriptor via futimens(2).
+/// Called after fsync but before close — avoids reopening the file entirely.
+#[cfg(unix)]
+fn set_mtime_on_fd(file: &std::fs::File, mtime: SystemTime) -> Result<()> {
+    use nix::sys::stat::futimens;
+    use nix::sys::time::TimeSpec;
+
+    let dur = mtime.duration_since(UNIX_EPOCH).context("Server timestamp is before Unix epoch")?;
+    let ts_mtime = TimeSpec::new(dur.as_secs() as i64, dur.subsec_nanos() as i64);
+    // Nix 0.31 uses UTIME_OMIT to signal "don't change this field"
+    let ts_atime = TimeSpec::UTIME_OMIT;
+    futimens(file, &ts_atime, &ts_mtime)
+        .map_err(|e| std::io::Error::from_raw_os_error(e as i32).into())
+}
+
+/// Windows fallback: use std FileTimes on an already-open file handle.
+#[cfg(not(unix))]
+fn set_mtime_on_fd(file: &File, mtime: SystemTime) -> Result<()> {
+    let times = std::fs::FileTimes::new().set_modified(mtime);
+    file.set_times(times)?;
+    Ok(())
 }
 
 /// Generate a numbered filename to avoid collisions.
@@ -2495,8 +3007,10 @@ fn parse_digest_field(digest: &str) -> Option<(&str, &str)> {
 }
 
 /// Compute SHA256 hex digest of a file.
-fn sha256_file(path: &Path) -> Result<String> {
-    let mut file = File::open(path).context("Failed to open file for hash verification")?;
+/// Uses DirCache for TOCTOU-safe reopening on Linux.
+fn sha256_file(path: &Path, cache: &mut DirCache) -> Result<String> {
+    let mut file =
+        open_for_read(path, cache).context("Failed to open file for hash verification")?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 256 * 1024];
     loop {
@@ -2510,13 +3024,73 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(hash.iter().map(|b| format!("{:02x}", b)).collect::<String>())
 }
 
+/// Open a file read-only using the DirCache for TOCTOU safety.
+#[cfg(target_os = "linux")]
+fn open_for_read(path: &Path, cache: &mut DirCache) -> std::io::Result<File> {
+    use nix::fcntl::{OFlag, OpenHow, ResolveFlag, open, openat2};
+    use nix::sys::stat::Mode;
+
+    let mut parent = path.parent().unwrap_or_else(|| Path::new("."));
+    if parent.as_os_str().is_empty() {
+        parent = Path::new(".");
+    }
+    let filename = path.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "Path has no filename")
+    })?;
+
+    let canonical_parent = parent.to_path_buf();
+    if !cache.contains_key(&canonical_parent) {
+        let dir_fd = match open(
+            parent,
+            OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(e) => return Err(std::io::Error::from_raw_os_error(e as i32)),
+        };
+        cache.insert(canonical_parent.clone(), dir_fd);
+    }
+
+    let dir_fd = cache.get(&canonical_parent).unwrap();
+
+    let resolve_flags = ResolveFlag::RESOLVE_BENEATH
+        | ResolveFlag::RESOLVE_NO_SYMLINKS
+        | ResolveFlag::RESOLVE_NO_MAGICLINKS;
+
+    let how = OpenHow::new()
+        .flags(OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOCTTY)
+        .resolve(resolve_flags);
+
+    match openat2(dir_fd, filename, how) {
+        Ok(fd) => Ok(std::fs::File::from(fd)),
+        Err(e) => Err(std::io::Error::from_raw_os_error(e as i32)),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_for_read(path: &Path, _cache: &mut DirCache) -> std::io::Result<File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NOCTTY);
+    }
+    opts.open(path)
+}
+
 /// Verify SHA256 of a file against an expected hex hash.
 /// Returns Ok(()) on match, PermanentError::JsonHashMismatch on mismatch.
-fn verify_sha256_file(path: &Path, expected_hex: &str, quiet: bool) -> Result<()> {
+fn verify_sha256_file(
+    path: &Path,
+    expected_hex: &str,
+    quiet: bool,
+    cache: &mut DirCache,
+) -> Result<()> {
     if !quiet {
         eprintln!("Verifying SHA256 for '{}'...", path.display());
     }
-    let actual_hash = sha256_file(path)?;
+    let actual_hash = sha256_file(path, cache)?;
     let expected_lower = expected_hex.to_lowercase();
     if actual_hash != expected_lower {
         return Err(PermanentError::JsonHashMismatch {
@@ -2588,6 +3162,8 @@ async fn process_json_downloads(
     client_cache: &mut HashMap<String, Client>,
     hsts_db: &mut HstsMap,
     used_filenames: &mut HashMap<PathBuf, u32>,
+    dir_cache: &mut DirCache,
+    tls_config: &Option<ClientConfig>,
 ) -> Result<()> {
     let json_url_field = args.json_url_field.as_ref().expect("--json-url-field required");
 
@@ -2763,6 +3339,7 @@ async fn process_json_downloads(
             if attempt > 0 {
                 current_args.resume = true;
             }
+            let mut attempt_used_filenames = used_filenames.clone();
 
             let result = async {
                 match resolve_final_url_and_client(
@@ -2770,6 +3347,7 @@ async fn process_json_downloads(
                     &current_args,
                     client_cache,
                     hsts_db,
+                    tls_config,
                 )
                 .await
                 {
@@ -2801,8 +3379,9 @@ async fn process_json_downloads(
                             content_length,
                             content_disposition.as_deref(),
                             last_modified.as_deref(),
-                            used_filenames,
+                            &mut attempt_used_filenames,
                             parsed_sha256.as_deref(),
+                            dir_cache,
                         )
                         .await
                     }
@@ -2812,7 +3391,11 @@ async fn process_json_downloads(
             .await;
 
             match result {
-                Ok(()) => break,
+                Ok(()) => {
+                    // 3. Commit the cache
+                    *used_filenames = attempt_used_filenames;
+                    break;
+                }
                 Err(e) => {
                     if is_permanent_error(&e) {
                         eprintln!("Failed to download {}: {:#}", url, e);
@@ -2854,6 +3437,7 @@ async fn download_file(
     head_last_modified: Option<&str>,
     used_filenames: &mut HashMap<PathBuf, u32>,
     expected_sha256: Option<&str>,
+    dir_cache: &mut DirCache,
 ) -> Result<()> {
     // 1. Determine filenames first
     let mut final_filename = determine_filename(args, url, content_disposition);
@@ -2864,6 +3448,18 @@ async fn download_file(
     };
 
     let is_stdout = output_path.to_str() == Some("-");
+
+    // Apply --output-dir: prefix relative paths with the output directory
+    if !is_stdout
+        && let Some(ref dir_str) = args.output_dir
+        && output_path.is_relative()
+    {
+        output_path = Path::new(dir_str).join(&output_path);
+        // Update final_filename to reflect the new path
+        if let Some(fname) = output_path.file_name().and_then(|s| s.to_str()) {
+            final_filename = fname.to_string();
+        }
+    }
 
     // Handle --multiple-copies: resolve unique output path before any file checks
     if !is_stdout {
@@ -2884,17 +3480,19 @@ async fn download_file(
     }
 
     if !is_stdout {
-        check_path_before_open(&output_path)?;
+        check_path_before_open(&output_path, dir_cache)?;
     }
 
+    // Stat output file through DirCache (no AT_FDCWD) for size/mtime checks below
+    let output_info = if !is_stdout { stat_file_via_cache(&output_path, dir_cache)? } else { None };
+
     // Handle -N (--newer) mode: check if remote file is newer than local file
-    if args.newer && !is_stdout && output_path.exists() && args.no_if_modified_since {
+    if args.newer && !is_stdout && output_info.is_some() && args.no_if_modified_since {
         // --no-if-modified-since: Use the HEAD response's Last-Modified we already have
         if let Some(lm_str) = head_last_modified
             && let Some(server_time) = parse_http_date(lm_str)
         {
-            let local_meta = fs::metadata(&output_path)?;
-            if let Ok(local_mtime) = local_meta.modified() {
+            if let Some(local_mtime) = output_info.as_ref().unwrap().modified {
                 if server_time <= local_mtime {
                     if !args.quiet {
                         eprintln!(
@@ -2930,14 +3528,17 @@ async fn download_file(
         None
     };
 
+    // Stat temp file through DirCache (no AT_FDCWD)
+    let temp_info =
+        if let Some(ref tp) = temp_path { stat_file_via_cache(tp, dir_cache)? } else { None };
+
     let mut start_byte: u64 = 0;
     // Handle existing file (NOT writing to stdout)
     if !is_stdout {
         // For temp mode, check if temp file exists for resume
         if let Some(ref tp) = temp_path {
-            if tp.exists() && args.resume {
-                let metadata = fs::metadata(tp)?;
-                start_byte = metadata.len();
+            if temp_info.is_some() && args.resume {
+                start_byte = temp_info.as_ref().unwrap().size;
 
                 if args.debug {
                     eprintln!(
@@ -2964,9 +3565,14 @@ async fn download_file(
                                 tp.display()
                             );
                         }
-                        perform_atomic_move(tp, &output_path, args)?;
+                        perform_atomic_move(tp, &output_path, args, dir_cache)?;
                         if args.server_timestamps {
-                            apply_server_timestamp(&output_path, head_last_modified, args.debug);
+                            apply_server_timestamp(
+                                &output_path,
+                                head_last_modified,
+                                args.debug,
+                                dir_cache,
+                            );
                         }
                         return Ok(());
                     }
@@ -2982,7 +3588,7 @@ async fn download_file(
                 } else if !args.quiet {
                     eprintln!("Resuming temp file '{}' from byte {}", tp.display(), start_byte);
                 }
-            } else if tp.exists() && !args.resume && !args.overwrite {
+            } else if temp_info.is_some() && !args.resume && !args.overwrite {
                 // Temp file exists but --continue not specified
                 // We'll overwrite it since it's our temp file
                 if !args.quiet {
@@ -2994,16 +3600,15 @@ async fn download_file(
             } else if args.debug {
                 eprintln!(
                     "[DEBUG] Temp file state: Exists={}, Resume={}, Overwrite={}. Start Byte: 0",
-                    tp.exists(),
+                    temp_info.is_some(),
                     args.resume,
                     args.overwrite
                 );
             }
 
             // Also check if output file already exists (for temp mode)
-            if output_path.exists() {
-                let metadata = fs::metadata(&output_path)?;
-                let existing_size = metadata.len();
+            if let Some(ref out_info) = output_info {
+                let existing_size = out_info.size;
 
                 // Check if file is already complete
                 if let Some(total) = expected_length
@@ -3023,10 +3628,9 @@ async fn download_file(
                 // With --resume or --overwrite or --newer, we proceed (download to temp, then rename)
                 // Note: we don't resume from the output file in temp mode, we use the temp file
             }
-        } else if output_path.exists() {
+        } else if let Some(ref out_info) = output_info {
             // Non-temp mode: check output file
-            let metadata = fs::metadata(&output_path)?;
-            let existing_size = metadata.len();
+            let existing_size = out_info.size;
 
             // --continue: skip if server file is smaller than local
             if args.resume
@@ -3086,17 +3690,17 @@ async fn download_file(
     }
 
     // -N mode without --no-if-modified-since: add If-Modified-Since header
-    if args.newer && !args.no_if_modified_since && !is_stdout && output_path.exists() {
-        let local_meta = fs::metadata(&output_path);
-        if let Ok(meta) = local_meta
-            && let Ok(local_mtime) = meta.modified()
-            && let Some(http_date) = format_http_date(local_mtime)
-        {
-            if args.verbose {
-                eprintln!("Sending If-Modified-Since: {}", http_date);
-            }
-            request = request.header(IF_MODIFIED_SINCE, http_date);
+    if args.newer
+        && !args.no_if_modified_since
+        && !is_stdout
+        && output_info.is_some()
+        && let Some(local_mtime) = output_info.as_ref().unwrap().modified
+        && let Some(http_date) = format_http_date(local_mtime)
+    {
+        if args.verbose {
+            eprintln!("Sending If-Modified-Since: {}", http_date);
         }
+        request = request.header(IF_MODIFIED_SINCE, http_date);
     }
 
     if let Some(ref u) = args.user {
@@ -3136,12 +3740,12 @@ async fn download_file(
         }
         // If we were using a temp file, rename it
         if let Some(ref tp) = temp_path
-            && tp.exists()
+            && temp_info.is_some()
         {
-            perform_atomic_move(tp, &output_path, args)?;
+            perform_atomic_move(tp, &output_path, args, dir_cache)?;
         }
         if args.server_timestamps {
-            apply_server_timestamp(&output_path, head_last_modified, args.debug);
+            apply_server_timestamp(&output_path, head_last_modified, args.debug, dir_cache);
         }
         return Ok(());
     }
@@ -3165,6 +3769,13 @@ async fn download_file(
         response.headers().get(LAST_MODIFIED).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
     // Prefer GET's Last-Modified, fallback to HEAD's
     let effective_last_modified = get_last_modified.as_deref().or(head_last_modified);
+
+    // Pre-parse server timestamp for futimens (used inside download functions)
+    let server_mtime = if args.server_timestamps {
+        effective_last_modified.and_then(parse_http_date)
+    } else {
+        None
+    };
 
     let mut force_truncate = false;
     // Validate Content-Range when resuming
@@ -3234,7 +3845,11 @@ async fn download_file(
             }
 
             final_filename = new_name.clone();
-            output_path = PathBuf::from(&final_filename);
+            output_path = if let Some(ref dir_str) = args.output_dir {
+                Path::new(dir_str).join(&final_filename)
+            } else {
+                PathBuf::from(&final_filename)
+            };
 
             if args.temp {
                 let parent = output_path.parent().unwrap_or(Path::new("."));
@@ -3270,7 +3885,7 @@ async fn download_file(
 
     // In -N mode, force overwrite since we've already determined the file needs updating
     let mut effective_args = args.clone();
-    if args.newer && output_path.exists() {
+    if args.newer && output_info.is_some() {
         effective_args.overwrite = true;
     }
 
@@ -3285,6 +3900,8 @@ async fn download_file(
             force_truncate,
             path_buf,
             expected_sha256,
+            dir_cache,
+            server_mtime,
         )
         .await?;
     } else {
@@ -3296,13 +3913,10 @@ async fn download_file(
             remaining_bytes,
             force_truncate,
             expected_sha256,
+            dir_cache,
+            server_mtime,
         )
         .await?;
-    }
-
-    // Apply server timestamps after successful download
-    if args.server_timestamps {
-        apply_server_timestamp(&output_path, effective_last_modified, args.debug);
     }
 
     Ok(())
@@ -3313,41 +3927,111 @@ async fn download_file(
 /// - Uses O_EXCL (create_new) when starting fresh to prevent race conditions.
 /// - Uses mode defined by --filemode or umask (default) for security.
 /// - Handles resuming via Append mode.
+#[cfg(target_os = "linux")]
 fn open_temp_file_safely(
     path: &Path,
-    _args: &Args,
+    args: &Args,
     start_byte: u64,
     force_truncate: bool,
+    cache: &mut DirCache,
 ) -> std::io::Result<File> {
-    // Case 1: Resuming an existing download
-    if start_byte > 0 && !force_truncate {
-        let mut opts = OpenOptions::new();
-        opts.append(true);
+    use nix::fcntl::{OFlag, OpenHow, ResolveFlag, open, openat2};
+    use nix::sys::stat::Mode;
 
+    // 1. Path Splitting
+    let mut parent = path.parent().unwrap_or_else(|| Path::new("."));
+    if parent.as_os_str().is_empty() {
+        parent = Path::new(".");
+    }
+    let filename = path.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "Path has no filename")
+    })?;
+
+    // 2. Pin Directory Globally
+    let canonical_parent = parent.to_path_buf();
+    if !cache.contains_key(&canonical_parent) {
+        let dir_fd = match open(
+            parent,
+            OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(e) => return Err(std::io::Error::from_raw_os_error(e as i32)),
+        };
+        cache.insert(canonical_parent.clone(), dir_fd);
+    }
+    let dir_fd = cache.get(&canonical_parent).unwrap();
+
+    // 3. Prepare common OpenHow configuration
+    let mut mode = Mode::S_IRUSR | Mode::S_IWUSR | Mode::S_IRGRP | Mode::S_IROTH;
+    if let Some(ref mode_str) = args.filemode
+        && let Ok(m) = u32::from_str_radix(mode_str, 8)
+    {
+        mode = Mode::from_bits_truncate(m as nix::libc::mode_t);
+    }
+
+    let resolve_flags = ResolveFlag::RESOLVE_BENEATH
+        | ResolveFlag::RESOLVE_NO_SYMLINKS
+        | ResolveFlag::RESOLVE_NO_MAGICLINKS;
+
+    // Helper closure to attempt the openat2 call
+    let try_open = |flags: OFlag| -> std::io::Result<File> {
+        let mut how =
+            OpenHow::new().flags(flags | OFlag::O_CLOEXEC | OFlag::O_NOCTTY).resolve(resolve_flags);
+
+        if flags.contains(OFlag::O_CREAT) {
+            how = how.mode(mode);
+        }
+
+        match openat2(dir_fd, filename, how) {
+            Ok(fd) => Ok(std::fs::File::from(fd)),
+            Err(e) => Err(std::io::Error::from_raw_os_error(e as i32)),
+        }
+    };
+
+    // 4. Execute the correct open strategy
+    if start_byte > 0 && !force_truncate {
+        try_open(OFlag::O_WRONLY | OFlag::O_APPEND)
+    } else {
+        match try_open(OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL) {
+            Ok(f) => Ok(f),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                try_open(OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_TRUNC)
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_temp_file_safely(
+    path: &Path,
+    args: &Args,
+    start_byte: u64,
+    force_truncate: bool,
+    _cache: &mut DirCache,
+) -> std::io::Result<File> {
+    if start_byte > 0 && !force_truncate {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.append(true);
         apply_safe_flags(&mut opts);
         return opts.open(path);
     }
 
-    // Case 2: Starting fresh (Create new or Truncate)
-    // We try 'create_new' (O_EXCL) first for atomic security.
-    let mut opts = OpenOptions::new();
+    let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
-
     apply_safe_flags(&mut opts);
     #[cfg(unix)]
-    apply_file_mode(&mut opts, _args);
+    apply_file_mode(&mut opts, args);
 
     match opts.open(path) {
         Ok(f) => Ok(f),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // File exists, but we aren't resuming (force_truncate is true, or start_byte is 0).
-            // We must truncate it.
-            let mut opts = OpenOptions::new();
+            let mut opts = std::fs::OpenOptions::new();
             opts.write(true).truncate(true).create(true);
-
             apply_safe_flags(&mut opts);
             #[cfg(unix)]
-            apply_file_mode(&mut opts, _args);
+            apply_file_mode(&mut opts, args);
             opts.open(path)
         }
         Err(e) => Err(e),
@@ -3363,6 +4047,8 @@ async fn download_to_temp(
     force_truncate: bool,
     temp_path: PathBuf,
     expected_sha256: Option<&str>,
+    dir_cache: &mut DirCache,
+    server_mtime: Option<SystemTime>,
 ) -> Result<PathBuf> {
     // Store temp path for potential cleanup on signal
     {
@@ -3372,7 +4058,7 @@ async fn download_to_temp(
 
     // Log temporary filename
     if !args.quiet {
-        if temp_path.exists() && start_byte > 0 {
+        if start_byte > 0 && !force_truncate {
             eprintln!("Resuming with temporary file: {}", temp_path.display());
         } else {
             eprintln!("Using temporary file: {}", temp_path.display());
@@ -3382,15 +4068,16 @@ async fn download_to_temp(
     // Determine actual start byte from temp file
     let actual_start_byte = if force_truncate {
         0
-    } else if temp_path.exists() && start_byte > 0 {
+    } else if start_byte > 0 {
         start_byte
     } else {
         0
     };
 
     // Open temp file (create or append)
-    let std_file = open_temp_file_safely(&temp_path, args, actual_start_byte, force_truncate)
-        .context("Failed to open temp file")?;
+    let std_file =
+        open_temp_file_safely(&temp_path, args, actual_start_byte, force_truncate, dir_cache)
+            .context("Failed to open temp file")?;
 
     let mut async_file = tokio::fs::File::from_std(std_file);
     let bytes_written = write_response_to_file(
@@ -3409,15 +4096,31 @@ async fn download_to_temp(
         Err(e) if e.raw_os_error() == Some(libc::ENOTSUP) => {}
         Err(e) => return Err(e.into()),
     };
-    drop(async_file); // Close file handle before rename
+
+    // Apply server timestamp on the temp file via futimens BEFORE close and rename.
+    // The mtime is set on the temp file's fd — rename preserves inode metadata,
+    // so the final file inherits the correct mtime.
+    if let Some(mtime) = server_mtime {
+        let std_file = async_file.into_std().await;
+        if let Err(e) = set_mtime_on_fd(&std_file, mtime) {
+            if args.debug {
+                eprintln!("[DEBUG] futimens on temp file failed: {}", e);
+            }
+        } else if args.debug {
+            eprintln!("[DEBUG] Set temp file mtime via futimens before rename");
+        }
+        drop(std_file);
+    } else {
+        drop(async_file);
+    }
 
     // Verify SHA256 on the temp file BEFORE renaming to the final path.
     // This way a corrupt download never overwrites a good file.
     if let Some(expected) = expected_sha256 {
-        verify_sha256_file(&temp_path, expected, args.quiet)?;
+        verify_sha256_file(&temp_path, expected, args.quiet, dir_cache)?;
     }
 
-    let move_result = perform_atomic_move(&temp_path, output_path, args);
+    let move_result = perform_atomic_move(&temp_path, output_path, args, dir_cache);
     {
         let mut guard = CURRENT_TEMP_PATH.lock().unwrap();
         *guard = None;
@@ -3455,10 +4158,12 @@ async fn download_direct(
     remaining_bytes: Option<u64>,
     force_truncate: bool,
     expected_sha256: Option<&str>,
+    dir_cache: &mut DirCache,
+    server_mtime: Option<SystemTime>,
 ) -> Result<PathBuf> {
     let (std_file, actual_path) =
-        match open_file_safely(output_path, args, start_byte, force_truncate) {
-            Ok(f) => (f, output_path.to_path_buf()),
+        match open_file_securely(output_path, args, start_byte, force_truncate, dir_cache) {
+            Ok((f, _existed)) => (f, output_path.to_path_buf()),
             Err(e) => {
                 // Check if the root cause is ENAMETOOLONG
                 let is_too_long = e
@@ -3472,7 +4177,18 @@ async fn download_direct(
                         return Err(PermanentError::FilenameTooLong.into());
                     }
                     eprintln!("Filename too long, truncating to: {}", truncated.display());
-                    (open_file_safely(&truncated, args, start_byte, force_truncate)?, truncated)
+
+                    // Retry with truncated path
+                    match open_file_securely(
+                        &truncated,
+                        args,
+                        start_byte,
+                        force_truncate,
+                        dir_cache,
+                    ) {
+                        Ok((f, _)) => (f, truncated),
+                        Err(e) => return Err(e),
+                    }
                 } else {
                     return Err(e);
                 }
@@ -3495,12 +4211,27 @@ async fn download_direct(
         Err(e) if e.raw_os_error() == Some(libc::ENOTSUP) => {}
         Err(e) => return Err(e.into()),
     };
-    // Must drop the async file handle so the blocking SHA256 read can open it
-    drop(file);
+
+    // Apply server timestamp via futimens on the still-open fd, after fsync.
+    // This avoids reopening the file and is TOCTOU-safe.
+    if let Some(mtime) = server_mtime {
+        let std_file = file.into_std().await;
+        if let Err(e) = set_mtime_on_fd(&std_file, mtime) {
+            if args.debug {
+                eprintln!("[DEBUG] futimens on output file failed: {}", e);
+            }
+        } else if args.debug {
+            eprintln!("[DEBUG] Set output file mtime via futimens");
+        }
+        // Must drop the std file handle so the blocking SHA256 read can open it
+        drop(std_file);
+    } else {
+        drop(file);
+    }
 
     // Verify SHA256 after writing and syncing
     if let Some(expected) = expected_sha256 {
-        verify_sha256_file(&actual_path, expected, args.quiet)?;
+        verify_sha256_file(&actual_path, expected, args.quiet, dir_cache)?;
     }
 
     if !args.quiet {

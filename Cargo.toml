@@ -10,7 +10,7 @@ license = "Apache-2.0 AND GPL-3.0-only"
 
 [dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json", "hickory-dns"] }
-rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "logging"] }
+rustls = { version = "0.23", features = ["std", "aws-lc-rs", "logging"] }
 aws-lc-rs = "1"
 charset = "0.1"
 log = "0"

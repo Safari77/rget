@@ -6,6 +6,7 @@ fn make_args() -> Args {
     Args {
         urls: vec!["http://test.com".to_string()],
         output: None,
+        output_dir: None,
         insecure: false,
         no_proxy: false,
         ipv4_only: false,
@@ -35,6 +36,17 @@ fn make_args() -> Args {
         cert: None,
         key: None,
         force_tty_write: false,
+        newer: false,
+        no_if_modified_since: false,
+        server_timestamps: false,
+        multiple_copies: false,
+        keep_extension: false,
+        json_parse: false,
+        json_url_field: None,
+        json_hash_field: None,
+        json_name_field: None,
+        json_filter: None,
+        json_verify_hash: false,
     }
 }
 
@@ -1288,4 +1300,51 @@ fn test_idn_homograph_punycode() {
             );
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_openat2_security_linux() {
+    use std::os::unix::fs::symlink;
+
+    // Create unique filenames for the test to prevent collisions
+    let time_num =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+
+    let temp_dir = std::env::temp_dir();
+    let target_file = temp_dir.join(format!("secure_file_{}.txt", time_num));
+    let symlink_file = temp_dir.join(format!("symlink_{}.txt", time_num));
+
+    // Ensure clean state
+    let _ = std::fs::remove_file(&target_file);
+    let _ = std::fs::remove_file(&symlink_file);
+
+    // Create a malicious symlink pointing to /dev/null
+    symlink("/dev/null", &symlink_file).expect("Failed to create test symlink");
+
+    let args = make_args();
+    let mut cache = DirCache::default();
+
+    // 1. Verify normal file creation succeeds
+    let (file, existed) = open_file_securely(&target_file, &args, 0, false, &mut cache)
+        .expect("Should create file securely via openat2");
+    assert!(!existed, "File should not have existed");
+    drop(file);
+
+    // 2. Verify Symlink protection (RESOLVE_NO_SYMLINKS)
+    let err = open_file_securely(&symlink_file, &args, 0, false, &mut cache)
+        .expect_err("openat2 MUST fail when traversing a symlink");
+
+    let err_str = err.to_string();
+
+    // ELOOP on Linux is typically OS error 40 ("Too many levels of symbolic links")
+    assert!(
+        err_str.contains("Too many levels of symbolic links") || err_str.contains("os error 40"),
+        "Symlink bypass failed! openat2 did not return ELOOP. Got: {}",
+        err_str
+    );
+
+    // Cleanup
+    let _ = std::fs::remove_file(&target_file);
+    let _ = std::fs::remove_file(&symlink_file);
 }
