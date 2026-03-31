@@ -571,6 +571,10 @@ struct Args {
     )]
     hsts_file: Option<String>,
 
+    /// Disable loading, updating, and saving the HSTS database
+    #[arg(long = "no-hsts-update", help = "Disable HSTS database persistence and updates")]
+    no_hsts_update: bool,
+
     /// Download only if remote file is newer than local file
     #[arg(short = 'N', long = "newer", help = "Download only if remote file is newer than local")]
     newer: bool,
@@ -1013,7 +1017,9 @@ async fn resolve_final_url_and_client(
             response = get_request.send().await.context("Failed to send GET request")?;
         }
 
-        update_hsts(hsts_db, &current_url, response.headers(), args.debug);
+        if !args.no_hsts_update {
+            update_hsts(hsts_db, &current_url, response.headers(), args.debug);
+        }
 
         if args.debug {
             eprintln!("[DEBUG] HTTP version: {:#?} {}", response.version(), response.status());
@@ -2124,6 +2130,29 @@ fn check_path_before_open(path: &Path, cache: &mut DirCache) -> Result<bool> {
     }
 }
 
+/// Try openat2, falling back to openat with O_NOFOLLOW if the kernel returns ENOSYS
+/// (e.g. Linux < 5.6, WSL1, systemd unit with `RestrictSUIDSGID=yes`).
+#[cfg(target_os = "linux")]
+fn openat2_or_fallback(
+    dir_fd: &std::os::fd::OwnedFd,
+    filename: &std::ffi::OsStr,
+    how: nix::fcntl::OpenHow,
+    fallback_flags: nix::fcntl::OFlag,
+    fallback_mode: nix::sys::stat::Mode,
+) -> std::io::Result<std::os::fd::OwnedFd> {
+    use nix::fcntl::{openat, openat2};
+
+    match openat2(dir_fd, filename, how) {
+        Ok(fd) => Ok(fd),
+        Err(nix::errno::Errno::ENOSYS) => {
+            // openat2 not supported — fall back to openat with O_NOFOLLOW
+            openat(dir_fd, filename, fallback_flags, fallback_mode)
+                .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
+        }
+        Err(e) => Err(std::io::Error::from_raw_os_error(e as i32)),
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn open_file_securely(
     path: &Path,
@@ -2132,7 +2161,7 @@ fn open_file_securely(
     force_truncate: bool,
     cache: &mut DirCache,
 ) -> Result<(File, bool)> {
-    use nix::fcntl::{AtFlags, OFlag, OpenHow, ResolveFlag, open, openat2};
+    use nix::fcntl::{AtFlags, OFlag, OpenHow, ResolveFlag, open};
     use nix::sys::stat::{Mode, fstatat};
 
     let mut parent = path.parent().unwrap_or_else(|| Path::new("."));
@@ -2209,12 +2238,8 @@ fn open_file_securely(
     }
 
     // USE PERSISTENT FD
-    let fd_result = openat2(dir_fd, filename, how);
-
-    let owned_fd = match fd_result {
-        Ok(fd) => fd,
-        Err(e) => return Err(std::io::Error::from_raw_os_error(e as i32).into()),
-    };
+    let fallback_flags = flags | OFlag::O_CLOEXEC | OFlag::O_NOCTTY | OFlag::O_NOFOLLOW;
+    let owned_fd = openat2_or_fallback(dir_fd, filename, how, fallback_flags, mode)?;
 
     let file = std::fs::File::from(owned_fd);
 
@@ -2518,6 +2543,7 @@ fn is_permanent_error(err: &anyhow::Error) -> bool {
                 if os_err == nix::libc::ELOOP
                     || os_err == nix::libc::ENOTDIR
                     || os_err == nix::libc::EISDIR
+                    || os_err == nix::libc::ENOSYS
                 {
                     return true;
                 }
@@ -3027,7 +3053,7 @@ fn sha256_file(path: &Path, cache: &mut DirCache) -> Result<String> {
 /// Open a file read-only using the DirCache for TOCTOU safety.
 #[cfg(target_os = "linux")]
 fn open_for_read(path: &Path, cache: &mut DirCache) -> std::io::Result<File> {
-    use nix::fcntl::{OFlag, OpenHow, ResolveFlag, open, openat2};
+    use nix::fcntl::{OFlag, OpenHow, ResolveFlag, open};
     use nix::sys::stat::Mode;
 
     let mut parent = path.parent().unwrap_or_else(|| Path::new("."));
@@ -3061,10 +3087,9 @@ fn open_for_read(path: &Path, cache: &mut DirCache) -> std::io::Result<File> {
         .flags(OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOCTTY)
         .resolve(resolve_flags);
 
-    match openat2(dir_fd, filename, how) {
-        Ok(fd) => Ok(std::fs::File::from(fd)),
-        Err(e) => Err(std::io::Error::from_raw_os_error(e as i32)),
-    }
+    let fallback_flags = OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOCTTY | OFlag::O_NOFOLLOW;
+    let fd = openat2_or_fallback(dir_fd, filename, how, fallback_flags, Mode::empty())?;
+    Ok(std::fs::File::from(fd))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -3935,7 +3960,7 @@ fn open_temp_file_safely(
     force_truncate: bool,
     cache: &mut DirCache,
 ) -> std::io::Result<File> {
-    use nix::fcntl::{OFlag, OpenHow, ResolveFlag, open, openat2};
+    use nix::fcntl::{OFlag, OpenHow, ResolveFlag, open};
     use nix::sys::stat::Mode;
 
     // 1. Path Splitting
@@ -3974,7 +3999,7 @@ fn open_temp_file_safely(
         | ResolveFlag::RESOLVE_NO_SYMLINKS
         | ResolveFlag::RESOLVE_NO_MAGICLINKS;
 
-    // Helper closure to attempt the openat2 call
+    // Helper closure to attempt the openat2 call via openat2_or_fallback
     let try_open = |flags: OFlag| -> std::io::Result<File> {
         let mut how =
             OpenHow::new().flags(flags | OFlag::O_CLOEXEC | OFlag::O_NOCTTY).resolve(resolve_flags);
@@ -3983,10 +4008,9 @@ fn open_temp_file_safely(
             how = how.mode(mode);
         }
 
-        match openat2(dir_fd, filename, how) {
-            Ok(fd) => Ok(std::fs::File::from(fd)),
-            Err(e) => Err(std::io::Error::from_raw_os_error(e as i32)),
-        }
+        let fallback_flags = flags | OFlag::O_CLOEXEC | OFlag::O_NOCTTY | OFlag::O_NOFOLLOW;
+        let fd = openat2_or_fallback(dir_fd, filename, how, fallback_flags, mode)?;
+        Ok(std::fs::File::from(fd))
     };
 
     // 4. Execute the correct open strategy
@@ -4405,10 +4429,11 @@ async fn main() -> ExitCode {
     // Set global flag for signal handler
     KEEP_TEMP_ON_CANCEL.store(args.keep_temp, Ordering::SeqCst);
 
-    // Load HSTS database once at startup
+    // Load HSTS database once at startup (skip if --no-hsts-update)
+    let no_hsts_update = args.no_hsts_update;
     let hsts_path =
         if let Some(ref p) = args.hsts_file { PathBuf::from(p) } else { get_default_hsts_path() };
-    let mut hsts_db = load_hsts_db(&hsts_path);
+    let mut hsts_db = if no_hsts_update { HashMap::new() } else { load_hsts_db(&hsts_path) };
 
     let exit_code = tokio::select! {
         result = run_with_args(args, &mut hsts_db) => {
@@ -4450,8 +4475,10 @@ async fn main() -> ExitCode {
         }
     };
 
-    // Save HSTS database exactly once, regardless of how we exited
-    save_hsts_db(&hsts_path, &hsts_db);
+    // Save HSTS database exactly once, regardless of how we exited (skip if --no-hsts-update)
+    if !no_hsts_update {
+        save_hsts_db(&hsts_path, &hsts_db);
+    }
 
     exit_code
 }
