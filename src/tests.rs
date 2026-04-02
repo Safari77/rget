@@ -47,6 +47,7 @@ fn make_args() -> Args {
         json_name_field: None,
         json_filter: None,
         json_verify_hash: false,
+        no_hsts_update: false,
     }
 }
 

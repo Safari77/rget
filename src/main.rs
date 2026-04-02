@@ -38,16 +38,17 @@ static GLOBAL: Jemalloc = Jemalloc;
 */
 
 use std::collections::{HashMap, HashSet};
-#[cfg(not(target_os = "linux"))]
-use std::fs::OpenOptions;
 use std::fs::{self, File};
 use std::io::IsTerminal;
 use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Read};
 use std::net::{IpAddr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, OpenOptions};
 
 use crate::content_disposition::{DispositionType, parse_content_disposition};
 use anyhow::{Context, Result, bail};
@@ -82,12 +83,8 @@ static KEEP_TEMP_ON_CANCEL: AtomicBool = AtomicBool::new(false);
 /// Global storage for temp file path during download (for cleanup decision)
 static CURRENT_TEMP_PATH: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
-// A cache to keep directory file descriptors permanently open during the run
-#[cfg(target_os = "linux")]
-type DirCache = std::collections::HashMap<PathBuf, std::os::fd::OwnedFd>;
-
-#[cfg(not(target_os = "linux"))]
-type DirCache = (); // Dummy type for macOS/Windows
+// A cache to keep directory handles permanently open during the run
+type DirCache = std::collections::HashMap<PathBuf, Dir>;
 
 #[derive(Debug)]
 pub enum PermanentError {
@@ -377,26 +374,6 @@ const RESUME_KEY_FILENAME: &str = "resumekey.conf";
 /// Check if io::Error is ENAMETOOLONG or equivalent
 fn is_name_too_long(err: &std::io::Error) -> bool {
     err.kind() == std::io::ErrorKind::InvalidFilename
-}
-
-/// Apply safe open flags (O_NOFOLLOW | O_NOCTTY) on Unix (excluding Linux, which uses openat2)
-#[cfg(all(unix, not(target_os = "linux")))]
-fn apply_safe_flags(opts: &mut OpenOptions) {
-    use std::os::unix::fs::OpenOptionsExt;
-    opts.custom_flags(libc::O_NOFOLLOW | libc::O_NOCTTY);
-}
-
-#[cfg(not(unix))]
-fn apply_safe_flags(_opts: &mut OpenOptions) {}
-
-#[cfg(all(unix, not(target_os = "linux")))]
-fn apply_file_mode(opts: &mut OpenOptions, args: &Args) {
-    use std::os::unix::fs::OpenOptionsExt;
-    if let Some(ref mode_str) = args.filemode
-        && let Ok(mode) = u32::from_str_radix(mode_str, 8)
-    {
-        opts.mode(mode);
-    }
 }
 
 /// HSTS database filename
@@ -777,6 +754,13 @@ fn update_hsts(map: &mut HstsMap, url: &Url, headers: &HeaderMap, debug: bool) {
             }
         }
     }
+}
+
+/// Safely extracts the parent directory from a path.
+/// If the path is just a filename (e.g., "ur.bin"), it returns "." instead of "".
+fn safe_parent(path: &Path) -> &Path {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    if parent.as_os_str().is_empty() { Path::new(".") } else { parent }
 }
 
 /// Build the TLS ClientConfig once per invocation.
@@ -1188,23 +1172,15 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
     let mut used_filenames: HashMap<PathBuf, u32> = HashMap::new();
     let mut dir_cache = DirCache::default();
 
-    // Pre-populate DirCache with --output-dir fd so all downloads reuse it
-    #[cfg(target_os = "linux")]
+    // Pre-populate DirCache with --output-dir handle so all downloads reuse it
     if let Some(ref dir_str) = args.output_dir {
-        use nix::fcntl::{OFlag, open};
-        use nix::sys::stat::Mode;
-
         let dir_path = Path::new(dir_str);
-        let dir_fd =
-            open(dir_path, OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC, Mode::empty())
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "Failed to open output directory '{}': {}",
-                        dir_path.display(),
-                        std::io::Error::from_raw_os_error(e as i32)
-                    )
-                })?;
-        dir_cache.insert(dir_path.to_path_buf(), dir_fd);
+
+        // Use standard Dir and standard Path
+        let dir_handle = Dir::open_ambient_dir(dir_path, ambient_authority()).map_err(|e| {
+            anyhow::anyhow!("Failed to open output directory '{}': {}", dir_path.display(), e)
+        })?;
+        dir_cache.insert(dir_path.to_path_buf(), dir_handle);
     }
 
     // Build TLS config once (platform verifier + mTLS) and reuse for all clients.
@@ -1682,8 +1658,6 @@ fn sanitize_filename(filename: &str) -> String {
     // 3. Windows Reserved Name Check (Windows Only)
     #[cfg(windows)]
     {
-        use std::path::Path;
-
         let stem =
             Path::new(&sanitized).file_stem().and_then(|s| s.to_str()).unwrap_or("").to_uppercase();
 
@@ -1928,7 +1902,6 @@ fn check_file_after_open(
     insecure_owner: bool,
 ) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
-
     let metadata = file.metadata()?;
 
     if let Some(device_type) = is_block_or_char_device(metadata.mode()) {
@@ -1942,7 +1915,7 @@ fn check_file_after_open(
     // Check owner when appending (unless --insecure-owner)
     if check_owner && !insecure_owner {
         let file_uid = metadata.uid();
-        let process_uid = nix::unistd::getuid().as_raw();
+        let process_uid = rustix::process::getuid().as_raw();
 
         if file_uid != process_uid {
             return Err(PermanentError::FileOwnerMismatch {
@@ -1957,28 +1930,6 @@ fn check_file_after_open(
     Ok(())
 }
 
-// Unified fallback for both macOS (Unix, non-Linux) and Windows (non-Unix)
-#[cfg(not(target_os = "linux"))]
-fn check_path_before_open(path: &Path, _cache: &mut DirCache) -> Result<bool> {
-    match std::fs::metadata(path) {
-        Ok(_metadata) => {
-            #[cfg(unix)]
-            if let Some(device_type) =
-                is_block_or_char_device(std::os::unix::fs::MetadataExt::mode(&_metadata))
-            {
-                return if device_type == "block" {
-                    Err(PermanentError::BlockDeviceNotAllowed(path.to_path_buf()).into())
-                } else {
-                    Err(PermanentError::CharDeviceNotAllowed(path.to_path_buf()).into())
-                };
-            }
-            Ok(true)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(_) => Ok(false),
-    }
-}
-
 /// File metadata obtained through the DirCache (avoids AT_FDCWD stat calls).
 struct FileInfo {
     size: u64,
@@ -1987,55 +1938,26 @@ struct FileInfo {
 
 /// Stat a file through the DirCache, using fstatat on the pinned directory fd.
 /// Returns None if the file does not exist.
-#[cfg(target_os = "linux")]
-fn stat_file_via_cache(path: &Path, cache: &mut DirCache) -> Result<Option<FileInfo>> {
-    use nix::fcntl::{AtFlags, OFlag, open};
-    use nix::sys::stat::fstatat;
-
-    let mut parent = path.parent().unwrap_or_else(|| Path::new("."));
-    if parent.as_os_str().is_empty() {
-        parent = Path::new(".");
-    }
+fn stat_file_via_cache(
+    path: &Path,
+    cache: &mut DirCache,
+) -> Result<Option<FileInfo>, std::io::Error> {
+    let parent = safe_parent(path);
     let filename = path.file_name().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "Path has no filename")
     })?;
 
-    let canonical_parent = parent.to_path_buf();
-    if !cache.contains_key(&canonical_parent) {
-        let dir_fd = match open(
-            parent,
-            OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
-            nix::sys::stat::Mode::empty(),
-        ) {
-            Ok(fd) => fd,
-            Err(e) if e == nix::errno::Errno::ENOENT => return Ok(None),
-            Err(e) => return Err(std::io::Error::from_raw_os_error(e as i32).into()),
-        };
-        cache.insert(canonical_parent.clone(), dir_fd);
-    }
+    ensure_dir_cached(cache, parent)?;
+    let dir = cache.get(parent).unwrap();
 
-    let dir_fd = cache.get(&canonical_parent).unwrap();
-
-    match fstatat(dir_fd, filename, AtFlags::AT_SYMLINK_NOFOLLOW) {
-        Ok(stat) => {
-            let modified = if stat.st_mtime >= 0 {
-                Some(UNIX_EPOCH + Duration::new(stat.st_mtime as u64, stat.st_mtime_nsec as u32))
-            } else {
-                None
-            };
-            Ok(Some(FileInfo { size: stat.st_size as u64, modified }))
+    match dir.symlink_metadata(filename) {
+        Ok(metadata) => {
+            // FIX: Convert cap_std::time::SystemTime to std::time::SystemTime
+            let modified = metadata.modified().ok().map(|t| t.into_std());
+            Ok(Some(FileInfo { size: metadata.len(), modified }))
         }
-        Err(e) if e == nix::errno::Errno::ENOENT => Ok(None),
-        Err(e) => Err(std::io::Error::from_raw_os_error(e as i32).into()),
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn stat_file_via_cache(path: &Path, _cache: &mut DirCache) -> Result<Option<FileInfo>> {
-    match fs::metadata(path) {
-        Ok(m) => Ok(Some(FileInfo { size: m.len(), modified: m.modified().ok() })),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
+        Err(e) => Err(e),
     }
 }
 
@@ -2050,44 +1972,7 @@ fn check_file_after_open(
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
-fn open_file_securely(
-    path: &Path,
-    args: &Args,
-    start_byte: u64,
-    force_truncate: bool,
-    cache: &mut DirCache,
-) -> Result<(File, bool)> {
-    let file_existed = check_path_before_open(path, cache)?;
-    let is_append = start_byte > 0;
-
-    let mut opts = std::fs::OpenOptions::new();
-    if is_append {
-        opts.append(true);
-    } else if file_existed || args.overwrite || force_truncate {
-        opts.create(true).write(true).truncate(true);
-    } else {
-        opts.write(true).create_new(true);
-    }
-
-    apply_safe_flags(&mut opts);
-    #[cfg(unix)]
-    apply_file_mode(&mut opts, args);
-
-    let file = opts.open(path)?;
-
-    if file_existed {
-        check_file_after_open(&file, path, true, args.insecure_owner)?;
-    }
-
-    Ok((file, file_existed))
-}
-
-#[cfg(target_os = "linux")]
 fn check_path_before_open(path: &Path, cache: &mut DirCache) -> Result<bool> {
-    use nix::fcntl::{AtFlags, OFlag, open};
-    use nix::sys::stat::fstatat;
-
     let mut parent = path.parent().unwrap_or_else(|| Path::new("."));
     if parent.as_os_str().is_empty() {
         parent = Path::new(".");
@@ -2095,350 +1980,230 @@ fn check_path_before_open(path: &Path, cache: &mut DirCache) -> Result<bool> {
     let filename = path.file_name().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "Path has no filename")
     })?;
+    let filename_str = filename.to_str().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "Filename is not valid UTF-8")
+    })?;
 
     // PIN DIRECTORY GLOBALLY
     let canonical_parent = parent.to_path_buf();
-    if !cache.contains_key(&canonical_parent) {
-        let dir_fd = match open(
-            parent,
-            OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
-            nix::sys::stat::Mode::empty(),
-        ) {
-            Ok(fd) => fd,
-            Err(e) if e == nix::errno::Errno::ENOENT => return Ok(false),
-            Err(e) => return Err(std::io::Error::from_raw_os_error(e as i32).into()),
-        };
-        cache.insert(canonical_parent.clone(), dir_fd);
-    }
+    ensure_dir_cached(cache, &canonical_parent)?;
 
-    let dir_fd = cache.get(&canonical_parent).unwrap(); // Get the persistent FD
-    let stat_result = fstatat(dir_fd, filename, AtFlags::AT_SYMLINK_NOFOLLOW);
+    let dir = cache.get(&canonical_parent).unwrap();
 
-    match stat_result {
-        Ok(stat) => {
-            if let Some(device_type) = is_block_or_char_device(stat.st_mode) {
-                return if device_type == "block" {
-                    Err(PermanentError::BlockDeviceNotAllowed(path.to_path_buf()).into())
-                } else {
-                    Err(PermanentError::CharDeviceNotAllowed(path.to_path_buf()).into())
-                };
+    // Check metadata universally to determine if the file exists
+    match dir.symlink_metadata(filename_str) {
+        Ok(_metadata) => {
+            // Only check for block/char devices on Unix
+            #[cfg(unix)]
+            {
+                use cap_std::fs::MetadataExt;
+                if let Some(device_type) = is_block_or_char_device(_metadata.mode()) {
+                    return if device_type == "block" {
+                        Err(PermanentError::BlockDeviceNotAllowed(path.to_path_buf()).into())
+                    } else {
+                        Err(PermanentError::CharDeviceNotAllowed(path.to_path_buf()).into())
+                    };
+                }
             }
-            Ok(true)
+            Ok(true) // File exists and is safe
         }
-        Err(e) if e == nix::errno::Errno::ENOENT => Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(_) => Ok(false),
     }
 }
 
-/// Try openat2, falling back to openat with O_NOFOLLOW if the kernel returns ENOSYS
-/// (e.g. Linux < 5.6, WSL1, systemd unit with `RestrictSUIDSGID=yes`).
-#[cfg(target_os = "linux")]
-fn openat2_or_fallback(
-    dir_fd: &std::os::fd::OwnedFd,
-    filename: &std::ffi::OsStr,
-    how: nix::fcntl::OpenHow,
-    fallback_flags: nix::fcntl::OFlag,
-    fallback_mode: nix::sys::stat::Mode,
-) -> std::io::Result<std::os::fd::OwnedFd> {
-    use nix::fcntl::{openat, openat2};
+/// Normalizes a path purely lexically (no disk I/O).
+/// Strips out `.` and resolves `..` where possible.
+fn normalize_path_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
 
-    match openat2(dir_fd, filename, how) {
-        Ok(fd) => Ok(fd),
-        Err(nix::errno::Errno::ENOSYS) => {
-            // openat2 not supported — fall back to openat with O_NOFOLLOW
-            openat(dir_fd, filename, fallback_flags, fallback_mode)
-                .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
+    for component in path.components() {
+        match component {
+            Component::Prefix(..) | Component::RootDir | Component::Normal(..) => {
+                normalized.push(component);
+            }
+            Component::CurDir => {} // Ignore `.`
+            Component::ParentDir => {
+                // Pop the last component if it's a normal directory, otherwise push `..`
+                // This handles edge cases where the path starts with `..`
+                let can_pop = matches!(normalized.components().last(), Some(Component::Normal(_)));
+                if can_pop {
+                    normalized.pop();
+                } else {
+                    normalized.push(component);
+                }
+            }
         }
-        Err(e) => Err(std::io::Error::from_raw_os_error(e as i32)),
     }
+
+    // If the path was just `.` or resolved to empty, return `.`
+    if normalized.as_os_str().is_empty() { PathBuf::from(".") } else { normalized }
 }
 
-#[cfg(target_os = "linux")]
+/// Ensure a parent directory is cached as a cap-std Dir handle.
+/// Opens it via ambient authority if not already present.
+fn ensure_dir_cached(cache: &mut DirCache, parent: &Path) -> std::io::Result<()> {
+    // 1. Normalize the path purely in memory
+    let canonical = normalize_path_lexically(parent);
+
+    // 2. Use the normalized path as the cache key
+    if !cache.contains_key(&canonical) {
+        let dir = Dir::open_ambient_dir(&canonical, cap_std::ambient_authority())?;
+        cache.insert(canonical, dir);
+    }
+    Ok(())
+}
+
 fn open_file_securely(
     path: &Path,
     args: &Args,
     start_byte: u64,
     force_truncate: bool,
     cache: &mut DirCache,
-) -> Result<(File, bool)> {
-    use nix::fcntl::{AtFlags, OFlag, OpenHow, ResolveFlag, open};
-    use nix::sys::stat::{Mode, fstatat};
-
-    let mut parent = path.parent().unwrap_or_else(|| Path::new("."));
-    if parent.as_os_str().is_empty() {
-        parent = Path::new(".");
-    }
+) -> Result<(std::fs::File, bool)> {
+    let parent = safe_parent(path);
     let filename = path.file_name().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "Path has no filename")
     })?;
 
-    // PIN DIRECTORY GLOBALLY
-    let canonical_parent = parent.to_path_buf();
-    if !cache.contains_key(&canonical_parent) {
-        let dir_fd = match open(
-            parent,
-            OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
-            Mode::empty(),
-        ) {
-            Ok(fd) => fd,
-            Err(e) => return Err(std::io::Error::from_raw_os_error(e as i32).into()),
-        };
-        cache.insert(canonical_parent.clone(), dir_fd);
-    }
+    ensure_dir_cached(cache, parent)?;
+    let dir = cache.get(parent).unwrap();
 
-    let dir_fd = cache.get(&canonical_parent).unwrap(); // Get the persistent FD
-
-    let file_existed;
-    let stat_result = fstatat(dir_fd, filename, AtFlags::AT_SYMLINK_NOFOLLOW);
-
-    match stat_result {
-        Ok(stat) => {
+    let mut file_existed = false;
+    match dir.symlink_metadata(filename) {
+        Ok(_metadata) => {
             file_existed = true;
-            if let Some(device_type) = is_block_or_char_device(stat.st_mode) {
-                return if device_type == "block" {
-                    Err(PermanentError::BlockDeviceNotAllowed(path.to_path_buf()).into())
-                } else {
-                    Err(PermanentError::CharDeviceNotAllowed(path.to_path_buf()).into())
-                };
+
+            #[cfg(unix)]
+            {
+                // FIX: Use cap-std's MetadataExt, not std's
+                use cap_std::fs::MetadataExt;
+                if let Some(device_type) = is_block_or_char_device(_metadata.mode()) {
+                    return if device_type == "block" {
+                        Err(PermanentError::BlockDeviceNotAllowed(path.to_path_buf()).into())
+                    } else {
+                        Err(PermanentError::CharDeviceNotAllowed(path.to_path_buf()).into())
+                    };
+                }
             }
         }
-        Err(e) if e == nix::errno::Errno::ENOENT => {
-            file_existed = false;
-        }
-        Err(e) => return Err(std::io::Error::from_raw_os_error(e as i32).into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
     }
 
     let is_append = start_byte > 0;
-    let mut flags = OFlag::O_WRONLY;
+    let mut opts = OpenOptions::new();
+    opts.write(true);
 
     if is_append {
-        flags |= OFlag::O_APPEND;
+        opts.append(true);
     } else if file_existed || args.overwrite || force_truncate {
-        flags |= OFlag::O_CREAT | OFlag::O_TRUNC;
+        opts.create(true).truncate(true);
     } else {
-        flags |= OFlag::O_CREAT | OFlag::O_EXCL;
+        opts.create_new(true);
     }
 
-    let mut mode = Mode::S_IRUSR | Mode::S_IWUSR | Mode::S_IRGRP | Mode::S_IROTH;
-    if let Some(ref mode_str) = args.filemode
-        && let Ok(m) = u32::from_str_radix(mode_str, 8)
+    #[cfg(unix)]
     {
-        mode = Mode::from_bits_truncate(m as nix::libc::mode_t);
+        use cap_std::fs::OpenOptionsExt;
+
+        let custom_flags = libc::O_NOCTTY | libc::O_NOFOLLOW;
+        opts.custom_flags(custom_flags);
+
+        if let Some(ref mode_str) = args.filemode {
+            if let Ok(m) = u32::from_str_radix(mode_str, 8) {
+                opts.mode(m);
+            }
+        }
     }
 
-    let resolve_flags = ResolveFlag::RESOLVE_BENEATH
-        | ResolveFlag::RESOLVE_NO_SYMLINKS
-        | ResolveFlag::RESOLVE_NO_MAGICLINKS;
-
-    let mut how =
-        OpenHow::new().flags(flags | OFlag::O_CLOEXEC | OFlag::O_NOCTTY).resolve(resolve_flags);
-
-    if flags.contains(OFlag::O_CREAT) {
-        how = how.mode(mode);
-    }
-
-    // USE PERSISTENT FD
-    let fallback_flags = flags | OFlag::O_CLOEXEC | OFlag::O_NOCTTY | OFlag::O_NOFOLLOW;
-    let owned_fd = openat2_or_fallback(dir_fd, filename, how, fallback_flags, mode)?;
-
-    let file = std::fs::File::from(owned_fd);
+    let cap_file = dir.open_with(filename, &opts)?;
+    let std_file = cap_file.into_std();
 
     if file_existed {
-        check_file_after_open(&file, path, true, args.insecure_owner)?;
+        check_file_after_open(&std_file, path, true, args.insecure_owner)?;
     }
 
-    Ok((file, file_existed))
+    Ok((std_file, file_existed))
 }
 
-/// Low-level helper: Rename a file atomically without overwriting the destination.
-/// Includes fallback for Android/FAT filesystems where renameat2 is not supported.
-#[cfg(not(target_os = "linux"))]
-fn rename_noreplace(from: &Path, to: &Path, debug: bool) -> std::io::Result<()> {
-    #[cfg(target_os = "android")]
-    {
-        if debug {
-            eprintln!("[DEBUG] Attempting fallback: hard link + unlink");
-        }
-        if std::fs::hard_link(from, to).is_ok() {
-            let _ = std::fs::remove_file(from);
-            return Ok(());
-        }
-
-        if debug {
-            eprintln!("[DEBUG] Attempting last resort: rename (if dst missing)");
-        }
-        if to.exists() {
-            return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
-        }
-        std::fs::rename(from, to)
-    }
-
-    #[cfg(all(unix, not(target_os = "android")))]
-    {
-        if debug {
-            eprintln!("[DEBUG] rename_noreplace: using hard_link fallback (non-linux)");
-        }
-        match std::fs::hard_link(from, to) {
-            Ok(()) => {
-                std::fs::remove_file(from)?;
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    #[cfg(windows)]
-    {
-        if debug {
-            eprintln!("[DEBUG] rename_noreplace: using rename fallback (windows)");
-        }
-        if to.exists() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "Destination exists",
-            ));
-        }
-        std::fs::rename(from, to)
-    }
-}
-
-/// High-level helper: Handles the decision between overwrite vs noreplace,
-/// and handles Filename Too Long truncation logic automatically.
+/// Because cap-std does not expose Linux's renameat2 (with RENAME_NOREPLACE), we use a hybrid
+/// approach here. We extract the raw file descriptors from our cap-std handles to pass to rustix
+/// on Linux. For macOS and Windows, we use cap-std's sandboxed .hard_link() and .rename().
 fn perform_atomic_move(
     temp_path: &Path,
     target_path: &Path,
     args: &Args,
     cache: &mut DirCache,
-) -> Result<PathBuf> {
-    // Helper closure to attempt the actual move operation based on flags
+) -> Result<PathBuf, anyhow::Error> {
+    // Internal helper to perform the move using Dir handles
     let try_move = |src: &Path, dst: &Path, cache: &mut DirCache| -> std::io::Result<()> {
+        let parent_from = safe_parent(src);
+        let parent_to = safe_parent(dst);
+        let file_from = src.file_name().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "Missing source filename")
+        })?;
+        let file_to = dst.file_name().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "Missing destination filename")
+        })?;
+
+        ensure_dir_cached(cache, parent_from)?;
+        ensure_dir_cached(cache, parent_to)?;
+
+        let dir_from = cache.get(parent_from).unwrap();
+        let dir_to = cache.get(parent_to).unwrap();
+
         let overwrite_or_resume = args.overwrite || args.resume;
 
+        // LINUX FAST-PATH: Use rustix for RENAME_NOREPLACE using the cap-std file descriptors
         #[cfg(target_os = "linux")]
         {
-            use nix::fcntl::{OFlag, RenameFlags, open, renameat2};
-            use nix::sys::stat::Mode;
+            use rustix::fs::RenameFlags;
             use std::os::fd::AsFd;
 
-            // 1. Split paths into directories and filenames
-            let mut parent_from = src.parent().unwrap_or_else(|| Path::new("."));
-            let mut parent_to = dst.parent().unwrap_or_else(|| Path::new("."));
+            let flags =
+                if overwrite_or_resume { RenameFlags::empty() } else { RenameFlags::NOREPLACE };
 
-            if parent_from.as_os_str().is_empty() {
-                parent_from = Path::new(".");
+            match rustix::fs::renameat_with(
+                dir_from.as_fd(),
+                file_from,
+                dir_to.as_fd(),
+                file_to,
+                flags,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(e) if e == rustix::io::Errno::EXIST => return Err(std::io::Error::from(e)),
+                Err(_) => {} // Fallthrough to std fallbacks for EXDEV / unsupported NOREPLACE
             }
-            if parent_to.as_os_str().is_empty() {
-                parent_to = Path::new(".");
-            }
-
-            let canon_from = parent_from.to_path_buf();
-            let canon_to = parent_to.to_path_buf();
-
-            let file_from = src.file_name().ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "Missing source filename")
-            })?;
-            let file_to = dst.file_name().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "Missing destination filename",
-                )
-            })?;
-
-            // 2. Ensure both parent directories are pinned in the cache
-            for d in [&canon_from, &canon_to] {
-                if !cache.contains_key(d) {
-                    let dir_fd = match open(
-                        d.as_path(),
-                        OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
-                        Mode::empty(),
-                    ) {
-                        Ok(fd) => fd,
-                        Err(e) => return Err(std::io::Error::from_raw_os_error(e as i32)),
-                    };
-                    cache.insert(d.clone(), dir_fd);
-                }
-            }
-
-            // 3. Retrieve our beautiful cached file descriptors safely
-            let fd_from = cache.get(&canon_from).unwrap();
-            let borrowed_from = fd_from.as_fd();
-
-            let fd_to = cache.get(&canon_to).unwrap();
-            let borrowed_to = fd_to.as_fd();
-
-            let flags = if overwrite_or_resume {
-                RenameFlags::empty()
-            } else {
-                RenameFlags::RENAME_NOREPLACE
-            };
-
-            // 4. Perform the atomic rename using the cached dir fds
-            match renameat2(borrowed_from, file_from, borrowed_to, file_to, flags) {
-                Ok(_) => {
-                    if args.debug {
-                        eprintln!(
-                            "[DEBUG] renameat2(dirfd, {:?}, dirfd, {:?}, {:?}) succeeded",
-                            file_from, file_to, flags
-                        );
-                    }
-                    return Ok(());
-                }
-                Err(e) => {
-                    if args.debug {
-                        eprintln!(
-                            "[DEBUG] renameat2 failed: {} (errno: {}). Checking fallback...",
-                            e, e as i32
-                        );
-                    }
-
-                    // ONLY short-circuit if NOREPLACE successfully blocked an overwrite.
-                    if e == nix::errno::Errno::EEXIST {
-                        return Err(std::io::Error::from_raw_os_error(e as i32));
-                    }
-
-                    // For EXDEV (cross-device) or EINVAL (NOREPLACE unsupported),
-                    // we intentionally fall through to the std::fs fallbacks.
-                }
-            }
-
-            // Fallback for filesystems that reject RENAME_NOREPLACE (EINVAL/ENOSYS)
-            if args.debug {
-                eprintln!("[DEBUG] Attempting fallback: hard link + unlink");
-            }
-            if std::fs::hard_link(src, dst).is_ok() {
-                let _ = std::fs::remove_file(src);
-                return Ok(());
-            }
-
-            if args.debug {
-                eprintln!("[DEBUG] Attempting last resort: rename");
-            }
-            if dst.exists() {
-                return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
-            }
-            std::fs::rename(src, dst)
         }
 
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = cache; // Satisfy compiler warnings on non-linux
-
-            if overwrite_or_resume {
-                if args.debug {
-                    eprintln!(
-                        "[DEBUG] Force rename (overwrite/resume): '{}' -> '{}'",
-                        src.display(),
-                        dst.display()
-                    );
+        // CROSS-PLATFORM / FALLBACK PATH using cap-std
+        if overwrite_or_resume {
+            // Atomic replace
+            dir_from.rename(file_from, dir_to, file_to)
+        } else {
+            // Safe fallback for NOREPLACE: hardlink then remove
+            match dir_from.hard_link(file_from, dir_to, file_to) {
+                Ok(()) => {
+                    let _ = dir_from.remove_file(file_from);
+                    Ok(())
                 }
-                std::fs::rename(src, dst)
-            } else {
-                rename_noreplace(src, dst, args.debug)
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
+                Err(_) => {
+                    // Last resort: check existence and standard rename
+                    if dir_to.symlink_metadata(file_to).is_ok() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            "Destination exists",
+                        ));
+                    }
+                    dir_from.rename(file_from, dir_to, file_to)
+                }
             }
         }
     };
 
-    // Attempt 1: Try the move
+    // The rest of your logic handles retries and ENAMETOOLONG
     match try_move(temp_path, target_path, cache) {
         Ok(_) => Ok(target_path.to_path_buf()),
 
@@ -2461,7 +2226,6 @@ fn perform_atomic_move(
                 eprintln!("Filename too long, retrying with: {}", truncated.display());
             }
 
-            // Attempt 2: Try with truncated name
             match try_move(temp_path, &truncated, cache) {
                 Ok(_) => Ok(truncated),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -2482,7 +2246,6 @@ fn perform_atomic_move(
         Err(e) => Err(e).context("Failed to rename temp file"),
     }
 }
-
 /// Parse Content-Range header to extract the start byte
 /// Format: "bytes START-END/TOTAL" or "bytes START-END/*"
 fn parse_content_range(header_value: &str) -> Option<u64> {
@@ -2538,12 +2301,12 @@ fn is_permanent_error(err: &anyhow::Error) -> bool {
 
         // --- IO Errors ---
         if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+            #[cfg(unix)]
             if let Some(os_err) = io_err.raw_os_error() {
-                #[cfg(unix)]
-                if os_err == nix::libc::ELOOP
-                    || os_err == nix::libc::ENOTDIR
-                    || os_err == nix::libc::EISDIR
-                    || os_err == nix::libc::ENOSYS
+                if os_err == libc::ELOOP
+                    || os_err == libc::ENOTDIR
+                    || os_err == libc::EISDIR
+                    || os_err == libc::ENOSYS
                 {
                     return true;
                 }
@@ -2665,9 +2428,8 @@ fn format_http_date(time: SystemTime) -> Option<String> {
 /// Apply server timestamp (Last-Modified) to a local file.
 /// Silently does nothing if the header is missing or unparseable.
 ///
-/// On Linux: uses utimensat on the pinned DirCache fd with AT_SYMLINK_NOFOLLOW.
+/// On Unix: uses utimensat on the pinned DirCache fd with AT_SYMLINK_NOFOLLOW.
 ///   No file reopen — operates directly on the directory fd + filename.
-/// On other Unix: uses utimensat with AT_FDCWD + AT_SYMLINK_NOFOLLOW.
 /// On Windows: reopens the file via std and uses FileTimes.
 fn apply_server_timestamp(
     path: &Path,
@@ -2703,18 +2465,22 @@ fn apply_server_timestamp(
     }
 }
 
-/// Set file mtime via utimensat using the DirCache dir fd + AT_SYMLINK_NOFOLLOW.
+/// Set file mtime via utimensat using the DirCache dir handle + AT_SYMLINK_NOFOLLOW.
 /// No file descriptor is opened for the file itself — purely metadata operation.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn set_file_mtime(path: &Path, server_time: SystemTime, cache: &mut DirCache) -> Result<()> {
-    use nix::fcntl::{OFlag, open};
-    use nix::sys::stat::{Mode, UtimensatFlags, utimensat};
-    use nix::sys::time::TimeSpec;
+    use rustix::fs::{AtFlags, Timespec, Timestamps};
+    use std::os::fd::AsFd;
 
     let dur =
         server_time.duration_since(UNIX_EPOCH).context("Server timestamp is before Unix epoch")?;
-    let mtime = TimeSpec::new(dur.as_secs() as i64, dur.subsec_nanos() as i64);
-    let atime = TimeSpec::UTIME_OMIT;
+    let times = Timestamps {
+        last_access: Timespec { tv_sec: 0, tv_nsec: rustix::fs::UTIME_OMIT as _ },
+        last_modification: Timespec {
+            tv_sec: dur.as_secs() as _,
+            tv_nsec: dur.subsec_nanos() as _,
+        },
+    };
 
     let mut parent = path.parent().unwrap_or_else(|| Path::new("."));
     if parent.as_os_str().is_empty() {
@@ -2722,72 +2488,53 @@ fn set_file_mtime(path: &Path, server_time: SystemTime, cache: &mut DirCache) ->
     }
     let filename = path.file_name().ok_or_else(|| anyhow::anyhow!("Path has no filename"))?;
 
-    // Ensure parent directory fd is in cache
+    // Ensure parent directory handle is in cache
     let canonical_parent = parent.to_path_buf();
-    if !cache.contains_key(&canonical_parent) {
-        let dir_fd =
-            open(parent, OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC, Mode::empty())
-                .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
-        cache.insert(canonical_parent.clone(), dir_fd);
-    }
+    ensure_dir_cached(cache, &canonical_parent)?;
 
-    let dir_fd = cache.get(&canonical_parent).unwrap();
+    let dir = cache.get(&canonical_parent).unwrap();
 
-    utimensat(dir_fd, filename, &atime, &mtime, UtimensatFlags::NoFollowSymlink)
-        .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+    rustix::fs::utimensat(dir.as_fd(), filename, &times, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(std::io::Error::from)?;
 
     Ok(())
 }
 
-/// Set file mtime via utimensat with AT_FDCWD + AT_SYMLINK_NOFOLLOW.
-/// The full path is used since DirCache is not available on non-Linux Unix.
-#[cfg(all(unix, not(target_os = "linux")))]
-fn set_file_mtime(path: &Path, server_time: SystemTime, _cache: &mut DirCache) -> Result<()> {
-    use nix::sys::stat::{UtimensatFlags, utimensat};
-    use nix::sys::time::TimeSpec;
-    use std::os::fd::BorrowedFd;
-
-    let dur =
-        server_time.duration_since(UNIX_EPOCH).context("Server timestamp is before Unix epoch")?;
-    let mtime = TimeSpec::new(dur.as_secs() as i64, dur.subsec_nanos() as i64);
-    let atime = TimeSpec::new(0, libc::UTIME_OMIT as i64);
-
-    let cwd = unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) };
-    utimensat(cwd, path, &atime, &mtime, UtimensatFlags::NoFollowSymlink)
-        .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
-    Ok(())
-}
-
-/// Windows fallback: reopen the file and use std FileTimes.
+/// Windows fallback: reopen the file securely via DirCache and use std FileTimes.
 #[cfg(not(unix))]
-fn set_file_mtime(path: &Path, server_time: SystemTime, _cache: &mut DirCache) -> Result<()> {
-    let file = std::fs::File::options().write(true).open(path)?;
+fn set_file_mtime(path: &Path, server_time: SystemTime, cache: &mut DirCache) -> Result<()> {
+    let mut parent = path.parent().unwrap_or_else(|| Path::new("."));
+    if parent.as_os_str().is_empty() {
+        parent = Path::new(".");
+    }
+    let filename = path.file_name().ok_or_else(|| anyhow::anyhow!("Path has no filename"))?;
+
+    // 1. Ensure parent directory handle is securely in the cache
+    let canonical_parent = parent.to_path_buf();
+    ensure_dir_cached(cache, &canonical_parent)?;
+
+    let dir = cache.get(&canonical_parent).unwrap();
+
+    // 2. Setup OpenOptions for write access
+    let mut opts = cap_std::fs::OpenOptions::new();
+    opts.write(true);
+
+    // 3. Open the file SECURELY through the pinned directory handle, avoiding symlink/junction TOCTOU
+    let cap_file = dir.open_with(filename, &opts)?;
+    let file = cap_file.into_std();
+
+    // 4. Apply the modified time
     let times = std::fs::FileTimes::new().set_modified(server_time);
     file.set_times(times)?;
+
     Ok(())
 }
 
 /// Apply mtime directly on an open file descriptor via futimens(2).
 /// Called after fsync but before close — avoids reopening the file entirely.
-#[cfg(unix)]
 fn set_mtime_on_fd(file: &std::fs::File, mtime: SystemTime) -> Result<()> {
-    use nix::sys::stat::futimens;
-    use nix::sys::time::TimeSpec;
-
-    let dur = mtime.duration_since(UNIX_EPOCH).context("Server timestamp is before Unix epoch")?;
-    let ts_mtime = TimeSpec::new(dur.as_secs() as i64, dur.subsec_nanos() as i64);
-    // Nix 0.31 uses UTIME_OMIT to signal "don't change this field"
-    let ts_atime = TimeSpec::UTIME_OMIT;
-    futimens(file, &ts_atime, &ts_mtime)
-        .map_err(|e| std::io::Error::from_raw_os_error(e as i32).into())
-}
-
-/// Windows fallback: use std FileTimes on an already-open file handle.
-#[cfg(not(unix))]
-fn set_mtime_on_fd(file: &File, mtime: SystemTime) -> Result<()> {
     let times = std::fs::FileTimes::new().set_modified(mtime);
-    file.set_times(times)?;
-    Ok(())
+    file.set_times(times).map_err(|e| -> anyhow::Error { e.into() })
 }
 
 /// Generate a numbered filename to avoid collisions.
@@ -3051,57 +2798,32 @@ fn sha256_file(path: &Path, cache: &mut DirCache) -> Result<String> {
 }
 
 /// Open a file read-only using the DirCache for TOCTOU safety.
-#[cfg(target_os = "linux")]
-fn open_for_read(path: &Path, cache: &mut DirCache) -> std::io::Result<File> {
-    use nix::fcntl::{OFlag, OpenHow, ResolveFlag, open};
-    use nix::sys::stat::Mode;
-
-    let mut parent = path.parent().unwrap_or_else(|| Path::new("."));
-    if parent.as_os_str().is_empty() {
-        parent = Path::new(".");
-    }
+/// Unified across all operating systems using cap-std.
+fn open_for_read(path: &Path, cache: &mut DirCache) -> std::io::Result<std::fs::File> {
+    let parent = safe_parent(path);
     let filename = path.file_name().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "Path has no filename")
     })?;
 
-    let canonical_parent = parent.to_path_buf();
-    if !cache.contains_key(&canonical_parent) {
-        let dir_fd = match open(
-            parent,
-            OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
-            Mode::empty(),
-        ) {
-            Ok(fd) => fd,
-            Err(e) => return Err(std::io::Error::from_raw_os_error(e as i32)),
-        };
-        cache.insert(canonical_parent.clone(), dir_fd);
-    }
+    // 1. Ensure the directory is securely cached
+    ensure_dir_cached(cache, parent)?;
+    let dir = cache.get(parent).unwrap();
 
-    let dir_fd = cache.get(&canonical_parent).unwrap();
-
-    let resolve_flags = ResolveFlag::RESOLVE_BENEATH
-        | ResolveFlag::RESOLVE_NO_SYMLINKS
-        | ResolveFlag::RESOLVE_NO_MAGICLINKS;
-
-    let how = OpenHow::new()
-        .flags(OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOCTTY)
-        .resolve(resolve_flags);
-
-    let fallback_flags = OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOCTTY | OFlag::O_NOFOLLOW;
-    let fd = openat2_or_fallback(dir_fd, filename, how, fallback_flags, Mode::empty())?;
-    Ok(std::fs::File::from(fd))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn open_for_read(path: &Path, _cache: &mut DirCache) -> std::io::Result<File> {
-    let mut opts = std::fs::OpenOptions::new();
+    // 2. Set up OpenOptions for read-only
+    let mut opts = OpenOptions::new();
     opts.read(true);
+
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NOCTTY);
+        use cap_std::fs::OpenOptionsExt;
+        // Apply safe flags: O_NOCTTY and O_NOFOLLOW
+        opts.custom_flags(libc::O_NOCTTY | libc::O_NOFOLLOW);
     }
-    opts.open(path)
+
+    // 3. Perform the sandboxed open and convert back to std::fs::File
+    let cap_file = dir.open_with(filename, &opts)?;
+
+    Ok(cap_file.into_std())
 }
 
 /// Verify SHA256 of a file against an expected hex hash.
@@ -3948,118 +3670,62 @@ async fn download_file(
 }
 
 /// Open a temp file for writing (with resume support).
-///
-/// - Uses O_EXCL (create_new) when starting fresh to prevent race conditions.
-/// - Uses mode defined by --filemode or umask (default) for security.
-/// - Handles resuming via Append mode.
-#[cfg(target_os = "linux")]
+/// Sandboxed across all OSes using cap-std.
 fn open_temp_file_safely(
     path: &Path,
-    args: &Args,
+    _args: &Args,
     start_byte: u64,
     force_truncate: bool,
     cache: &mut DirCache,
-) -> std::io::Result<File> {
-    use nix::fcntl::{OFlag, OpenHow, ResolveFlag, open};
-    use nix::sys::stat::Mode;
-
-    // 1. Path Splitting
-    let mut parent = path.parent().unwrap_or_else(|| Path::new("."));
-    if parent.as_os_str().is_empty() {
-        parent = Path::new(".");
-    }
+) -> std::io::Result<std::fs::File> {
+    let parent = safe_parent(path);
     let filename = path.file_name().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "Path has no filename")
     })?;
 
-    // 2. Pin Directory Globally
-    let canonical_parent = parent.to_path_buf();
-    if !cache.contains_key(&canonical_parent) {
-        let dir_fd = match open(
-            parent,
-            OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
-            Mode::empty(),
-        ) {
-            Ok(fd) => fd,
-            Err(e) => return Err(std::io::Error::from_raw_os_error(e as i32)),
-        };
-        cache.insert(canonical_parent.clone(), dir_fd);
-    }
-    let dir_fd = cache.get(&canonical_parent).unwrap();
+    ensure_dir_cached(cache, parent)?;
+    let dir = cache.get(parent).unwrap();
 
-    // 3. Prepare common OpenHow configuration
-    let mut mode = Mode::S_IRUSR | Mode::S_IWUSR | Mode::S_IRGRP | Mode::S_IROTH;
-    if let Some(ref mode_str) = args.filemode
-        && let Ok(m) = u32::from_str_radix(mode_str, 8)
+    let mut opts = OpenOptions::new();
+    opts.write(true);
+
+    #[cfg(unix)]
     {
-        mode = Mode::from_bits_truncate(m as nix::libc::mode_t);
+        use cap_std::fs::OpenOptionsExt;
+        // Apply safe flags: O_NOCTTY and O_NOFOLLOW
+        let custom_flags = libc::O_NOCTTY | libc::O_NOFOLLOW;
+        opts.custom_flags(custom_flags);
+
+        if let Some(ref mode_str) = _args.filemode {
+            if let Ok(m) = u32::from_str_radix(mode_str, 8) {
+                opts.mode(m);
+            }
+        }
     }
 
-    let resolve_flags = ResolveFlag::RESOLVE_BENEATH
-        | ResolveFlag::RESOLVE_NO_SYMLINKS
-        | ResolveFlag::RESOLVE_NO_MAGICLINKS;
+    // Execute the correct open strategy via cap-std handles
+    let cap_file = if start_byte > 0 && !force_truncate {
+        opts.append(true);
+        dir.open_with(filename, &opts)?
+    } else {
+        // Attempt O_CREAT | O_EXCL
+        let mut excl_opts = opts.clone();
+        excl_opts.create_new(true);
 
-    // Helper closure to attempt the openat2 call via openat2_or_fallback
-    let try_open = |flags: OFlag| -> std::io::Result<File> {
-        let mut how =
-            OpenHow::new().flags(flags | OFlag::O_CLOEXEC | OFlag::O_NOCTTY).resolve(resolve_flags);
-
-        if flags.contains(OFlag::O_CREAT) {
-            how = how.mode(mode);
+        match dir.open_with(filename, &excl_opts) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Fallback to O_TRUNC if it already exists
+                let mut trunc_opts = opts.clone();
+                trunc_opts.create(true).truncate(true);
+                dir.open_with(filename, &trunc_opts)?
+            }
+            Err(e) => return Err(e),
         }
-
-        let fallback_flags = flags | OFlag::O_CLOEXEC | OFlag::O_NOCTTY | OFlag::O_NOFOLLOW;
-        let fd = openat2_or_fallback(dir_fd, filename, how, fallback_flags, mode)?;
-        Ok(std::fs::File::from(fd))
     };
 
-    // 4. Execute the correct open strategy
-    if start_byte > 0 && !force_truncate {
-        try_open(OFlag::O_WRONLY | OFlag::O_APPEND)
-    } else {
-        match try_open(OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL) {
-            Ok(f) => Ok(f),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                try_open(OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_TRUNC)
-            }
-            Err(e) => Err(e),
-        }
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn open_temp_file_safely(
-    path: &Path,
-    args: &Args,
-    start_byte: u64,
-    force_truncate: bool,
-    _cache: &mut DirCache,
-) -> std::io::Result<File> {
-    if start_byte > 0 && !force_truncate {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.append(true);
-        apply_safe_flags(&mut opts);
-        return opts.open(path);
-    }
-
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    apply_safe_flags(&mut opts);
-    #[cfg(unix)]
-    apply_file_mode(&mut opts, args);
-
-    match opts.open(path) {
-        Ok(f) => Ok(f),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let mut opts = std::fs::OpenOptions::new();
-            opts.write(true).truncate(true).create(true);
-            apply_safe_flags(&mut opts);
-            #[cfg(unix)]
-            apply_file_mode(&mut opts, args);
-            opts.open(path)
-        }
-        Err(e) => Err(e),
-    }
+    // Convert the cap-std file to a standard file
+    Ok(cap_file.into_std())
 }
 
 async fn download_to_temp(
