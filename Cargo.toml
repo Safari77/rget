@@ -44,7 +44,7 @@ libc = "0.2"
 #tikv-jemallocator = "0.6"
 
 # For deterministic temp filename generation (SHAKE256)
-sha3 = "0.10"
+sha3 = "0.11"
 # For base32 encoding of temp filenames
 data-encoding = "2"
 
