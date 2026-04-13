@@ -3673,11 +3673,11 @@ async fn download_file(
 /// Sandboxed across all OSes using cap-std.
 fn open_temp_file_safely(
     path: &Path,
-    _args: &Args,
+    args: &Args,
     start_byte: u64,
     force_truncate: bool,
     cache: &mut DirCache,
-) -> std::io::Result<std::fs::File> {
+) -> Result<std::fs::File> {
     let parent = safe_parent(path);
     let filename = path.file_name().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "Path has no filename")
@@ -3696,7 +3696,7 @@ fn open_temp_file_safely(
         let custom_flags = libc::O_NOCTTY | libc::O_NOFOLLOW;
         opts.custom_flags(custom_flags);
 
-        if let Some(ref mode_str) = _args.filemode {
+        if let Some(ref mode_str) = args.filemode {
             if let Ok(m) = u32::from_str_radix(mode_str, 8) {
                 opts.mode(m);
             }
@@ -3704,28 +3704,35 @@ fn open_temp_file_safely(
     }
 
     // Execute the correct open strategy via cap-std handles
-    let cap_file = if start_byte > 0 && !force_truncate {
+    let (cap_file, file_existed) = if start_byte > 0 && !force_truncate {
         opts.append(true);
-        dir.open_with(filename, &opts)?
+        (dir.open_with(filename, &opts)?, true)
     } else {
         // Attempt O_CREAT | O_EXCL
         let mut excl_opts = opts.clone();
         excl_opts.create_new(true);
 
         match dir.open_with(filename, &excl_opts) {
-            Ok(f) => f,
+            Ok(f) => (f, false),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 // Fallback to O_TRUNC if it already exists
                 let mut trunc_opts = opts.clone();
                 trunc_opts.create(true).truncate(true);
-                dir.open_with(filename, &trunc_opts)?
+                (dir.open_with(filename, &trunc_opts)?, true)
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         }
     };
 
     // Convert the cap-std file to a standard file
-    Ok(cap_file.into_std())
+    let std_file = cap_file.into_std();
+
+    // Post-open TOCTOU check: verify device type and owner on existing files
+    if file_existed {
+        check_file_after_open(&std_file, path, true, args.insecure_owner)?;
+    }
+
+    Ok(std_file)
 }
 
 async fn download_to_temp(
