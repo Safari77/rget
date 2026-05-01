@@ -435,8 +435,11 @@ struct Args {
     )]
     ipv6_only: bool,
 
-    /// Overwrite existing file without prompting
-    #[arg(long = "overwrite", help = "Overwrite existing file")]
+    /// Overwrite existing file without prompting; forces re-download even if the local file size matches Content-Length
+    #[arg(
+        long = "overwrite",
+        help = "Overwrite existing file (forces re-download even when local size matches server's Content-Length)"
+    )]
     overwrite: bool,
 
     /// Write to a temporary file first, then atomically rename
@@ -3361,6 +3364,7 @@ async fn download_file(
                 if let Some(total) = expected_length
                     && existing_size >= total
                     && !args.newer
+                    && !args.overwrite
                 {
                     if !args.quiet {
                         eprintln!("File already fully downloaded.");
@@ -3398,6 +3402,7 @@ async fn download_file(
             if let Some(total) = expected_length
                 && existing_size >= total
                 && !args.newer
+                && !args.overwrite
             {
                 if !args.quiet {
                     eprintln!("File already fully downloaded.");
