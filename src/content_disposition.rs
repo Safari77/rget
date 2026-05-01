@@ -4,6 +4,8 @@
 // Based on 62330e3d606cbe32219300422f5922f55bedb3a2 commit
 // from https://github.com/y0zong/content-disposition
 //
+// More tests at http://test.greenbytes.de/tech/tc2231/
+//
 // Adapted for local use to fix RFC 6266 precedence issues.
 
 use charset::Charset;
@@ -63,6 +65,29 @@ impl ParsedContentDisposition {
     }
 }
 
+/// Process RFC 7230 §3.2.6 quoted-pair sequences inside a quoted-string body.
+/// Inside a quoted-string, `\X` represents the literal character X for any X.
+/// Allocates only when a backslash is present.
+fn unquote(inner: &str) -> String {
+    if !inner.contains('\\') {
+        return inner.to_string();
+    }
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            // \X -> X; a trailing lone '\' is kept literal
+            match chars.next() {
+                Some(next) => out.push(next),
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 pub fn parse_content_disposition(header: &str) -> ParsedContentDisposition {
     let params = parse_param_content(header);
     let disposition = parse_disposition_type(&params.value);
@@ -75,15 +100,25 @@ struct ParamContent {
     params: BTreeMap<String, String>,
 }
 
-/// Split on semicolons, but respect quoted strings.
+/// Split on semicolons, but respect quoted strings and quoted-pair escapes.
 /// RFC 6266 Section 4.1: semicolons inside quoted-string values must not split parameters.
+/// RFC 7230 Section 3.2.6: inside a quoted-string, a backslash escapes the next
+/// character (so `\"` does not terminate the string, and `\\` is a literal backslash).
 fn split_semicolon_aware(content: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut start = 0;
     let mut in_quotes = false;
+    let mut escape = false;
 
     for (i, ch) in content.char_indices() {
+        if escape {
+            // Previous char inside a quoted-string was a backslash;
+            // consume this char literally regardless of what it is.
+            escape = false;
+            continue;
+        }
         match ch {
+            '\\' if in_quotes => escape = true,
             '"' => in_quotes = !in_quotes,
             ';' if !in_quotes => {
                 parts.push(&content[start..i]);
@@ -105,11 +140,15 @@ fn parse_param_content(content: &str) -> ParamContent {
         .filter_map(|kv| {
             kv.find('=').map(|idx| {
                 let key = kv[0..idx].trim().to_lowercase();
-                let mut value = kv[idx + 1..].trim();
-                if value.starts_with('"') && value.ends_with('"') && value.len() > 1 {
-                    value = &value[1..value.len() - 1];
-                }
-                (key, value.to_string())
+                let raw = kv[idx + 1..].trim();
+                // RFC 7230 §3.2.6: a quoted-string strips outer DQUOTE and
+                // resolves quoted-pair escapes (\X -> X) inside the body.
+                let value = if raw.starts_with('"') && raw.ends_with('"') && raw.len() > 1 {
+                    unquote(&raw[1..raw.len() - 1])
+                } else {
+                    raw.to_string()
+                };
+                (key, value)
             })
         })
         .collect();
@@ -528,7 +567,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // KNOWN NON-CONFORMANCE: Parser doesn't handle escape sequences
     fn test_quoted_string_with_escaped_quote() {
         // RFC 2616 Section 2.2: Backslash can escape characters in quoted-string
         // Note: RFC 6266 Appendix D advises avoiding backslashes due to poor UA support
@@ -683,5 +721,274 @@ mod tests {
         assert_eq!(dis.disposition, DispositionType::Attachment);
         assert_eq!(dis.params.get("name"), Some(&"King Joffrey.death".to_string()));
         assert_eq!(dis.params.get("filename"), None);
+    }
+
+    // --------------------------------------------------------------------------
+    // tc2231: Path / security-relevant filenames
+    //
+    // The parser MUST preserve these verbatim. Sanitization (path stripping,
+    // Windows reserved names, etc.) is the caller's responsibility.
+    // --------------------------------------------------------------------------
+    #[test]
+    fn test_tc2231_attabspath() {
+        // attachment; filename="/foo.html"
+        let header = r#"attachment; filename="/foo.html""#;
+        let dis = parse_content_disposition(header);
+        assert_eq!(dis.disposition, DispositionType::Attachment);
+        assert_eq!(dis.params.get("filename"), Some(&"/foo.html".to_string()));
+    }
+
+    #[test]
+    fn test_tc2231_attabspathwin() {
+        // attachment; filename="\\foo.html"
+        // Wire bytes between the quotes are: \ \ f o o . h t m l
+        let header = r#"attachment; filename="\\foo.html""#;
+        let dis = parse_content_disposition(header);
+        assert_eq!(dis.disposition, DispositionType::Attachment);
+        assert_eq!(dis.params.get("filename"), Some(&r"\foo.html".to_string()));
+    }
+
+    #[test]
+    fn test_tc2231_attwithfnrawpctenca() {
+        // attachment; filename="foo-%41.html"
+        // Plain `filename` MUST NOT be percent-decoded (only `filename*` is).
+        // Decoding here would let an attacker smuggle bytes past sanitization.
+        let header = r#"attachment; filename="foo-%41.html""#;
+        let dis = parse_content_disposition(header);
+        assert_eq!(dis.params.get("filename"), Some(&"foo-%41.html".to_string()));
+    }
+
+    #[test]
+    fn test_tc2231_attwithfnusingpct() {
+        // attachment; filename="50%.html"
+        // Lone '%' must not crash anything; plain filename keeps it as-is.
+        let header = r#"attachment; filename="50%.html""#;
+        let dis = parse_content_disposition(header);
+        assert_eq!(dis.params.get("filename"), Some(&"50%.html".to_string()));
+    }
+
+    #[test]
+    fn test_tc2231_attwithnamepct() {
+        // attachment; name="foo-%41.html"
+        // `name` is not `filename`; never decoded.
+        let header = r#"attachment; name="foo-%41.html""#;
+        let dis = parse_content_disposition(header);
+        assert_eq!(dis.params.get("name"), Some(&"foo-%41.html".to_string()));
+        assert_eq!(dis.params.get("filename"), None);
+    }
+
+    #[test]
+    fn test_tc2231_attwithfnrawpctenclong() {
+        // attachment; filename="foo-%c3%a4-%e2%82%ac.html"
+        // Plain filename: percent sequences preserved, NOT decoded as UTF-8.
+        let header = r#"attachment; filename="foo-%c3%a4-%e2%82%ac.html""#;
+        let dis = parse_content_disposition(header);
+        assert_eq!(dis.params.get("filename"), Some(&"foo-%c3%a4-%e2%82%ac.html".to_string()));
+    }
+
+    // --------------------------------------------------------------------------
+    // tc2231: Duplicate filename parameter
+    //
+    // BEHAVIORAL NOTE: Your parser uses BTreeMap::collect, so when the same key
+    // appears twice the LAST occurrence wins. Browsers (FF, IE, Safari, Chrome)
+    // take the FIRST. tc2231 marks the "first wins" behavior as `warn`. Your
+    // current behavior is also acceptable per RFC (header is invalid either way).
+    // This test pins down the current choice; change it deliberately if at all.
+    // --------------------------------------------------------------------------
+
+    #[test]
+    fn test_tc2231_attwith2filenames_last_wins() {
+        let header = r#"attachment; filename="foo.html"; filename="bar.html""#;
+        let dis = parse_content_disposition(header);
+        assert_eq!(dis.params.get("filename"), Some(&"bar.html".to_string()));
+    }
+
+    // --------------------------------------------------------------------------
+    // tc2231: Token-form quirks (tolerant parsing of technically-invalid input)
+    // --------------------------------------------------------------------------
+
+    #[test]
+    fn test_tc2231_attwithfntokensq() {
+        // attachment; filename='foo.bar'
+        // Single quotes are not the same as double quotes; they stay in the value.
+        let header = "attachment; filename='foo.bar'";
+        let dis = parse_content_disposition(header);
+        assert_eq!(dis.params.get("filename"), Some(&"'foo.bar'".to_string()));
+    }
+
+    #[test]
+    fn test_tc2231_attwithtokfncommanq() {
+        // attachment; filename=foo,bar.html
+        // Invalid (comma not allowed in token form), but parser accepts it.
+        let header = "attachment; filename=foo,bar.html";
+        let dis = parse_content_disposition(header);
+        assert_eq!(dis.params.get("filename"), Some(&"foo,bar.html".to_string()));
+    }
+
+    #[test]
+    fn test_tc2231_attemptyparam() {
+        // attachment; ;filename=foo
+        // Empty segment between the two ; is silently skipped.
+        let header = "attachment; ;filename=foo";
+        let dis = parse_content_disposition(header);
+        assert_eq!(dis.disposition, DispositionType::Attachment);
+        assert_eq!(dis.params.get("filename"), Some(&"foo".to_string()));
+    }
+
+    #[test]
+    fn test_tc2231_attconfusedparam() {
+        // attachment; xfilename=foo.html
+        // 'xfilename' is not 'filename'; should NOT be treated as a filename.
+        let header = "attachment; xfilename=foo.html";
+        let dis = parse_content_disposition(header);
+        assert_eq!(dis.params.get("filename"), None);
+        assert_eq!(dis.params.get("xfilename"), Some(&"foo.html".to_string()));
+    }
+
+    // --------------------------------------------------------------------------
+    // tc2231: RFC 5987 ext-value malformed inputs
+    // --------------------------------------------------------------------------
+
+    #[test]
+    fn test_tc2231_attwithfn2231noc() {
+        // attachment; filename*=''foo-%c3%a4-%e2%82%ac.html
+        // No charset between the single quotes -> can't decode.
+        // Expected: plain `filename` not produced (only the raw filename* key remains).
+        let header = "attachment; filename*=''foo-%c3%a4-%e2%82%ac.html";
+        let dis = parse_content_disposition(header);
+        assert_eq!(dis.params.get("filename"), None);
+    }
+
+    #[test]
+    fn test_tc2231_attwithfn2231ws2() {
+        // attachment; filename*=UTF-8''foo-a.html  (no extra whitespace, baseline)
+        // Then a whitespace variant tc2231 calls "ws2": filename* =UTF-8''foo-a.html
+        let header = "attachment; filename* =UTF-8''foo-a.html";
+        let dis = parse_content_disposition(header);
+        // Whitespace BEFORE '=' should still let the param be recognized.
+        assert_eq!(dis.params.get("filename"), Some(&"foo-a.html".to_string()));
+    }
+
+    #[test]
+    fn test_tc2231_attwithfn2231ws3() {
+        // attachment; filename*= UTF-8''foo-a.html
+        // Whitespace AFTER '=' before the value.
+        let header = "attachment; filename*= UTF-8''foo-a.html";
+        let dis = parse_content_disposition(header);
+        assert_eq!(dis.params.get("filename"), Some(&"foo-a.html".to_string()));
+    }
+
+    // --------------------------------------------------------------------------
+    // tc2231: Continuation edge cases (RFC 2231 Section 3)
+    // --------------------------------------------------------------------------
+
+    #[test]
+    fn test_tc2231_attfncontnc() {
+        // attachment; filename*0="foo"; filename*2="bar"
+        // Gap in continuation indices: only the *0 part is taken; *2 is lost.
+        let header = r#"attachment; filename*0="foo"; filename*2="bar""#;
+        let dis = parse_content_disposition(header);
+        assert_eq!(dis.params.get("filename"), Some(&"foo".to_string()));
+    }
+
+    #[test]
+    fn test_tc2231_attfnconts1() {
+        // attachment; filename*1="foo."; filename*2="html"
+        // No filename*0 — current parser produces no `filename` key (only *0 triggers
+        // unwrapping). Verifies we don't accidentally synthesize a filename here.
+        let header = r#"attachment; filename*1="foo."; filename*2="html""#;
+        let dis = parse_content_disposition(header);
+        assert_eq!(dis.params.get("filename"), None);
+    }
+
+    // --------------------------------------------------------------------------
+    // tc2231: Known non-conformances — track but don't fail the suite
+    // --------------------------------------------------------------------------
+
+    #[test]
+    fn test_tc2231_attwithasciifnescapedchar() {
+        // attachment; filename="f\oo.html"  -> tc2231 expects "foo.html"
+        let header = r#"attachment; filename="f\oo.html""#;
+        let dis = parse_content_disposition(header);
+        assert_eq!(dis.params.get("filename"), Some(&"foo.html".to_string()));
+    }
+
+    #[test]
+    fn test_tc2231_attwithfilenameandextparamescaped() {
+        // attachment; foo="\"\\";filename="foo.html"
+        // tc2231 expects filename to be "foo.html"; our splitter sees the \"
+        // as an unescaped quote toggle and never reaches a clean delimiter.
+        let header = r#"attachment; foo="\"\\";filename="foo.html""#;
+        let dis = parse_content_disposition(header);
+        assert_eq!(dis.params.get("filename"), Some(&"foo.html".to_string()));
+    }
+
+    #[test]
+    fn test_tc2231_inlonlyquoted_should_be_ignored() {
+        // "inline"  (quoted disposition type — invalid)
+        // RFC says ignore the header. Our parser produces Extension("\"inline\"").
+        // Current callers only act on Inline/Attachment/FormData so this is benign,
+        // but if you ever switch to "if any disposition is set, use the filename"
+        // semantics, this would matter.
+        let dis = parse_content_disposition(r#""inline""#);
+        assert_ne!(dis.disposition, DispositionType::Inline);
+    }
+
+    // --------------------------------------------------------------------------
+    // tc2231: RFC 2047 encoded-words MUST NOT be decoded
+    //
+    // RFC 2047 encoded-words ("=?CHARSET?ENC?DATA?=") are defined for mail
+    // headers (RFC 5322), not for HTTP. RFC 6266 explicitly does not adopt them;
+    // the only HTTP-supported non-ASCII mechanism is RFC 5987 ext-value
+    // (filename*=charset'lang'pct-encoded). A parser that decodes encoded-words
+    // would violate RFC 6266 and accept input that real HTTP clients reject.
+    //
+    // These tests verify the parser preserves the raw bytes verbatim.
+    // --------------------------------------------------------------------------
+
+    #[test]
+    fn test_tc2231_attrfc2047token() {
+        // attachment; filename==?ISO-8859-1?Q?foo-=E4.html?=
+        // Token form (no quotes) containing what looks like an encoded-word.
+        // Expected: preserved as-is. NOT decoded to "foo-ä.html".
+        //
+        // Note the parser splits on the first '=': key="filename", and the
+        // value starts at the second '=' which begins the encoded-word.
+        let header = "attachment; filename==?ISO-8859-1?Q?foo-=E4.html?=";
+        let dis = parse_content_disposition(header);
+        assert_eq!(dis.disposition, DispositionType::Attachment);
+        assert_eq!(dis.params.get("filename"), Some(&"=?ISO-8859-1?Q?foo-=E4.html?=".to_string()));
+    }
+
+    #[test]
+    fn test_tc2231_attrfc2047quoted() {
+        // attachment; filename="=?ISO-8859-1?Q?foo-=E4.html?="
+        // Quoted-string form containing an encoded-word.
+        // Expected: outer quotes stripped, inner content preserved verbatim.
+        let header = r#"attachment; filename="=?ISO-8859-1?Q?foo-=E4.html?=""#;
+        let dis = parse_content_disposition(header);
+        assert_eq!(dis.disposition, DispositionType::Attachment);
+        assert_eq!(dis.params.get("filename"), Some(&"=?ISO-8859-1?Q?foo-=E4.html?=".to_string()));
+    }
+
+    #[test]
+    fn test_rfc2047_utf8_qencoded_not_decoded() {
+        // Extra paranoia case: =?UTF-8?Q?...?= in a properly quoted filename.
+        // If some future change adds RFC 2047 decoding, this catches it.
+        let header = r#"attachment; filename="=?UTF-8?Q?caf=C3=A9.txt?=""#;
+        let dis = parse_content_disposition(header);
+        assert_eq!(dis.params.get("filename"), Some(&"=?UTF-8?Q?caf=C3=A9.txt?=".to_string()));
+        // And specifically NOT the decoded form:
+        assert_ne!(dis.params.get("filename"), Some(&"café.txt".to_string()));
+    }
+
+    #[test]
+    fn test_rfc2047_base64_not_decoded() {
+        // =?CHARSET?B?base64?= form — also must not be decoded.
+        // "Zm9vLmh0bWw=" is base64 for "foo.html".
+        let header = r#"attachment; filename="=?UTF-8?B?Zm9vLmh0bWw=?=""#;
+        let dis = parse_content_disposition(header);
+        assert_eq!(dis.params.get("filename"), Some(&"=?UTF-8?B?Zm9vLmh0bWw=?=".to_string()));
+        assert_ne!(dis.params.get("filename"), Some(&"foo.html".to_string()));
     }
 }
