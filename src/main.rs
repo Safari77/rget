@@ -1955,7 +1955,6 @@ fn stat_file_via_cache(
 
     match dir.symlink_metadata(filename) {
         Ok(metadata) => {
-            // FIX: Convert cap_std::time::SystemTime to std::time::SystemTime
             let modified = metadata.modified().ok().map(|t| t.into_std());
             Ok(Some(FileInfo { size: metadata.len(), modified }))
         }
@@ -2079,7 +2078,6 @@ fn open_file_securely(
 
             #[cfg(unix)]
             {
-                // FIX: Use cap-std's MetadataExt, not std's
                 use cap_std::fs::MetadataExt;
                 if let Some(device_type) = is_block_or_char_device(_metadata.mode()) {
                     return if device_type == "block" {
