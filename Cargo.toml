@@ -49,7 +49,8 @@ libc = "0.2"
 shake = "0.1"
 # For base32 encoding of temp filenames
 data-encoding = "2"
-
+percent-encoding = "2"
+httpdate = "1"
 dirs = "6"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

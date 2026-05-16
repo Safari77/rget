@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 Sami Farin
+// Copyright 2026 Sami Farin
 //
 // Based on 62330e3d606cbe32219300422f5922f55bedb3a2 commit
 // from https://github.com/y0zong/content-disposition

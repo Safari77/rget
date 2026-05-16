@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// Copyright 2025 Sami Farin
+// Copyright 2026 Sami Farin
 
 //! Secure file downloader with wget-like functionality.
 //!
@@ -154,8 +154,10 @@ pub enum PermanentError {
     JsonHashMissing(String),
     JsonHashMismatch { file: String, expected: String, actual: String },
     JsonHashUnsupportedAlgo(String),
+    JsonHashInvalidFormat { url: String, digest: String },
     JsonVerifyHashWithoutHashField,
     JsonUrlFieldRequired,
+    JsonDownloadsFailed { failed: usize, total: usize },
 }
 
 impl std::fmt::Display for PermanentError {
@@ -222,7 +224,7 @@ impl std::fmt::Display for PermanentError {
             Self::RedirectOnGet { status, location } => {
                 write!(
                     f,
-                    "Server returned redirect on GET ({}). This may indicate HEAD/GET inconsistency. Redirect target: {}",
+                    "Server returned redirect on GET ({}) with manual-redirects disabled. Redirect target: {}",
                     status, location
                 )
             }
@@ -348,6 +350,16 @@ impl std::fmt::Display for PermanentError {
             Self::JsonUrlFieldRequired => {
                 write!(f, "--json-parse requires --json-url-field")
             }
+            Self::JsonHashInvalidFormat { url, digest } => {
+                write!(f, "--json-verify-hash: unparseable digest field {:?} for {}", digest, url)
+            }
+            Self::JsonDownloadsFailed { failed, total } => {
+                write!(
+                    f,
+                    "JSON download mode: {} of {} downloads failed (per-entry retries already exhausted)",
+                    failed, total
+                )
+            }
         }
     }
 }
@@ -374,6 +386,30 @@ const RESUME_KEY_FILENAME: &str = "resumekey.conf";
 /// Check if io::Error is ENAMETOOLONG or equivalent
 fn is_name_too_long(err: &std::io::Error) -> bool {
     err.kind() == std::io::ErrorKind::InvalidFilename
+}
+
+/// Check if a sync_all() error can be safely ignored.
+/// This handles filesystems / targets that don't support fsync:
+/// - Unix: EINVAL and ENOTSUP (e.g. /dev/null, some pseudo-fs)
+/// - Windows: ERROR_INVALID_FUNCTION (1) and ERROR_NOT_SUPPORTED (50)
+fn is_sync_ignorable(e: &std::io::Error) -> bool {
+    let Some(code) = e.raw_os_error() else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        code == libc::EINVAL || code == libc::ENOTSUP
+    }
+    #[cfg(windows)]
+    {
+        // ERROR_INVALID_FUNCTION = 1, ERROR_NOT_SUPPORTED = 50
+        code == 1 || code == 50
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = code;
+        false
+    }
 }
 
 /// HSTS database filename
@@ -485,8 +521,13 @@ struct Args {
     #[arg(long = "no-private-ips", help = "Block private/localhost IPs")]
     no_private_ips: bool,
 
-    /// Timeout in seconds if no data is received (default: 300)
-    #[arg(long = "timeout", default_value_t = 300, help = "Timeout in seconds (no data received)")]
+    /// Timeout in seconds if no data is received (default: 300, must be >= 1)
+    #[arg(
+        long = "timeout",
+        default_value_t = 300,
+        value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(1..),
+        help = "Timeout in seconds (no data received, must be >= 1)"
+    )]
     timeout: u64,
 
     /// Number of retries on connection failure or timeout (default: 1, 0 = infinite)
@@ -708,9 +749,11 @@ fn check_hsts(map: &HstsMap, host: &str) -> bool {
         return true;
     }
 
-    // Check superdomains if they have includeSubDomains set
+    // Check superdomains if they have includeSubDomains set.
+    // Walk down stripping the leftmost label, but stop before the TLD
+    // (a 1-label "superdomain" is the TLD; no HSTS pinning happens there).
     let mut parts: Vec<&str> = host.split('.').collect();
-    while parts.len() > 1 {
+    while parts.len() > 2 {
         parts.remove(0); // Remove subdomain
         let superdomain = parts.join(".");
         if let Some(entry) = map.get(&superdomain)
@@ -735,8 +778,9 @@ fn update_hsts(map: &mut HstsMap, url: &Url, headers: &HeaderMap, debug: bool) {
             let part = part.trim();
             if part.eq_ignore_ascii_case("includeSubDomains") {
                 include_subdomains = true;
-            } else if let Some(age_str) = part.to_lowercase().strip_prefix("max-age=")
-                && let Ok(age) = age_str.trim().parse::<u64>()
+            } else if let Some((key, val)) = part.split_once('=')
+                && key.trim().eq_ignore_ascii_case("max-age")
+                && let Ok(age) = val.trim().parse::<u64>()
             {
                 max_age = Some(age);
             }
@@ -1004,7 +1048,8 @@ async fn resolve_final_url_and_client(
             response = get_request.send().await.context("Failed to send GET request")?;
         }
 
-        if !args.no_hsts_update {
+        if !args.no_hsts_update && current_url.scheme() == "https" {
+            // RFC 6797 §8.1: STS headers received over insecure (http) transport MUST be ignored.
             update_hsts(hsts_db, &current_url, response.headers(), args.debug);
         }
 
@@ -1209,6 +1254,11 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
             let mut attempt = 0;
             loop {
                 let current_args = args.clone();
+                // Snapshot the filename cache before the attempt — process_json_downloads
+                // mutates it as individual downloads succeed. Without this snapshot, a
+                // retry of the whole JSON flow would see successful entries' filenames
+                // as "used" and (with --multiple-copies) write numbered duplicates.
+                let mut attempt_used_filenames = used_filenames.clone();
 
                 let result = async {
                     match resolve_final_url_and_client(
@@ -1236,7 +1286,7 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                                 &current_args,
                                 &mut client_cache,
                                 hsts_db,
-                                &mut used_filenames,
+                                &mut attempt_used_filenames,
                                 &mut dir_cache,
                                 &tls_config,
                             )
@@ -1248,7 +1298,11 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                 .await;
 
                 match result {
-                    Ok(()) => break,
+                    Ok(()) => {
+                        // Commit the cache only on full success
+                        used_filenames = attempt_used_filenames;
+                        break;
+                    }
                     Err(e) => {
                         if is_permanent_error(&e) {
                             eprintln!("Failed: {:#}", e);
@@ -1264,10 +1318,10 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                             "Error: {}. Retrying (attempt {}/{})...",
                             e,
                             attempt + 1,
-                            if args.retries == 0 {
+                            if current_args.retries == 0 {
                                 "\u{221e}".to_string()
                             } else {
-                                args.retries.to_string()
+                                current_args.retries.to_string()
                             }
                         );
                         attempt += 1;
@@ -1357,10 +1411,10 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                         "Error: {}. Retrying (attempt {}/{})...",
                         e,
                         attempt + 1,
-                        if args.retries == 0 {
+                        if current_args.retries == 0 {
                             "\u{221e}".to_string()
                         } else {
-                            args.retries.to_string()
+                            current_args.retries.to_string()
                         }
                     );
                     attempt += 1;
@@ -1597,48 +1651,12 @@ fn parse_content_disposition_header(header_value: &str) -> Option<String> {
     None
 }
 
-// This takes a string slice and returns a STRING.
-// It handles the hex decoding and the UTF-8 conversion internally.
+// Percent-decode a string. Wraps the percent_encoding crate (already a transitive
+// dep via the url crate). Returns a String for caller convenience.
+// Lossy UTF-8 conversion is used so invalid byte sequences become U+FFFD instead
+// of erroring — matches the prior behavior.
 fn percent_decode_str(input: &str) -> String {
-    let mut res = Vec::new();
-    let mut bytes = input.bytes();
-
-    while let Some(b) = bytes.next() {
-        if b == b'%' {
-            // Try to read the next two bytes without inventing zeros
-            let h1 = bytes.next();
-            let h2 = bytes.next();
-
-            match (h1, h2) {
-                (Some(v1), Some(v2)) => {
-                    // We have two bytes, try to decode them as hex
-                    let hex_str = format!("{}{}", v1 as char, v2 as char);
-                    if let Ok(byte) = u8::from_str_radix(&hex_str, 16) {
-                        res.push(byte);
-                    } else {
-                        // Not valid hex, push raw sequence
-                        res.push(b);
-                        res.push(v1);
-                        res.push(v2);
-                    }
-                }
-                (Some(v1), None) => {
-                    // String ended after %X (incomplete sequence)
-                    res.push(b);
-                    res.push(v1);
-                }
-                (None, None) => {
-                    // String ended after %
-                    res.push(b);
-                }
-                _ => unreachable!(), // Iterator can't go from None back to Some
-            }
-        } else {
-            res.push(b);
-        }
-    }
-
-    String::from_utf8_lossy(&res).to_string()
+    percent_encoding::percent_decode(input.as_bytes()).decode_utf8_lossy().into_owned()
 }
 
 fn sanitize_filename(filename: &str) -> String {
@@ -2010,7 +2028,9 @@ fn check_path_before_open(path: &Path, cache: &mut DirCache) -> Result<bool> {
             Ok(true) // File exists and is safe
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(_) => Ok(false),
+        // Propagate other errors (permission denied, EIO, etc.) instead of pretending the file
+        // doesn't exist — masking them led to confusing downstream "already exists" diagnostics.
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -2026,13 +2046,19 @@ fn normalize_path_lexically(path: &Path) -> PathBuf {
             }
             Component::CurDir => {} // Ignore `.`
             Component::ParentDir => {
-                // Pop the last component if it's a normal directory, otherwise push `..`
-                // This handles edge cases where the path starts with `..`
-                let can_pop = matches!(normalized.components().last(), Some(Component::Normal(_)));
-                if can_pop {
-                    normalized.pop();
-                } else {
-                    normalized.push(component);
+                // Pop the last component if it's a normal directory.
+                // After a RootDir, drop the `..` entirely — can't go above filesystem root.
+                // For paths starting with `..` (no anchor), preserve the `..`.
+                match normalized.components().last() {
+                    Some(Component::Normal(_)) => {
+                        normalized.pop();
+                    }
+                    Some(Component::RootDir) => {
+                        // No-op: "/.." resolves to "/"
+                    }
+                    _ => {
+                        normalized.push(component);
+                    }
                 }
             }
         }
@@ -2335,95 +2361,18 @@ fn is_permanent_error(err: &anyhow::Error) -> bool {
     false
 }
 
-/// Parse an HTTP-date string (RFC 1123 / RFC 850 / asctime) into a SystemTime.
-/// Only RFC 1123 format is fully supported: "Sun, 06 Nov 1994 08:49:37 GMT"
+/// Parse an HTTP-date string into a SystemTime.
+/// Supports the three formats listed in RFC 9110 §5.6.7:
+/// - IMF-fixdate (RFC 1123): "Sun, 06 Nov 1994 08:49:37 GMT"
+/// - RFC 850: "Sunday, 06-Nov-94 08:49:37 GMT"
+/// - asctime(): "Sun Nov  6 08:49:37 1994"
 fn parse_http_date(s: &str) -> Option<SystemTime> {
-    let s = s.trim();
-    // RFC 1123: "Sun, 06 Nov 1994 08:49:37 GMT"
-    let parts: Vec<&str> = s.split_whitespace().collect();
-    if parts.len() != 6 || parts[5] != "GMT" {
-        return None;
-    }
-    let day: u64 = parts[1].parse().ok()?;
-    let month: u64 = match parts[2] {
-        "Jan" => 1,
-        "Feb" => 2,
-        "Mar" => 3,
-        "Apr" => 4,
-        "May" => 5,
-        "Jun" => 6,
-        "Jul" => 7,
-        "Aug" => 8,
-        "Sep" => 9,
-        "Oct" => 10,
-        "Nov" => 11,
-        "Dec" => 12,
-        _ => return None,
-    };
-    let year: u64 = parts[3].parse().ok()?;
-    if year < 1970 || !(1..=31).contains(&day) {
-        return None;
-    }
-    let time_parts: Vec<&str> = parts[4].split(':').collect();
-    if time_parts.len() != 3 {
-        return None;
-    }
-    let hour: u64 = time_parts[0].parse().ok()?;
-    let min: u64 = time_parts[1].parse().ok()?;
-    let sec: u64 = time_parts[2].parse().ok()?;
-    if hour > 23 || min > 59 || sec > 60 {
-        return None;
-    }
-
-    // Convert to days since Unix epoch using the civil date algorithm
-    // Based on Howard Hinnant's chrono-compatible algorithm
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = y / 400;
-    let yoe = y - era * 400;
-    let m_adj = if month > 2 { month - 3 } else { month + 9 };
-    let doy = (153 * m_adj + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days_since_epoch = era * 146097 + doe;
-    // Unix epoch is day 719468 in this calendar
-    let unix_days = days_since_epoch.checked_sub(719468)?;
-    let total_secs = unix_days * 86400 + hour * 3600 + min * 60 + sec;
-
-    Some(UNIX_EPOCH + Duration::from_secs(total_secs))
+    httpdate::parse_http_date(s.trim()).ok()
 }
 
 /// Format a SystemTime as an HTTP-date string (RFC 1123).
 fn format_http_date(time: SystemTime) -> Option<String> {
-    let dur = time.duration_since(UNIX_EPOCH).ok()?;
-    let secs = dur.as_secs();
-
-    let sec = secs % 60;
-    let min = (secs / 60) % 60;
-    let hour = (secs / 3600) % 24;
-    let total_days = secs / 86400;
-
-    // Day of week: Jan 1 1970 was a Thursday (4)
-    let weekday = ((total_days + 4) % 7) as usize;
-    let weekdays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-
-    // Convert days since epoch to civil date (Howard Hinnant's algorithm)
-    let z = total_days + 719468;
-    let era = z / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if month <= 2 { y + 1 } else { y };
-
-    let months =
-        ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-
-    Some(format!(
-        "{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT",
-        weekdays[weekday], day, months[month as usize], year, hour, min, sec
-    ))
+    Some(httpdate::fmt_http_date(time))
 }
 
 /// Apply server timestamp (Last-Modified) to a local file.
@@ -2730,22 +2679,30 @@ fn parse_jq_path(path: &str) -> Result<Vec<JqSegment>> {
 }
 
 /// Recursively collect string values matching the segment path.
+///
+/// Missing fields and JSON nulls produce an empty-string sentinel rather than being
+/// silently skipped. This is required so that parallel extractions of different
+/// fields from the same array (e.g. `.assets[].url`, `.assets[].digest`,
+/// `.assets[].name`) stay positionally aligned — otherwise a hash extracted from
+/// one entry could be verified against the bytes of another entry, which is a
+/// security issue with `--json-verify-hash`.
 fn collect_values(value: &serde_json::Value, segments: &[JqSegment], results: &mut Vec<String>) {
     if segments.is_empty() {
         match value {
             serde_json::Value::String(s) => results.push(s.clone()),
-            serde_json::Value::Null => {} // skip nulls
+            // Null → sentinel, preserving alignment.
+            serde_json::Value::Null => results.push(String::new()),
             other => results.push(other.to_string()),
         }
         return;
     }
 
     match &segments[0] {
-        JqSegment::Field(name) => {
-            if let Some(child) = value.get(name.as_str()) {
-                collect_values(child, &segments[1..], results);
-            }
-        }
+        JqSegment::Field(name) => match value.get(name.as_str()) {
+            Some(child) => collect_values(child, &segments[1..], results),
+            // Missing field → sentinel, preserving alignment.
+            None => results.push(String::new()),
+        },
         JqSegment::ArrayIter => {
             if let serde_json::Value::Array(arr) = value {
                 for item in arr {
@@ -2754,10 +2711,11 @@ fn collect_values(value: &serde_json::Value, segments: &[JqSegment], results: &m
             }
         }
         JqSegment::ArrayIndex(idx) => {
-            if let serde_json::Value::Array(arr) = value
-                && let Some(item) = arr.get(*idx)
-            {
-                collect_values(item, &segments[1..], results);
+            if let serde_json::Value::Array(arr) = value {
+                match arr.get(*idx) {
+                    Some(item) => collect_values(item, &segments[1..], results),
+                    None => results.push(String::new()),
+                }
             }
         }
     }
@@ -3011,6 +2969,18 @@ async fn process_json_downloads(
         }
     }
 
+    // 7b. Drop entries whose URL is the empty-string sentinel produced when a
+    // .url field is null or missing in the JSON. The parallel fields (hash/name)
+    // are still aligned within each JsonDownloadEntry, so dropping by entry is safe.
+    let before_sentinel_drop = entries.len();
+    entries.retain(|e| !e.url.is_empty());
+    if args.debug && entries.len() != before_sentinel_drop {
+        eprintln!(
+            "[DEBUG] Dropped {} entries with null/missing URL",
+            before_sentinel_drop - entries.len()
+        );
+    }
+
     if entries.is_empty() {
         return Err(PermanentError::JsonNoUrlsExtracted.into());
     }
@@ -3027,16 +2997,20 @@ async fn process_json_downloads(
         }
     }
 
-    // 9. Download each entry
+    // 9. Download each entry. Per-entry retries are bounded internally; the outer
+    // retry around process_json_downloads must NOT retry these (it would re-fetch
+    // JSON and duplicate already-successful downloads), so any failure here is
+    // wrapped in PermanentError::JsonDownloadsFailed before returning.
     let max_retries = if args.retries == 0 { u64::MAX } else { args.retries };
-    let mut overall_success = true;
+    let total = entries.len();
+    let mut failed_count: usize = 0;
 
     for entry in &entries {
         let url = match Url::parse(&entry.url) {
             Ok(u) => u,
             Err(e) => {
                 eprintln!("Error parsing URL '{}': {}", entry.url, e);
-                overall_success = false;
+                failed_count += 1;
                 continue;
             }
         };
@@ -3051,38 +3025,50 @@ async fn process_json_downloads(
         let mut entry_args = args.clone();
         entry_args.json_parse = false;
         if let Some(ref name) = entry.name {
-            entry_args.output = Some(name.clone());
+            // An empty name sentinel (null/missing in JSON) should not become the output filename
+            if !name.is_empty() {
+                entry_args.output = Some(name.clone());
+            }
         }
 
-        let mut attempt = 0;
-
-        // Pre-parse and validate digest before download attempt
+        // Pre-parse and validate digest before download attempt.
+        // When --json-verify-hash is set, missing/empty/unparseable digests are HARD failures
+        // (silently downloading without verification would defeat the flag's purpose).
         let parsed_sha256: Option<String> = if args.json_verify_hash {
-            if let Some(ref digest_str) = entry.hash {
+            let digest_opt = entry.hash.as_deref().filter(|s| !s.is_empty());
+            if let Some(digest_str) = digest_opt {
                 if let Some((algo, hex_hash)) = parse_digest_field(digest_str) {
                     if algo != "sha256" {
                         eprintln!(
                             "Failed: {}",
                             PermanentError::JsonHashUnsupportedAlgo(algo.to_string())
                         );
-                        overall_success = false;
+                        failed_count += 1;
                         continue;
                     }
                     Some(hex_hash.to_lowercase())
                 } else {
-                    eprintln!("Warning: Could not parse digest field: {:?}", digest_str);
-                    None
+                    eprintln!(
+                        "Failed: {}",
+                        PermanentError::JsonHashInvalidFormat {
+                            url: entry.url.clone(),
+                            digest: digest_str.to_string(),
+                        }
+                    );
+                    failed_count += 1;
+                    continue;
                 }
             } else {
-                eprintln!("{}", PermanentError::JsonHashMissing(entry.url.clone()));
-                overall_success = false;
+                eprintln!("Failed: {}", PermanentError::JsonHashMissing(entry.url.clone()));
+                failed_count += 1;
                 continue;
             }
         } else {
             None
         };
 
-        loop {
+        let mut attempt: u64 = 0;
+        let entry_failed = loop {
             let mut current_args = entry_args.clone();
             if attempt > 0 {
                 current_args.resume = true;
@@ -3140,29 +3126,27 @@ async fn process_json_downloads(
 
             match result {
                 Ok(()) => {
-                    // 3. Commit the cache
+                    // Commit the cache
                     *used_filenames = attempt_used_filenames;
-                    break;
+                    break false;
                 }
                 Err(e) => {
                     if is_permanent_error(&e) {
                         eprintln!("Failed to download {}: {:#}", url, e);
-                        overall_success = false;
-                        break;
+                        break true;
                     }
                     if attempt >= max_retries {
                         eprintln!("Failed to download {}: {:#}", url, e);
-                        overall_success = false;
-                        break;
+                        break true;
                     }
                     eprintln!(
                         "Error: {}. Retrying (attempt {}/{})...",
                         e,
                         attempt + 1,
-                        if args.retries == 0 {
+                        if current_args.retries == 0 {
                             "\u{221e}".to_string()
                         } else {
-                            args.retries.to_string()
+                            current_args.retries.to_string()
                         }
                     );
                     attempt += 1;
@@ -3170,10 +3154,17 @@ async fn process_json_downloads(
                     sleep(Duration::from_secs(delay)).await;
                 }
             }
+        };
+        if entry_failed {
+            failed_count += 1;
         }
     }
 
-    if overall_success { Ok(()) } else { bail!("One or more JSON downloads failed") }
+    if failed_count == 0 {
+        Ok(())
+    } else {
+        Err(PermanentError::JsonDownloadsFailed { failed: failed_count, total }.into())
+    }
 }
 
 async fn download_file(
@@ -3792,8 +3783,7 @@ async fn download_to_temp(
 
     match async_file.sync_all().await {
         Ok(_) => {}
-        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {}
-        Err(e) if e.raw_os_error() == Some(libc::ENOTSUP) => {}
+        Err(e) if is_sync_ignorable(&e) => {}
         Err(e) => return Err(e.into()),
     };
 
@@ -3907,8 +3897,7 @@ async fn download_direct(
     .await?;
     match file.sync_all().await {
         Ok(_) => {}
-        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {}
-        Err(e) if e.raw_os_error() == Some(libc::ENOTSUP) => {}
+        Err(e) if is_sync_ignorable(&e) => {}
         Err(e) => return Err(e.into()),
     };
 
@@ -4185,3 +4174,5 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_json_alignment;
