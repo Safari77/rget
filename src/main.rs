@@ -66,7 +66,7 @@ use reqwest::{Client, Identity, Response, StatusCode};
 use rustls::ClientConfig;
 use rustls_platform_verifier::BuilderVerifierExt;
 use sha2::{Digest as Sha2Digest, Sha256};
-use sha3::{
+use shake::{
     Shake256,
     digest::{ExtendableOutput, Update, XofReader},
 };
