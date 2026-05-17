@@ -39,8 +39,7 @@ static GLOBAL: Jemalloc = Jemalloc;
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::IsTerminal;
-use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Read};
+use std::io::{BufRead, BufReader, BufWriter, ErrorKind, IsTerminal, Read, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
@@ -415,6 +414,11 @@ fn is_sync_ignorable(e: &std::io::Error) -> bool {
 /// HSTS database filename
 const HSTS_DB_FILENAME: &str = "hsts.json";
 
+/// Maximum number of HSTS entries retained in memory and persisted to disk.
+/// When an update would push the cache above this cap, the entries with the
+/// soonest expiry are evicted first (curl uses a comparable fixed cap).
+const MAX_HSTS_ENTRIES: usize = 5000;
+
 const VERSION_MESSAGE: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "\nLicense: ",
@@ -726,21 +730,51 @@ fn save_hsts_db(path: &Path, map: &HstsMap) {
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
 
-    match File::create(path) {
-        Ok(file) => {
-            let writer = BufWriter::new(file);
-            if let Err(e) = serde_json::to_writer_pretty(writer, &valid_entries) {
-                eprintln!("Failed to serialize HSTS DB to '{}': {}", path.display(), e);
-            }
-        }
+    // Atomic write via the tempfile crate.
+    let parent = safe_parent(path);
+    let mut tmp = match tempfile::Builder::new().prefix(".hsts-").suffix(".tmp").tempfile_in(parent)
+    {
+        Ok(t) => t,
         Err(e) => {
-            eprintln!("Failed to write HSTS DB to '{}': {}", path.display(), e);
+            eprintln!("Failed to create temp file for HSTS DB in '{}': {}", parent.display(), e);
+            return;
         }
+    };
+    let tmp_path_display = tmp.path().display().to_string();
+
+    {
+        let mut writer = BufWriter::new(tmp.as_file_mut());
+        if let Err(e) = serde_json::to_writer_pretty(&mut writer, &valid_entries) {
+            eprintln!("Failed to serialize HSTS DB to '{}': {}", tmp_path_display, e);
+            return;
+        }
+        if let Err(e) = writer.flush() {
+            eprintln!("Failed to flush HSTS DB to '{}': {}", tmp_path_display, e);
+            return;
+        }
+    }
+
+    // Atomically rename the temp file over the target.
+    if let Err(e) = tmp.persist(path) {
+        eprintln!("Failed to atomically replace HSTS DB '{}': {}", path.display(), e);
     }
 }
 
 fn check_hsts(map: &HstsMap, host: &str) -> bool {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+
+    // RFC 6797 §8.3 / §8.1.1: IP-literal hosts are never Known HSTS Hosts and
+    // cannot trigger an upgrade.
+    let bare = host.strip_prefix('[').and_then(|s| s.strip_suffix(']')).unwrap_or(host);
+    if bare.parse::<IpAddr>().is_ok() {
+        return false;
+    }
+
+    // Normalize trailing dot ('example.com.' is the same FQDN as 'example.com').
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.is_empty() {
+        return false;
+    }
 
     // Check exact match
     if let Some(entry) = map.get(host)
@@ -768,38 +802,137 @@ fn check_hsts(map: &HstsMap, host: &str) -> bool {
 }
 
 fn update_hsts(map: &mut HstsMap, url: &Url, headers: &HeaderMap, debug: bool) {
-    if let Some(hsts_val) = headers.get(STRICT_TRANSPORT_SECURITY)
-        && let Ok(hsts_str) = hsts_val.to_str()
-    {
-        let mut max_age = None;
-        let mut include_subdomains = false;
+    // HeaderMap::get returns the first value for repeated header names, which
+    // already satisfies RFC 6797 §8.1: "process only the first such header field".
+    let Some(hsts_val) = headers.get(STRICT_TRANSPORT_SECURITY) else {
+        return;
+    };
+    let Ok(hsts_str) = hsts_val.to_str() else {
+        return;
+    };
 
-        for part in hsts_str.split(';') {
-            let part = part.trim();
-            if part.eq_ignore_ascii_case("includeSubDomains") {
-                include_subdomains = true;
-            } else if let Some((key, val)) = part.split_once('=')
-                && key.trim().eq_ignore_ascii_case("max-age")
-                && let Ok(age) = val.trim().parse::<u64>()
-            {
-                max_age = Some(age);
+    // RFC 6797 §8.1.1: an IP-literal authority MUST NOT be noted as an HSTS host.
+    // Url::host() returns a typed enum, distinguishing Domain from Ipv4/Ipv6 cleanly.
+    let host_raw = match url.host() {
+        Some(url::Host::Domain(d)) => d,
+        Some(_) => {
+            if debug {
+                eprintln!("[DEBUG] HSTS: ignoring STS header for IP-literal host");
             }
+            return;
+        }
+        None => return,
+    };
+
+    // Strip a trailing dot so 'example.com.' and 'example.com' resolve to one entry.
+    let host = host_raw.strip_suffix('.').unwrap_or(host_raw);
+    if host.is_empty() {
+        return;
+    }
+
+    // RFC 6797 §6.1 rule 2: each directive MUST appear only once.
+    // RFC 6797 §6.1 rule 4: a header that does not conform to the syntax
+    // MUST be ignored in its entirety. Track duplicates and bail on a violation.
+    let mut max_age: Option<u64> = None;
+    let mut include_subdomains = false;
+    let mut seen_max_age = false;
+    let mut seen_isd = false;
+
+    for part in hsts_str.split(';') {
+        let part = part.trim();
+        if part.is_empty() {
+            // An empty fragment between two ';'s is permitted by the ABNF
+            // [ directive ] *( ";" [ directive ] ); skip it.
+            continue;
         }
 
-        if let Some(age) = max_age {
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-            let expiry = now + age;
-            if let Some(host) = url.host_str() {
-                map.insert(host.to_string(), HstsEntry { expiry, include_subdomains });
-
+        if part.eq_ignore_ascii_case("includeSubDomains") {
+            if seen_isd {
                 if debug {
-                    eprintln!(
-                        "[DEBUG] HSTS: Added/Updated entry for '{}' (max-age={}, includeSubDomains={})",
-                        host, age, include_subdomains
-                    );
+                    eprintln!("[DEBUG] HSTS: duplicate includeSubDomains, ignoring header");
+                }
+                return;
+            }
+            seen_isd = true;
+            include_subdomains = true;
+        } else if let Some((key, val)) = part.split_once('=') {
+            let key = key.trim();
+            if key.eq_ignore_ascii_case("max-age") {
+                if seen_max_age {
+                    if debug {
+                        eprintln!("[DEBUG] HSTS: duplicate max-age, ignoring header");
+                    }
+                    return;
+                }
+                seen_max_age = true;
+                // RFC 6797 §6.1 grammar: directive-value = token | quoted-string.
+                // Strip one surrounding pair of double quotes if present.
+                let mut v = val.trim();
+                if v.len() >= 2 && v.starts_with('"') && v.ends_with('"') {
+                    v = &v[1..v.len() - 1];
+                }
+                match v.parse::<u64>() {
+                    Ok(age) => max_age = Some(age),
+                    Err(_) => {
+                        if debug {
+                            eprintln!("[DEBUG] HSTS: malformed max-age '{}', ignoring header", val);
+                        }
+                        return;
+                    }
                 }
             }
+            // Unknown directive with a value: RFC §6.1 rule 5 says ignore
+            // unrecognized directives but still process the recognized ones.
+        } else {
+            // Unknown valueless directive: ignore (RFC §6.1 rule 5).
         }
+    }
+
+    // max-age is REQUIRED (RFC §6.1.1). Its absence makes the header malformed.
+    let Some(age) = max_age else {
+        if debug {
+            eprintln!("[DEBUG] HSTS: max-age missing, ignoring header");
+        }
+        return;
+    };
+
+    // RFC 6797 §8.1: max-age=0 means delete the cached policy (or do not
+    // store one if it was not already present). The includeSubDomains
+    // directive is explicitly ignored in this case (RFC §6.1.1 NOTE).
+    if age == 0 {
+        if map.remove(host).is_some() && debug {
+            eprintln!("[DEBUG] HSTS: removed entry for '{}' (max-age=0)", host);
+        }
+        return;
+    }
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let expiry = now.saturating_add(age);
+
+    map.insert(host.to_string(), HstsEntry { expiry, include_subdomains });
+
+    // Cap the cache so a hostile actor controlling many subdomains cannot grow
+    // it without bound. When over the cap, evict the entries with the soonest
+    // expiry, but never evict the entry we just stored (otherwise a server with
+    // a small max-age could be silently dropped on every visit).
+    if map.len() > MAX_HSTS_ENTRIES {
+        let excess = map.len() - MAX_HSTS_ENTRIES;
+        let mut by_expiry: Vec<(String, u64)> = map
+            .iter()
+            .filter(|(k, _)| k.as_str() != host)
+            .map(|(k, v)| (k.clone(), v.expiry))
+            .collect();
+        by_expiry.sort_by_key(|(_, e)| *e);
+        for (k, _) in by_expiry.into_iter().take(excess) {
+            map.remove(&k);
+        }
+    }
+
+    if debug {
+        eprintln!(
+            "[DEBUG] HSTS: Added/Updated entry for '{}' (max-age={}, includeSubDomains={})",
+            host, age, include_subdomains
+        );
     }
 }
 
@@ -980,6 +1113,17 @@ async fn resolve_final_url_and_client(
     hsts_db: &mut HstsMap,
     tls_config: &Option<ClientConfig>,
 ) -> Result<(Client, Url, Option<u64>, Option<String>, Option<String>)> {
+    // CLI policy: validate the URL the user actually supplied BEFORE any HSTS
+    // rewriting. Without this, 'http://example.com' would silently succeed
+    // whenever 'example.com' happens to be in the HSTS DB (the in-loop upgrade
+    // rewrites it to https:// before validate_url sees it) but fail otherwise --
+    // behaviour that depends on persistent state the user is not necessarily
+    // aware of. We require a user-supplied 'http://' URL to be paired with
+    // --insecure regardless of HSTS state. HSTS upgrade still applies to
+    // redirect targets returned by the server (handled inside the loop below),
+    // which preserves HSTS's anti-TLS-stripping purpose on redirect chains.
+    validate_url(&initial_url, args.insecure)?;
+
     let mut current_url = initial_url;
     let mut redirect_count = 0;
 
@@ -991,6 +1135,13 @@ async fn resolve_final_url_and_client(
         {
             if args.verbose {
                 eprintln!("HSTS: Upgrading insecure request to {}", host);
+            }
+            // RFC 6797 §8.3: when upgrading to https, an explicit port of 80
+            // MUST be converted to 443; any other explicit port is preserved;
+            // and if no explicit port is present, none is added. url::Url's
+            // set_scheme does not touch the port for us, so do it here.
+            if current_url.port() == Some(80) {
+                let _ = current_url.set_port(Some(443));
             }
             let _ = current_url.set_scheme("https");
         }
@@ -4174,5 +4325,7 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_hsts;
 #[cfg(test)]
 mod tests_json_alignment;
