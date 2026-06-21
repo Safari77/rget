@@ -160,17 +160,25 @@ fn parse_param_content(content: &str) -> ParamContent {
     let encodings = compute_parameter_encodings(&map, &decode_key_list);
 
     for (k, (e, strip)) in encodings {
-        if let Some(charset) = Charset::for_label_no_replacement(e.as_bytes()) {
-            let key = format!("{}*", k);
-            let percent_encoded_value = map.remove(&key).unwrap();
+        let key = format!("{}*", k);
+        // Ensure we remove the extended key whether the charset is recognized or not
+        if let Some(percent_encoded_value) = map.remove(&key) {
             let encoded_value = if strip {
                 percent_decode(percent_encoded_value.splitn(3, '\'').nth(2).unwrap_or(""))
             } else {
                 percent_decode(&percent_encoded_value)
             };
-            let decoded_value = charset.decode_without_bom_handling(&encoded_value).0;
-            // This insert will now correctly overwrite existing keys
-            map.insert(k, decoded_value.to_string());
+
+            let decoded_value =
+                if let Some(charset) = Charset::for_label_no_replacement(e.as_bytes()) {
+                    charset.decode_without_bom_handling(&encoded_value).0.into_owned()
+                } else {
+                    // Fallback: Default to UTF-8 lossy decoding for unrecognized/missing charsets
+                    String::from_utf8_lossy(&encoded_value).into_owned()
+                };
+
+            // This insert will now correctly overwrite existing keys (e.g., 'filename')
+            map.insert(k, decoded_value);
         }
     }
 
@@ -852,11 +860,21 @@ mod tests {
     #[test]
     fn test_tc2231_attwithfn2231noc() {
         // attachment; filename*=''foo-%c3%a4-%e2%82%ac.html
-        // No charset between the single quotes -> can't decode.
-        // Expected: plain `filename` not produced (only the raw filename* key remains).
+        // No charset between the single quotes.
+        // Expected: Previously failed/ignored, now successfully falls back to UTF-8 decoding.
         let header = "attachment; filename*=''foo-%c3%a4-%e2%82%ac.html";
         let dis = parse_content_disposition(header);
-        assert_eq!(dis.params.get("filename"), None);
+        assert_eq!(dis.params.get("filename"), Some(&"foo-ä-€.html".to_string()));
+    }
+
+    #[test]
+    fn test_rfc5987_iso8859_15() {
+        // ISO-8859-15 encoding (Latin-9)
+        // 'é' is 0xE9.
+        // The Euro sign '€' is 0xA4 (which uniquely distinguishes it from ISO-8859-1, where 0xA4 is '¤').
+        let header = "attachment; filename*=ISO-8859-15''caf%E9_%A4.txt";
+        let dis = parse_content_disposition(header);
+        assert_eq!(dis.params.get("filename"), Some(&"café_€.txt".to_string()));
     }
 
     #[test]

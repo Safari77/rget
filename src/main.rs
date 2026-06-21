@@ -1,3 +1,4 @@
+#![allow(clippy::too_many_arguments)]
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright 2026 Sami Farin
 
@@ -1156,7 +1157,10 @@ async fn resolve_final_url_and_client(
         }
 
         let client = if !args.no_proxy
-            && (std::env::var("HTTP_PROXY").is_ok() || std::env::var("HTTPS_PROXY").is_ok())
+            && (std::env::var("HTTP_PROXY").is_ok()
+                || std::env::var("HTTPS_PROXY").is_ok()
+                || std::env::var("http_proxy").is_ok()
+                || std::env::var("https_proxy").is_ok())
         {
             build_client(args, None, tls_config)?
         } else {
@@ -1306,6 +1310,17 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
         return Err(PermanentError::KeepExtensionWithoutMultipleCopies.into());
     }
 
+    // Validate --filemode
+    if let Some(ref mode_str) = args.filemode
+        && u32::from_str_radix(mode_str, 8).is_err()
+    {
+        return Err(PermanentError::InvalidArguments(format!(
+            "Invalid octal file mode: '{}'",
+            mode_str
+        ))
+        .into());
+    }
+
     // Validate --json-parse requirements
     if args.json_parse && args.json_url_field.is_none() {
         return Err(PermanentError::JsonUrlFieldRequired.into());
@@ -1379,7 +1394,7 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
         let dir_handle = Dir::open_ambient_dir(dir_path, ambient_authority()).map_err(|e| {
             anyhow::anyhow!("Failed to open output directory '{}': {}", dir_path.display(), e)
         })?;
-        dir_cache.insert(dir_path.to_path_buf(), dir_handle);
+        dir_cache.insert(normalize_path_lexically(dir_path), dir_handle);
     }
 
     // Build TLS config once (platform verifier + mTLS) and reuse for all clients.
@@ -1783,18 +1798,9 @@ fn parse_content_disposition_header(header_value: &str) -> Option<String> {
         _ => return None,
     }
 
-    // 2. Handle 'filename*' (High Priority)
-    if let Some(raw_ext) = data.params.get("filename*") {
-        let parts: Vec<&str> = raw_ext.split('\'').collect();
-        // The last part contains the encoded text (UTF-8''%E2%9C%93.txt -> %E2%9C%93.txt)
-        if let Some(encoded) = parts.last() {
-            // CALL THE HELPER HERE
-            let decoded = percent_decode_str(encoded);
-            return Some(sanitize_filename(&decoded));
-        }
-    }
-
-    // 3. Handle 'filename' (Low Priority)
+    // 2. Extract 'filename'
+    // The parser internally resolves 'filename*' vs 'filename' precedence,
+    // handles charset decoding, and provides UTF-8 fallback on unrecognized encoding.
     if let Some(name) = data.params.get("filename") {
         return Some(sanitize_filename(name));
     }
@@ -2119,8 +2125,7 @@ fn stat_file_via_cache(
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "Path has no filename")
     })?;
 
-    ensure_dir_cached(cache, parent)?;
-    let dir = cache.get(parent).unwrap();
+    let dir = get_cached_dir(cache, parent)?;
 
     match dir.symlink_metadata(filename) {
         Ok(metadata) => {
@@ -2156,10 +2161,7 @@ fn check_path_before_open(path: &Path, cache: &mut DirCache) -> Result<bool> {
     })?;
 
     // PIN DIRECTORY GLOBALLY
-    let canonical_parent = parent.to_path_buf();
-    ensure_dir_cached(cache, &canonical_parent)?;
-
-    let dir = cache.get(&canonical_parent).unwrap();
+    let dir = get_cached_dir(cache, parent)?;
 
     // Check metadata universally to determine if the file exists
     match dir.symlink_metadata(filename_str) {
@@ -2219,18 +2221,15 @@ fn normalize_path_lexically(path: &Path) -> PathBuf {
     if normalized.as_os_str().is_empty() { PathBuf::from(".") } else { normalized }
 }
 
-/// Ensure a parent directory is cached as a cap-std Dir handle.
-/// Opens it via ambient authority if not already present.
-fn ensure_dir_cached(cache: &mut DirCache, parent: &Path) -> std::io::Result<()> {
-    // 1. Normalize the path purely in memory
-    let canonical = normalize_path_lexically(parent);
-
-    // 2. Use the normalized path as the cache key
-    if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(canonical) {
+/// Get (or open and cache) the Dir handle for `parent`, keyed by its lexical
+/// normalization so "./a", "a/../a", etc. all map to one cache entry.
+fn get_cached_dir<'a>(cache: &'a mut DirCache, parent: &Path) -> std::io::Result<&'a Dir> {
+    let key = normalize_path_lexically(parent);
+    if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(key.clone()) {
         let dir = Dir::open_ambient_dir(e.key(), cap_std::ambient_authority())?;
         e.insert(dir);
     }
-    Ok(())
+    Ok(cache.get(&key).unwrap())
 }
 
 fn open_file_securely(
@@ -2245,8 +2244,7 @@ fn open_file_securely(
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "Path has no filename")
     })?;
 
-    ensure_dir_cached(cache, parent)?;
-    let dir = cache.get(parent).unwrap();
+    let dir = get_cached_dir(cache, parent)?;
 
     let mut file_existed = false;
     match dir.symlink_metadata(filename) {
@@ -2325,11 +2323,16 @@ fn perform_atomic_move(
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "Missing destination filename")
         })?;
 
-        ensure_dir_cached(cache, parent_from)?;
-        ensure_dir_cached(cache, parent_to)?;
+        // Populate cache sequentially so mutable borrows don't overlap
+        let _ = get_cached_dir(cache, parent_from)?;
+        let _ = get_cached_dir(cache, parent_to)?;
 
-        let dir_from = cache.get(parent_from).unwrap();
-        let dir_to = cache.get(parent_to).unwrap();
+        let key_from = normalize_path_lexically(parent_from);
+        let key_to = normalize_path_lexically(parent_to);
+
+        // Now borrow immutably concurrently
+        let dir_from = cache.get(&key_from).unwrap();
+        let dir_to = cache.get(&key_to).unwrap();
 
         let overwrite_or_resume = args.overwrite || args.resume;
 
@@ -2424,6 +2427,7 @@ fn perform_atomic_move(
         Err(e) => Err(e).context("Failed to rename temp file"),
     }
 }
+
 /// Parse Content-Range header to extract the start byte
 /// Format: "bytes START-END/TOTAL" or "bytes START-END/*"
 fn parse_content_range(header_value: &str) -> Option<u64> {
@@ -2588,11 +2592,7 @@ fn set_file_mtime(path: &Path, server_time: SystemTime, cache: &mut DirCache) ->
     }
     let filename = path.file_name().ok_or_else(|| anyhow::anyhow!("Path has no filename"))?;
 
-    // Ensure parent directory handle is in cache
-    let canonical_parent = parent.to_path_buf();
-    ensure_dir_cached(cache, &canonical_parent)?;
-
-    let dir = cache.get(&canonical_parent).unwrap();
+    let dir = get_cached_dir(cache, parent)?;
 
     rustix::fs::utimensat(dir.as_fd(), filename, &times, AtFlags::SYMLINK_NOFOLLOW)
         .map_err(std::io::Error::from)?;
@@ -2610,10 +2610,7 @@ fn set_file_mtime(path: &Path, server_time: SystemTime, cache: &mut DirCache) ->
     let filename = path.file_name().ok_or_else(|| anyhow::anyhow!("Path has no filename"))?;
 
     // 1. Ensure parent directory handle is securely in the cache
-    let canonical_parent = parent.to_path_buf();
-    ensure_dir_cached(cache, &canonical_parent)?;
-
-    let dir = cache.get(&canonical_parent).unwrap();
+    let dir = get_cached_dir(cache, parent)?;
 
     // 2. Setup OpenOptions for write access
     let mut opts = cap_std::fs::OpenOptions::new();
@@ -2665,6 +2662,7 @@ fn resolve_unique_output_path(
     output_path: &Path,
     args: &Args,
     used_filenames: &mut HashMap<PathBuf, u32>,
+    dir_cache: &mut DirCache,
 ) -> Result<(PathBuf, bool)> {
     let canonical_key = output_path.to_path_buf();
 
@@ -2675,7 +2673,7 @@ fn resolve_unique_output_path(
             loop {
                 let numbered =
                     generate_numbered_filename(output_path, *counter, args.keep_extension);
-                if !numbered.exists() {
+                if stat_file_via_cache(&numbered, dir_cache)?.is_none() {
                     *counter += 1;
                     return Ok((numbered, true));
                 }
@@ -2685,12 +2683,16 @@ fn resolve_unique_output_path(
 
         // First use of this filename in this execution
         // Check if it already exists on disk
-        if output_path.exists() && !args.overwrite && !args.resume && !args.newer {
+        if stat_file_via_cache(output_path, dir_cache)?.is_some()
+            && !args.overwrite
+            && !args.resume
+            && !args.newer
+        {
             let mut counter = 1u32;
             loop {
                 let numbered =
                     generate_numbered_filename(output_path, counter, args.keep_extension);
-                if !numbered.exists() {
+                if stat_file_via_cache(&numbered, dir_cache)?.is_none() {
                     used_filenames.insert(canonical_key, counter + 1);
                     return Ok((numbered, true));
                 }
@@ -2915,8 +2917,7 @@ fn open_for_read(path: &Path, cache: &mut DirCache) -> std::io::Result<std::fs::
     })?;
 
     // 1. Ensure the directory is securely cached
-    ensure_dir_cached(cache, parent)?;
-    let dir = cache.get(parent).unwrap();
+    let dir = get_cached_dir(cache, parent)?;
 
     // 2. Set up OpenOptions for read-only
     let mut opts = OpenOptions::new();
@@ -2925,7 +2926,6 @@ fn open_for_read(path: &Path, cache: &mut DirCache) -> std::io::Result<std::fs::
     #[cfg(unix)]
     {
         use cap_std::fs::OpenOptionsExt;
-        // Apply safe flags: O_NOCTTY and O_NOFOLLOW
         opts.custom_flags(libc::O_NOCTTY | libc::O_NOFOLLOW);
     }
 
@@ -3353,7 +3353,7 @@ async fn download_file(
     // Handle --multiple-copies: resolve unique output path before any file checks
     if !is_stdout {
         let (resolved_path, was_renamed) =
-            resolve_unique_output_path(&output_path, args, used_filenames)?;
+            resolve_unique_output_path(&output_path, args, used_filenames, dir_cache)?;
         if was_renamed && !args.quiet {
             eprintln!(
                 "Filename collision: '{}' -> '{}'",
@@ -3372,16 +3372,20 @@ async fn download_file(
         check_path_before_open(&output_path, dir_cache)?;
     }
 
-    // Stat output file through DirCache (no AT_FDCWD) for size/mtime checks below
+    // Stat output file through DirCache for size/mtime checks below
     let output_info = if !is_stdout { stat_file_via_cache(&output_path, dir_cache)? } else { None };
 
     // Handle -N (--newer) mode: check if remote file is newer than local file
-    if args.newer && !is_stdout && output_info.is_some() && args.no_if_modified_since {
+    if args.newer
+        && !is_stdout
+        && let Some(ref out_info) = output_info
+        && args.no_if_modified_since
+    {
         // --no-if-modified-since: Use the HEAD response's Last-Modified we already have
         if let Some(lm_str) = head_last_modified
             && let Some(server_time) = parse_http_date(lm_str)
         {
-            if let Some(local_mtime) = output_info.as_ref().unwrap().modified {
+            if let Some(local_mtime) = out_info.modified {
                 if server_time <= local_mtime {
                     if !args.quiet {
                         eprintln!(
@@ -3417,7 +3421,7 @@ async fn download_file(
         None
     };
 
-    // Stat temp file through DirCache (no AT_FDCWD)
+    // Stat temp file through DirCache
     let temp_info =
         if let Some(ref tp) = temp_path { stat_file_via_cache(tp, dir_cache)? } else { None };
 
@@ -3426,8 +3430,10 @@ async fn download_file(
     if !is_stdout {
         // For temp mode, check if temp file exists for resume
         if let Some(ref tp) = temp_path {
-            if temp_info.is_some() && args.resume {
-                start_byte = temp_info.as_ref().unwrap().size;
+            if let Some(ref t_info) = temp_info
+                && args.resume
+            {
+                start_byte = t_info.size;
 
                 if args.debug {
                     eprintln!(
@@ -3575,89 +3581,188 @@ async fn download_file(
         }
     }
 
-    let mut request = client.get(url.clone());
-    if start_byte > 0 {
-        request = request.header(RANGE, format!("bytes={}-", start_byte));
-    }
+    let mut force_truncate = false;
+    let response;
+    let mut content_length;
+    let mut get_last_modified;
 
-    // -N mode without --no-if-modified-since: add If-Modified-Since header
-    if args.newer
-        && !args.no_if_modified_since
-        && !is_stdout
-        && output_info.is_some()
-        && let Some(local_mtime) = output_info.as_ref().unwrap().modified
-        && let Some(http_date) = format_http_date(local_mtime)
-    {
-        if args.verbose {
-            eprintln!("Sending If-Modified-Since: {}", http_date);
+    // Loop added to safely retry the entire request if we discover a different
+    // Content-Disposition dynamically and need to reset an active partial-resume context.
+    loop {
+        let mut request = client.get(url.clone());
+        if start_byte > 0 {
+            request = request.header(RANGE, format!("bytes={}-", start_byte));
         }
-        request = request.header(IF_MODIFIED_SINCE, http_date);
-    }
 
-    if let Some(ref u) = args.user {
-        request = request.basic_auth(u, args.password.as_deref());
-    }
-
-    let response = request.send().await.context("Failed to send GET request")?;
-    let status = response.status();
-
-    // Handle 304 Not Modified (from If-Modified-Since in -N mode)
-    if status == StatusCode::NOT_MODIFIED {
-        if !args.quiet {
-            eprintln!(
-                "Server file is not newer than local file '{}', skipping.",
-                output_path.display()
-            );
-        }
-        return Ok(());
-    }
-
-    // Check for redirect on GET (HEAD and GET may behave differently)
-    if status.is_redirection() {
-        if let Some(location) = response.headers().get(LOCATION) {
-            let location_str = location.to_str().unwrap_or("<invalid>");
-            return Err(PermanentError::RedirectOnGet {
-                status: status.as_u16(),
-                location: location_str.to_string(),
-            }
-            .into());
-        }
-        return Err(PermanentError::RedirectWithoutLocation(status.as_u16()).into());
-    }
-
-    if status == StatusCode::RANGE_NOT_SATISFIABLE {
-        if !args.quiet {
-            eprintln!("File already fully downloaded.");
-        }
-        // If we were using a temp file, rename it
-        if let Some(ref tp) = temp_path
-            && temp_info.is_some()
+        // -N mode without --no-if-modified-since: add If-Modified-Since header
+        if args.newer
+            && !args.no_if_modified_since
+            && !is_stdout
+            && let Some(ref out_info) = output_info
+            && let Some(local_mtime) = out_info.modified
+            && let Some(http_date) = format_http_date(local_mtime)
         {
-            perform_atomic_move(tp, &output_path, args, dir_cache)?;
+            if args.verbose {
+                eprintln!("Sending If-Modified-Since: {}", http_date);
+            }
+            request = request.header(IF_MODIFIED_SINCE, http_date);
         }
-        if args.server_timestamps {
-            apply_server_timestamp(&output_path, head_last_modified, args.debug, dir_cache);
-        }
-        return Ok(());
-    }
 
-    // Handle HTTP 4xx and 5xx errors
-    if status.is_client_error() || status.is_server_error() {
-        if args.content_on_error {
+        if let Some(ref u) = args.user {
+            request = request.basic_auth(u, args.password.as_deref());
+        }
+
+        let current_response = request.send().await.context("Failed to send GET request")?;
+        let status = current_response.status();
+
+        // Handle 304 Not Modified (from If-Modified-Since in -N mode)
+        if status == StatusCode::NOT_MODIFIED {
             if !args.quiet {
                 eprintln!(
-                    "Warning: HTTP {} returned. Saving error body to file due to --content-on-error.",
-                    status
+                    "Server file is not newer than local file '{}', skipping.",
+                    output_path.display()
                 );
             }
-        } else {
-            return Err(PermanentError::HttpClientError(status.as_u16()).into());
+            return Ok(());
         }
+
+        // Check for redirect on GET (HEAD and GET may behave differently)
+        if status.is_redirection() {
+            if let Some(location) = current_response.headers().get(LOCATION) {
+                let location_str = location.to_str().unwrap_or("<invalid>");
+                return Err(PermanentError::RedirectOnGet {
+                    status: status.as_u16(),
+                    location: location_str.to_string(),
+                }
+                .into());
+            }
+            return Err(PermanentError::RedirectWithoutLocation(status.as_u16()).into());
+        }
+
+        if status == StatusCode::RANGE_NOT_SATISFIABLE {
+            if !args.quiet {
+                eprintln!("File already fully downloaded.");
+            }
+            // If we were using a temp file, rename it
+            if let Some(ref tp) = temp_path
+                && temp_info.is_some()
+            {
+                perform_atomic_move(tp, &output_path, args, dir_cache)?;
+            }
+            if args.server_timestamps {
+                apply_server_timestamp(&output_path, head_last_modified, args.debug, dir_cache);
+            }
+            return Ok(());
+        }
+
+        // Handle HTTP 4xx and 5xx errors
+        if status.is_client_error() || status.is_server_error() {
+            if args.content_on_error {
+                if !args.quiet {
+                    eprintln!(
+                        "Warning: HTTP {} returned. Saving error body to file due to --content-on-error.",
+                        status
+                    );
+                }
+            } else {
+                return Err(PermanentError::HttpClientError(status.as_u16()).into());
+            }
+        }
+
+        get_last_modified = current_response
+            .headers()
+            .get(LAST_MODIFIED)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        // Validate Content-Range when resuming
+        if args.resume && start_byte > 0 {
+            if status != StatusCode::PARTIAL_CONTENT {
+                if !args.quiet {
+                    eprintln!("Server doesn't support resume, restarting from scratch.");
+                }
+                start_byte = 0;
+                force_truncate = true;
+            } else {
+                // Validate Content-Range header matches our request
+                if let Some(content_range) = current_response.headers().get(CONTENT_RANGE)
+                    && let Ok(range_str) = content_range.to_str()
+                    && let Some(server_start) = parse_content_range(range_str)
+                    && server_start != start_byte
+                {
+                    return Err(PermanentError::ContentRangeMismatch {
+                        requested: start_byte,
+                        received: server_start,
+                    }
+                    .into());
+                }
+            }
+        }
+
+        content_length = current_response
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
+
+        // Re-check Content-Disposition from GET response (some servers only set it on GET, not HEAD)
+        // Only relevant when no explicit --output was given
+        if args.output.is_none() && !is_stdout {
+            let get_cd = current_response
+                .headers()
+                .get(CONTENT_DISPOSITION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_content_disposition_header);
+
+            if let Some(ref new_name) = get_cd
+                && *new_name != final_filename
+            {
+                if args.debug {
+                    eprintln!(
+                        "[DEBUG] Content-Disposition changed on GET: '{}' -> '{}'",
+                        final_filename, new_name
+                    );
+                }
+
+                let old_filename = final_filename.clone();
+                final_filename = new_name.clone();
+                output_path = if let Some(ref dir_str) = args.output_dir {
+                    Path::new(dir_str).join(&final_filename)
+                } else {
+                    PathBuf::from(&final_filename)
+                };
+
+                if args.temp {
+                    let parent = output_path.parent().unwrap_or(Path::new("."));
+                    temp_path = Some(generate_deterministic_temp_filename(
+                        url,
+                        &final_filename,
+                        parent,
+                        args.tempnamelen,
+                        args.debug,
+                    ));
+                }
+
+                // If we were resuming with the old temp file, we must restart since
+                // the temp filename is derived from the output filename
+                if start_byte > 0 {
+                    if !args.quiet {
+                        eprintln!(
+                            "Filename changed during resume ('{}' -> '{}'), restarting download.",
+                            old_filename, new_name
+                        );
+                    }
+                    start_byte = 0;
+                    force_truncate = true;
+                    continue; // RE-ISSUE GET REQUEST
+                }
+            }
+        }
+
+        response = current_response;
+        break; // Successfully got response, break loop
     }
 
-    // Capture Last-Modified from the GET response (may differ from HEAD)
-    let get_last_modified =
-        response.headers().get(LAST_MODIFIED).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
     // Prefer GET's Last-Modified, fallback to HEAD's
     let effective_last_modified = get_last_modified.as_deref().or(head_last_modified);
 
@@ -3668,92 +3773,10 @@ async fn download_file(
         None
     };
 
-    let mut force_truncate = false;
-    // Validate Content-Range when resuming
-    if args.resume && start_byte > 0 {
-        if status != StatusCode::PARTIAL_CONTENT {
-            if !args.quiet {
-                eprintln!("Server doesn't support resume, restarting from scratch.");
-            }
-            start_byte = 0;
-            force_truncate = true;
-        } else {
-            // Validate Content-Range header matches our request
-            if let Some(content_range) = response.headers().get(CONTENT_RANGE)
-                && let Ok(range_str) = content_range.to_str()
-                && let Some(server_start) = parse_content_range(range_str)
-                && server_start != start_byte
-            {
-                return Err(PermanentError::ContentRangeMismatch {
-                    requested: start_byte,
-                    received: server_start,
-                }
-                .into());
-            }
-        }
-    }
-
-    let content_length = response
-        .headers()
-        .get(CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok());
-
     // Calculate total size for resume logic, but for the progress bar
     // we strictly want to track the *stream* size (remaining bytes)
     // to ensure speed/ETA calculations are correct.
     let remaining_bytes = content_length;
-
-    // Re-check Content-Disposition from GET response (some servers only set it on GET, not HEAD)
-    // Only relevant when no explicit --output was given
-    if args.output.is_none() && !is_stdout {
-        let get_cd = response
-            .headers()
-            .get(CONTENT_DISPOSITION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(parse_content_disposition_header);
-
-        if let Some(ref new_name) = get_cd
-            && *new_name != final_filename
-        {
-            if args.debug {
-                eprintln!(
-                    "[DEBUG] Content-Disposition changed on GET: '{}' -> '{}'",
-                    final_filename, new_name
-                );
-            }
-            // If we were resuming with the old temp file, we must restart since
-            // the temp filename is derived from the output filename
-            if start_byte > 0 {
-                if !args.quiet {
-                    eprintln!(
-                        "Filename changed during resume ('{}' -> '{}'), restarting download.",
-                        final_filename, new_name
-                    );
-                }
-                start_byte = 0;
-                force_truncate = true;
-            }
-
-            final_filename = new_name.clone();
-            output_path = if let Some(ref dir_str) = args.output_dir {
-                Path::new(dir_str).join(&final_filename)
-            } else {
-                PathBuf::from(&final_filename)
-            };
-
-            if args.temp {
-                let parent = output_path.parent().unwrap_or(Path::new("."));
-                temp_path = Some(generate_deterministic_temp_filename(
-                    url,
-                    &final_filename,
-                    parent,
-                    args.tempnamelen,
-                    args.debug,
-                ));
-            }
-        }
-    }
 
     // If writing to stdout, bypass file/temp logic
     if is_stdout {
@@ -3827,8 +3850,7 @@ fn open_temp_file_safely(
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "Path has no filename")
     })?;
 
-    ensure_dir_cached(cache, parent)?;
-    let dir = cache.get(parent).unwrap();
+    let dir = get_cached_dir(cache, parent)?;
 
     let mut opts = OpenOptions::new();
     opts.write(true);
@@ -3836,7 +3858,6 @@ fn open_temp_file_safely(
     #[cfg(unix)]
     {
         use cap_std::fs::OpenOptionsExt;
-        // Apply safe flags: O_NOCTTY and O_NOFOLLOW
         let custom_flags = libc::O_NOCTTY | libc::O_NOFOLLOW;
         opts.custom_flags(custom_flags);
 
