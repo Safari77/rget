@@ -2226,9 +2226,9 @@ fn ensure_dir_cached(cache: &mut DirCache, parent: &Path) -> std::io::Result<()>
     let canonical = normalize_path_lexically(parent);
 
     // 2. Use the normalized path as the cache key
-    if !cache.contains_key(&canonical) {
-        let dir = Dir::open_ambient_dir(&canonical, cap_std::ambient_authority())?;
-        cache.insert(canonical, dir);
+    if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(canonical) {
+        let dir = Dir::open_ambient_dir(e.key(), cap_std::ambient_authority())?;
+        e.insert(dir);
     }
     Ok(())
 }
