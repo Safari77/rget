@@ -1305,6 +1305,7 @@ fn test_idn_homograph_punycode() {
 
 #[cfg(target_os = "linux")]
 #[test]
+#[cfg_attr(miri, ignore)] // unsupported flags 0x210000
 fn test_openat2_security_linux() {
     use std::os::unix::fs::symlink;
 
