@@ -114,7 +114,7 @@ pub enum PermanentError {
     RedirectOnGet { status: u16, location: String },
 
     // HTTP errors (4xx = permanent, 5xx = transient)
-    HttpClientError(u16), // 4xx errors
+    HttpClientError(u16), // any HTTP error status; 5xx and 429 are transient (see is_permanent_error)
 
     // TOCTOU: file appeared during download
     FileAppearedDuringDownload(PathBuf),
@@ -1677,6 +1677,8 @@ fn is_private_ip(ip: &IpAddr) -> bool {
                 || (ipv4.octets()[0] == 100 && (ipv4.octets()[1] & 0xC0) == 64)
                 // IETF Protocol Assignments: 192.0.0.0/24
                 || (ipv4.octets()[0] == 192 && ipv4.octets()[1] == 0 && ipv4.octets()[2] == 0)
+                // Reserved for future use (RFC 1112 §4): 240.0.0.0/4
+                || ((ipv4.octets()[0] & 0xf0) == 0xf0)
         }
         IpAddr::V6(ipv6) => {
             ipv6.is_loopback()
@@ -2247,9 +2249,11 @@ fn open_file_securely(
     let dir = get_cached_dir(cache, parent)?;
 
     let mut file_existed = false;
+    let mut existing_is_regular = false;
     match dir.symlink_metadata(filename) {
         Ok(_metadata) => {
             file_existed = true;
+            existing_is_regular = _metadata.file_type().is_file();
 
             #[cfg(unix)]
             {
@@ -2273,9 +2277,33 @@ fn open_file_securely(
 
     if is_append {
         opts.append(true);
-    } else if file_existed || args.overwrite || force_truncate {
+    } else if file_existed
+        && existing_is_regular
+        && (args.overwrite || args.resume || args.newer || force_truncate)
+    {
+        // Existing regular file that we are authorized to replace (--overwrite,
+        // -N, --continue resuming from 0 bytes, or a forced restart; a plain
+        // pre-existing file without those flags was already rejected upstream with
+        // FileAlreadyExists). Delete and recreate it fresh via O_EXCL rather than
+        // truncating in place, so the replacement works regardless of the file's
+        // ownership (unlinking needs write access to the parent directory, not
+        // ownership of the file).
+        match dir.remove_file(filename) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        opts.create_new(true);
+    } else if file_existed {
+        // Existing entry we will not unlink: a symlink, FIFO, or other non-regular
+        // object (or, defensively, a regular file reached without an authorizing
+        // flag). Open with O_TRUNC (no O_EXCL); combined with O_NOFOLLOW set below
+        // this makes a symlink fail with ELOOP (preserving the anti-symlink
+        // guarantee), while a FIFO opens for writing into the pipe.
         opts.create(true).truncate(true);
     } else {
+        // Nothing exists yet: create a brand-new file (O_EXCL keeps it
+        // TOCTOU-safe against a file appearing between the stat and the open).
         opts.create_new(true);
     }
 
@@ -2296,7 +2324,11 @@ fn open_file_securely(
     let cap_file = dir.open_with(filename, &opts)?;
     let std_file = cap_file.into_std();
 
-    if file_existed {
+    // Post-open TOCTOU check only matters when appending: we verify the real fd
+    // is not a device and (unless --insecure-owner) is owned by us. Overwrite and
+    // create-new paths produce a brand-new file we just created via O_EXCL, so no
+    // owner check applies there.
+    if is_append {
         check_file_after_open(&std_file, path, true, args.insecure_owner)?;
     }
 
@@ -2444,7 +2476,13 @@ fn parse_content_range(header_value: &str) -> Option<u64> {
 /// Check if an error is permanent (should not be retried)
 fn is_permanent_error(err: &anyhow::Error) -> bool {
     // 1. Check our custom permanent errors
-    if err.downcast_ref::<PermanentError>().is_some() {
+    if let Some(pe) = err.downcast_ref::<PermanentError>() {
+        // HttpClientError carries any HTTP error status. 5xx server errors and
+        // 429 Too Many Requests are transient and should be retried; every other
+        // 4xx is permanent. All other PermanentError variants are permanent.
+        if let PermanentError::HttpClientError(code) = pe {
+            return *code < 500 && *code != 429;
+        }
         return true;
     }
 
@@ -3732,6 +3770,26 @@ async fn download_file(
                     PathBuf::from(&final_filename)
                 };
 
+                // The output path changed, so re-run the same collision/existence
+                // checks that were performed for the original name at the top of
+                // this function. Without this, --multiple-copies numbering, the
+                // FileAlreadyExists guard and the device check would all be
+                // bypassed for the new name, and an unrelated existing file could
+                // be silently overwritten.
+                let (resolved_path, was_renamed) =
+                    resolve_unique_output_path(&output_path, args, used_filenames, dir_cache)?;
+                if was_renamed && !args.quiet {
+                    eprintln!(
+                        "Filename collision: '{}' -> '{}'",
+                        output_path.display(),
+                        resolved_path.display()
+                    );
+                }
+                output_path = resolved_path;
+                if let Some(fname) = output_path.file_name().and_then(|s| s.to_str()) {
+                    final_filename = fname.to_string();
+                }
+
                 if args.temp {
                     let parent = output_path.parent().unwrap_or(Path::new("."));
                     temp_path = Some(generate_deterministic_temp_filename(
@@ -3743,8 +3801,32 @@ async fn download_file(
                     ));
                 }
 
-                // If we were resuming with the old temp file, we must restart since
-                // the temp filename is derived from the output filename
+                check_path_before_open(&output_path, dir_cache)?;
+
+                // Re-evaluate the existing-output guard for the new name (mirrors
+                // the top-of-function logic). A pre-existing target must not be
+                // silently clobbered unless --continue/--overwrite/--newer is set.
+                if let Some(out_info) = stat_file_via_cache(&output_path, dir_cache)? {
+                    if let Some(total) = content_length
+                        && out_info.size >= total
+                        && !args.newer
+                        && !args.overwrite
+                    {
+                        if !args.quiet {
+                            eprintln!("File already fully downloaded.");
+                        }
+                        return Ok(());
+                    }
+                    if !args.resume && !args.overwrite && !args.newer {
+                        return Err(PermanentError::FileAlreadyExists(output_path.clone()).into());
+                    }
+                }
+
+                // If we were resuming with the old temp/output file, we must
+                // restart since the resume context (and the temp filename) was
+                // derived from the old output filename. Re-issue the GET without a
+                // Range header. When start_byte is 0 the current response already
+                // holds the full body, so there is no need to re-issue.
                 if start_byte > 0 {
                     if !args.quiet {
                         eprintln!(
@@ -3880,10 +3962,34 @@ fn open_temp_file_safely(
         match dir.open_with(filename, &excl_opts) {
             Ok(f) => (f, false),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                // Fallback to O_TRUNC if it already exists
-                let mut trunc_opts = opts.clone();
-                trunc_opts.create(true).truncate(true);
-                (dir.open_with(filename, &trunc_opts)?, true)
+                // Something already sits at the temp path. Inspect it without
+                // following symlinks to decide how to proceed.
+                match dir.symlink_metadata(filename) {
+                    // Stale regular temp file: delete and recreate fresh via
+                    // O_EXCL. Unlinking depends on directory write access rather
+                    // than the file's ownership, matching --overwrite semantics.
+                    Ok(meta) if meta.file_type().is_file() => {
+                        match dir.remove_file(filename) {
+                            Ok(()) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(e) => return Err(e.into()),
+                        }
+                        (dir.open_with(filename, &excl_opts)?, false)
+                    }
+                    // Symlink/FIFO/other: never unlink or follow it. O_TRUNC plus
+                    // O_NOFOLLOW makes a symlink fail with ELOOP; a FIFO opens for
+                    // writing into the pipe.
+                    Ok(_) => {
+                        let mut trunc_opts = opts.clone();
+                        trunc_opts.create(true).truncate(true);
+                        (dir.open_with(filename, &trunc_opts)?, true)
+                    }
+                    // Vanished between the O_EXCL attempt and the stat: create fresh.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        (dir.open_with(filename, &excl_opts)?, false)
+                    }
+                    Err(e) => return Err(e.into()),
+                }
             }
             Err(e) => return Err(e.into()),
         }
@@ -3892,7 +3998,11 @@ fn open_temp_file_safely(
     // Convert the cap-std file to a standard file
     let std_file = cap_file.into_std();
 
-    // Post-open TOCTOU check: verify device type and owner on existing files
+    // Post-open TOCTOU check on any pre-existing object we actually opened (an
+    // appended temp file, or a non-regular object such as a FIFO): verify on the
+    // real fd that it is not a device and (unless --insecure-owner) is owned by
+    // us. The delete-and-recreate path produced a brand-new O_EXCL file we own, so
+    // it is exempt.
     if file_existed {
         check_file_after_open(&std_file, path, true, args.insecure_owner)?;
     }
