@@ -4189,6 +4189,7 @@ async fn write_response_to_file<W: AsyncWrite + Unpin>(
 }
 
 #[cfg(all(target_os = "linux", not(target_os = "android")))]
+#[cfg(not(miri))]
 pub fn apply_security_sandbox() -> Result<(), Box<dyn std::error::Error>> {
     use libseccomp::{ScmpAction, ScmpArgCompare, ScmpCompareOp, ScmpFilterContext, ScmpSyscall};
 
@@ -4219,7 +4220,7 @@ pub fn apply_security_sandbox() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(any(target_os = "android", not(target_os = "linux")))]
+#[cfg(any(miri, target_os = "android", not(target_os = "linux")))]
 pub fn apply_security_sandbox() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
