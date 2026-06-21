@@ -2200,7 +2200,7 @@ fn normalize_path_lexically(path: &Path) -> PathBuf {
                 // Pop the last component if it's a normal directory.
                 // After a RootDir, drop the `..` entirely — can't go above filesystem root.
                 // For paths starting with `..` (no anchor), preserve the `..`.
-                match normalized.components().last() {
+                match normalized.components().next_back() {
                     Some(Component::Normal(_)) => {
                         normalized.pop();
                     }
@@ -2288,10 +2288,10 @@ fn open_file_securely(
         let custom_flags = libc::O_NOCTTY | libc::O_NOFOLLOW;
         opts.custom_flags(custom_flags);
 
-        if let Some(ref mode_str) = args.filemode {
-            if let Ok(m) = u32::from_str_radix(mode_str, 8) {
-                opts.mode(m);
-            }
+        if let Some(ref mode_str) = args.filemode
+            && let Ok(m) = u32::from_str_radix(mode_str, 8)
+        {
+            opts.mode(m);
         }
     }
 
@@ -2480,14 +2480,13 @@ fn is_permanent_error(err: &anyhow::Error) -> bool {
         // --- IO Errors ---
         if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
             #[cfg(unix)]
-            if let Some(os_err) = io_err.raw_os_error() {
-                if os_err == libc::ELOOP
+            if let Some(os_err) = io_err.raw_os_error()
+                && (os_err == libc::ELOOP
                     || os_err == libc::ENOTDIR
                     || os_err == libc::EISDIR
-                    || os_err == libc::ENOSYS
-                {
-                    return true;
-                }
+                    || os_err == libc::ENOSYS)
+            {
+                return true;
             }
 
             if matches!(
@@ -3841,10 +3840,10 @@ fn open_temp_file_safely(
         let custom_flags = libc::O_NOCTTY | libc::O_NOFOLLOW;
         opts.custom_flags(custom_flags);
 
-        if let Some(ref mode_str) = args.filemode {
-            if let Ok(m) = u32::from_str_radix(mode_str, 8) {
-                opts.mode(m);
-            }
+        if let Some(ref mode_str) = args.filemode
+            && let Ok(m) = u32::from_str_radix(mode_str, 8)
+        {
+            opts.mode(m);
         }
     }
 
