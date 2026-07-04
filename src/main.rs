@@ -138,7 +138,6 @@ pub enum PermanentError {
     // -N / --newer related
     NoIfModifiedSinceWithoutNewer,
     KeepExtensionWithoutMultipleCopies,
-    ServerFileSmallerThanLocal { server_size: u64, local_size: u64 },
 
     // --output-dir related
     OutputDirNotFound(PathBuf),
@@ -279,14 +278,6 @@ impl std::fmt::Display for PermanentError {
             Self::KeepExtensionWithoutMultipleCopies => {
                 write!(f, "--keep-extension can only be used with --multiple-copies")
             }
-            Self::ServerFileSmallerThanLocal { server_size, local_size } => {
-                write!(
-                    f,
-                    "Server file ({}) is smaller than local file ({}), skipping download",
-                    HumanBytes(*server_size),
-                    HumanBytes(*local_size)
-                )
-            }
             Self::OutputDirNotFound(path) => {
                 write!(
                     f,
@@ -370,6 +361,11 @@ impl std::error::Error for PermanentError {}
 const MAX_REDIRECTS: usize = 20;
 
 const BUFFER_SIZE: usize = 1024 * 1024;
+
+/// Maximum size of a JSON body fetched with --json-parse. The JSON metadata is
+/// parsed fully in memory, so it must be bounded regardless of --max-size
+/// (--max-size tightens this cap further when it is smaller).
+const MAX_JSON_BODY_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Default personalization string if config file doesn't exist
 const DEFAULT_PERSONALIZATION: &str = "rget-default-key-v1";
@@ -551,8 +547,12 @@ struct Args {
     #[arg(long = "referer", help = "Include 'Referer: url' header in HTTP request")]
     referer: Option<String>,
 
-    /// Read URLs from a local or external file
-    #[arg(short = 'i', long = "input-file", help = "Read URLs from a local or external file")]
+    /// Read URLs from a local file ('-' for stdin); lines starting with '#' are comments
+    #[arg(
+        short = 'i',
+        long = "input-file",
+        help = "Read URLs from a local file, '-' for stdin ('#' lines are comments)"
+    )]
     input_file: Option<String>,
 
     /// Specify username for HTTP authentication
@@ -593,7 +593,7 @@ struct Args {
     /// HSTS cache file path
     #[arg(
         long = "hsts-file",
-        help = "Path to HSTS cache file (default: ~/.config/rget/hsts.conf)"
+        help = "Path to HSTS cache file (default: ~/.config/rget/hsts.json)"
     )]
     hsts_file: Option<String>,
 
@@ -1113,7 +1113,7 @@ async fn resolve_final_url_and_client(
     client_cache: &mut HashMap<String, Client>,
     hsts_db: &mut HstsMap,
     tls_config: &Option<ClientConfig>,
-) -> Result<(Client, Url, Option<u64>, Option<String>, Option<String>)> {
+) -> Result<(Client, Url, Option<u64>, Option<String>, Option<String>, bool)> {
     // CLI policy: validate the URL the user actually supplied BEFORE any HSTS
     // rewriting. Without this, 'http://example.com' would silently succeed
     // whenever 'example.com' happens to be in the HSTS DB (the in-loop upgrade
@@ -1124,6 +1124,11 @@ async fn resolve_final_url_and_client(
     // redirect targets returned by the server (handled inside the loop below),
     // which preserves HSTS's anti-TLS-stripping purpose on redirect chains.
     validate_url(&initial_url, args.insecure)?;
+
+    // Remember the host the user actually asked for: HTTP credentials are only
+    // ever sent to this host. A redirect that changes the host must not receive
+    // the credentials (matching curl's default without --location-trusted).
+    let initial_host = initial_url.host_str().map(|h| h.to_string());
 
     let mut current_url = initial_url;
     let mut redirect_count = 0;
@@ -1186,9 +1191,20 @@ async fn resolve_final_url_and_client(
             }
         };
 
+        // Only send credentials to the originally requested host, never to a
+        // host reached through a redirect.
+        let same_host = current_url.host_str() == initial_host.as_deref();
+
         let mut request = client.head(current_url.clone());
         if let Some(ref u) = args.user {
-            request = request.basic_auth(u, args.password.as_deref());
+            if same_host {
+                request = request.basic_auth(u, args.password.as_deref());
+            } else if args.verbose {
+                eprintln!(
+                    "   Not sending credentials to '{}' (host differs from original URL)",
+                    current_url.host_str().unwrap_or("<none>")
+                );
+            }
         }
 
         let mut response = request.send().await.context("Failed to send HEAD request")?;
@@ -1197,7 +1213,9 @@ async fn resolve_final_url_and_client(
                 eprintln!("[DEBUG] HEAD status: 405 Method Not Allowed. Retrying with GET...");
             }
             let mut get_request = client.get(current_url.clone());
-            if let Some(ref u) = args.user {
+            if let Some(ref u) = args.user
+                && same_host
+            {
                 get_request = get_request.basic_auth(u, args.password.as_deref());
             }
             response = get_request.send().await.context("Failed to send GET request")?;
@@ -1251,7 +1269,14 @@ async fn resolve_final_url_and_client(
             headers.get(LAST_MODIFIED).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
 
         if status.is_success() || status.is_client_error() || status.is_server_error() {
-            return Ok((client, current_url, content_length, content_disposition, last_modified));
+            return Ok((
+                client,
+                current_url,
+                content_length,
+                content_disposition,
+                last_modified,
+                same_host,
+            ));
         }
 
         bail!("Unexpected status code: {}", status);
@@ -1279,7 +1304,8 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
         for line in reader.lines() {
             let line = line?;
             let trimmed = line.trim();
-            if !trimmed.is_empty() {
+            // Skip blank lines and '#' comment lines (a URL cannot start with '#')
+            if !trimmed.is_empty() && !trimmed.starts_with('#') {
                 all_urls.push(trimmed.to_string());
             }
         }
@@ -1442,6 +1468,7 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                             _content_length,
                             _content_disposition,
                             _last_modified,
+                            send_auth,
                         )) => {
                             if current_args.verbose && final_url != url {
                                 eprintln!("Final URL: {}", final_url);
@@ -1455,6 +1482,7 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                                 &mut attempt_used_filenames,
                                 &mut dir_cache,
                                 &tls_config,
+                                send_auth,
                             )
                             .await
                         }
@@ -1504,6 +1532,10 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
 
         // Normal (non-JSON) download mode
         let mut attempt = 0;
+        // Output path pinned by the first attempt; retries reuse it so the
+        // auto-set resume flag cannot re-route the download into a different
+        // pre-existing file (see download_file).
+        let mut resolved_output: Option<PathBuf> = None;
         loop {
             let mut current_args = args.clone();
             if attempt > 0 {
@@ -1523,7 +1555,14 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                 )
                 .await
                 {
-                    Ok((client, final_url, content_length, content_disposition, last_modified)) => {
+                    Ok((
+                        client,
+                        final_url,
+                        content_length,
+                        content_disposition,
+                        last_modified,
+                        send_auth,
+                    )) => {
                         if current_args.verbose && final_url != url {
                             eprintln!("Final URL: {}", final_url);
                         }
@@ -1548,6 +1587,8 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                             &mut attempt_used_filenames,
                             None,
                             &mut dir_cache,
+                            &mut resolved_output,
+                            send_auth,
                         )
                         .await
                     }
@@ -1673,16 +1714,25 @@ fn is_private_ip(ip: &IpAddr) -> bool {
                 || ipv4.is_broadcast()
                 || ipv4.is_unspecified()
                 || ipv4.is_documentation()
+                // "This network" (RFC 6890): 0.0.0.0/8 - on Linux these
+                // addresses can reach localhost, a classic SSRF bypass
+                || ipv4.octets()[0] == 0
                 // Shared Address Space (RFC 6598): 100.64.0.0/10
                 || (ipv4.octets()[0] == 100 && (ipv4.octets()[1] & 0xC0) == 64)
                 // IETF Protocol Assignments: 192.0.0.0/24
                 || (ipv4.octets()[0] == 192 && ipv4.octets()[1] == 0 && ipv4.octets()[2] == 0)
+                // Benchmarking (RFC 2544): 198.18.0.0/15
+                || (ipv4.octets()[0] == 198 && (ipv4.octets()[1] & 0xFE) == 18)
+                // Multicast (RFC 5771): 224.0.0.0/4
+                || ipv4.is_multicast()
                 // Reserved for future use (RFC 1112 §4): 240.0.0.0/4
                 || ((ipv4.octets()[0] & 0xf0) == 0xf0)
         }
         IpAddr::V6(ipv6) => {
             ipv6.is_loopback()
                 || ipv6.is_unspecified()
+                // Multicast: ff00::/8
+                || ipv6.is_multicast()
                 // Link-local: fe80::/10 (first 10 bits are 1111111010)
                 || (ipv6.segments()[0] & 0xffc0) == 0xfe80
                 // Unique Local Address (ULA): fc00::/7 (first 7 bits are 1111110)
@@ -1693,6 +1743,8 @@ fn is_private_ip(ip: &IpAddr) -> bool {
                 || (ipv6.segments()[0] == 0x2001 && ipv6.segments()[1] == 0x0000)
                 // 6to4: 2002::/16 - embeds IPv4 address, check if embedded IP is private
                 || is_6to4_private(ipv6)
+                // NAT64: 64:ff9b::/96 (RFC 6052) embeds IPv4; 64:ff9b:1::/48 (RFC 8215)
+                || is_nat64_private(ipv6)
                 // IPv4-mapped IPv6: ::ffff:x.x.x.x
                 || ipv6
                     .to_ipv4_mapped()
@@ -1718,6 +1770,32 @@ fn is_6to4_private(ipv6: &std::net::Ipv6Addr) -> bool {
         (seg2 & 0xff) as u8,
     );
     is_private_ip(&IpAddr::V4(ipv4))
+}
+
+/// Check if a NAT64 address maps to private address space.
+/// Covers the well-known prefix 64:ff9b::/96 (RFC 6052), which embeds an IPv4
+/// address in the last 32 bits, and the local-use prefix 64:ff9b:1::/48
+/// (RFC 8215), which is reserved for operator-internal translation.
+fn is_nat64_private(ipv6: &std::net::Ipv6Addr) -> bool {
+    let s = ipv6.segments();
+    if s[0] != 0x0064 || s[1] != 0xff9b {
+        return false;
+    }
+    // 64:ff9b:1::/48 is local-use; treat the whole prefix as private.
+    if s[2] == 0x0001 {
+        return true;
+    }
+    // Well-known prefix 64:ff9b::/96: IPv4 is embedded in segments 6-7.
+    if s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0 {
+        let ipv4 = std::net::Ipv4Addr::new(
+            (s[6] >> 8) as u8,
+            (s[6] & 0xff) as u8,
+            (s[7] >> 8) as u8,
+            (s[7] & 0xff) as u8,
+        );
+        return is_private_ip(&IpAddr::V4(ipv4));
+    }
+    false
 }
 
 /// Helper function to validate an IP against the CLI arguments
@@ -1835,11 +1913,19 @@ fn sanitize_filename(filename: &str) -> String {
     // Remove leading dots
     sanitized = sanitized.trim_start_matches('.').to_string();
 
-    // 3. Windows Reserved Name Check (Windows Only)
+    // 3. Windows Reserved Name Check and trailing dot/space stripping (Windows Only)
     #[cfg(windows)]
     {
-        let stem =
-            Path::new(&sanitized).file_stem().and_then(|s| s.to_str()).unwrap_or("").to_uppercase();
+        // Windows silently strips trailing dots and spaces, which both breaks
+        // round-tripping and can resurrect reserved names ("CON." -> "CON"),
+        // so strip them ourselves before the reserved-name check.
+        sanitized = sanitized.trim_end_matches(['.', ' ']).to_string();
+
+        // Windows reserves device names based on the part before the FIRST dot
+        // ("CON.tar.gz" is still the CON device), so split there instead of
+        // using file_stem(), which only strips the last extension. Trailing
+        // spaces in the stem ("CON .txt") are also ignored by Windows.
+        let stem = sanitized.split('.').next().unwrap_or("").trim_end().to_uppercase();
 
         let reserved_names = [
             "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
@@ -1848,15 +1934,12 @@ fn sanitize_filename(filename: &str) -> String {
         ];
 
         if reserved_names.contains(&stem.as_str()) {
-            // Replace ONLY the reserved word with '_', preserving extension
-            let extension =
-                Path::new(&sanitized).extension().and_then(|e| e.to_str()).unwrap_or("");
-
-            if !extension.is_empty() {
-                sanitized = format!("_.{}", extension);
-            } else {
-                sanitized = "_".to_string();
-            }
+            // Replace ONLY the reserved word with '_', preserving everything
+            // after the first dot
+            sanitized = match sanitized.split_once('.') {
+                Some((_, rest)) => format!("_.{}", rest),
+                None => "_".to_string(),
+            };
         }
     }
 
@@ -1864,13 +1947,16 @@ fn sanitize_filename(filename: &str) -> String {
 }
 
 fn filename_from_url(url: &Url) -> String {
-    let path = url.path();
-    let decoded_path = percent_decode_str(path);
-    let filename =
-        decoded_path.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or("index.html");
-    let filename = filename.split('?').next().unwrap_or(filename);
-    let filename = filename.split('#').next().unwrap_or(filename);
-    sanitize_filename(filename)
+    // Pick the last raw path segment BEFORE percent-decoding: decoding first
+    // would let an encoded '/' (%2F) change which segment is chosen. Note that
+    // url.path() never contains the query or fragment, so there is nothing to
+    // split off at '?' or '#'; splitting after decoding used to truncate
+    // legitimate filenames containing encoded '?' or '#' (sanitize_filename
+    // neutralizes those characters instead).
+    let raw_segment =
+        url.path().rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or("index.html");
+    let decoded = percent_decode_str(raw_segment);
+    sanitize_filename(&decoded)
 }
 
 /// Read the personalization key from config file
@@ -2424,7 +2510,10 @@ fn perform_atomic_move(
             if args.overwrite || args.resume {
                 Err(e.into())
             } else {
-                Err(PermanentError::FileAlreadyExists(target_path.to_path_buf()).into())
+                // The pre-download existence checks already passed for this
+                // target, so AlreadyExists at rename time means the file
+                // appeared during the download (TOCTOU race).
+                Err(PermanentError::FileAppearedDuringDownload(target_path.to_path_buf()).into())
             }
         }
 
@@ -2446,14 +2535,6 @@ fn perform_atomic_move(
                 }
                 Err(e) => Err(e).context("Failed to rename to truncated path"),
             }
-        }
-
-        Err(e)
-            if !args.overwrite
-                && !args.resume
-                && (e.kind() == std::io::ErrorKind::AlreadyExists) =>
-        {
-            Err(PermanentError::FileAppearedDuringDownload(target_path.to_path_buf()).into())
         }
 
         Err(e) => Err(e).context("Failed to rename temp file"),
@@ -3009,9 +3090,14 @@ struct JsonDownloadEntry {
 }
 
 /// Fetch JSON body from a URL (using existing client/redirect infrastructure).
-async fn fetch_json_body(client: &Client, url: &Url, args: &Args) -> Result<String> {
+async fn fetch_json_body(
+    client: &Client,
+    url: &Url,
+    args: &Args,
+    send_auth: bool,
+) -> Result<String> {
     let mut request = client.get(url.clone());
-    if let Some(ref u) = args.user {
+    if send_auth && let Some(ref u) = args.user {
         request = request.basic_auth(u, args.password.as_deref());
     }
 
@@ -3044,8 +3130,32 @@ async fn fetch_json_body(client: &Client, url: &Url, args: &Args) -> Result<Stri
         return Err(PermanentError::JsonContentTypeExpected(content_type.to_string()).into());
     }
 
-    let body = response.text().await.context("Failed to read JSON response body")?;
-    Ok(body)
+    // The JSON body is parsed fully in memory, so cap it instead of reading
+    // unbounded data (--max-size tightens the cap when it is smaller).
+    let limit = args.max_size.map_or(MAX_JSON_BODY_BYTES, |m| m.min(MAX_JSON_BODY_BYTES));
+    if let Some(len) = response.content_length()
+        && len > limit
+    {
+        return Err(PermanentError::FileSizeExceedsLimit {
+            size: len,
+            max: limit,
+            url: url.to_string(),
+        }
+        .into());
+    }
+
+    let mut body_bytes: Vec<u8> = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("Failed to read JSON response body")?;
+        if body_bytes.len() as u64 + chunk.len() as u64 > limit {
+            return Err(PermanentError::DownloadExceedsLimit { max: limit }.into());
+        }
+        body_bytes.extend_from_slice(&chunk);
+    }
+
+    // JSON is UTF-8 (RFC 8259 §8.1); reject anything else instead of guessing.
+    String::from_utf8(body_bytes).context("JSON response body is not valid UTF-8")
 }
 
 /// Process JSON mode: parse JSON, extract entries, download each, optionally verify hashes.
@@ -3058,6 +3168,7 @@ async fn process_json_downloads(
     used_filenames: &mut HashMap<PathBuf, u32>,
     dir_cache: &mut DirCache,
     tls_config: &Option<ClientConfig>,
+    send_auth: bool,
 ) -> Result<()> {
     let json_url_field = args.json_url_field.as_ref().expect("--json-url-field required");
 
@@ -3065,7 +3176,7 @@ async fn process_json_downloads(
     if args.verbose {
         eprintln!("Fetching JSON from: {}", json_url);
     }
-    let body = fetch_json_body(client, json_url, args).await?;
+    let body = fetch_json_body(client, json_url, args, send_auth).await?;
 
     if args.debug {
         eprintln!("[DEBUG] JSON response body length: {} bytes", body.len());
@@ -3215,7 +3326,12 @@ async fn process_json_downloads(
         if let Some(ref name) = entry.name {
             // An empty name sentinel (null/missing in JSON) should not become the output filename
             if !name.is_empty() {
-                entry_args.output = Some(name.clone());
+                // The name comes from server-controlled JSON: sanitize it like a
+                // Content-Disposition filename so it can neither traverse
+                // directories nor become '-' (which --output reserves for stdout).
+                let safe_name = sanitize_filename(name);
+                entry_args.output =
+                    Some(if safe_name == "-" { "_".to_string() } else { safe_name });
             }
         }
 
@@ -3256,6 +3372,9 @@ async fn process_json_downloads(
         };
 
         let mut attempt: u64 = 0;
+        // Output path pinned by the first attempt; retries reuse it so the
+        // auto-set resume flag cannot re-route the download (see download_file).
+        let mut resolved_output: Option<PathBuf> = None;
         let entry_failed = loop {
             let mut current_args = entry_args.clone();
             if attempt > 0 {
@@ -3279,6 +3398,7 @@ async fn process_json_downloads(
                         content_length,
                         content_disposition,
                         last_modified,
+                        entry_send_auth,
                     )) => {
                         if current_args.verbose && final_url != url {
                             eprintln!("Final URL: {}", final_url);
@@ -3304,6 +3424,8 @@ async fn process_json_downloads(
                             &mut attempt_used_filenames,
                             parsed_sha256.as_deref(),
                             dir_cache,
+                            &mut resolved_output,
+                            entry_send_auth,
                         )
                         .await
                     }
@@ -3365,16 +3487,30 @@ async fn download_file(
     used_filenames: &mut HashMap<PathBuf, u32>,
     expected_sha256: Option<&str>,
     dir_cache: &mut DirCache,
+    resolved_output: &mut Option<PathBuf>,
+    send_auth: bool,
 ) -> Result<()> {
+    // True when a previous attempt already resolved (pinned) the output path;
+    // this attempt must reuse it instead of re-deriving/re-numbering it.
+    let output_pinned = resolved_output.is_some();
+
     // 1. Determine filenames first
     let mut final_filename = determine_filename(args, url, content_disposition);
+    // The pre-numbering filename, used to detect a *real* Content-Disposition
+    // change on GET. Comparing against final_filename would misfire after
+    // --multiple-copies collision numbering ("a.txt" vs "a.txt.1") and
+    // re-number the output on every loop iteration.
+    let mut head_filename = final_filename.clone();
     let mut output_path = if let Some(ref output) = args.output {
         PathBuf::from(output)
     } else {
         PathBuf::from(&final_filename)
     };
 
-    let is_stdout = output_path.to_str() == Some("-");
+    // '-' means stdout only when explicitly requested with --output. A filename
+    // derived from the URL or a server-supplied Content-Disposition must never
+    // be able to flip the download into stdout mode.
+    let is_stdout = args.output.as_deref() == Some("-");
 
     // Apply --output-dir: prefix relative paths with the output directory
     if !is_stdout
@@ -3388,21 +3524,32 @@ async fn download_file(
         }
     }
 
-    // Handle --multiple-copies: resolve unique output path before any file checks
+    // Handle --multiple-copies: resolve unique output path before any file checks.
+    // On retry attempts the path pinned by the first attempt is reused:
+    // re-resolving with the auto-set resume flag would skip collision numbering
+    // and append the resumed download into an unrelated pre-existing file.
     if !is_stdout {
-        let (resolved_path, was_renamed) =
-            resolve_unique_output_path(&output_path, args, used_filenames, dir_cache)?;
-        if was_renamed && !args.quiet {
-            eprintln!(
-                "Filename collision: '{}' -> '{}'",
-                output_path.display(),
-                resolved_path.display()
-            );
-        }
-        output_path = resolved_path;
-        // Update final_filename if path changed
-        if let Some(fname) = output_path.file_name().and_then(|s| s.to_str()) {
-            final_filename = fname.to_string();
+        if let Some(prev) = resolved_output.as_ref() {
+            output_path = prev.clone();
+            if let Some(fname) = output_path.file_name().and_then(|s| s.to_str()) {
+                final_filename = fname.to_string();
+            }
+        } else {
+            let (resolved_path, was_renamed) =
+                resolve_unique_output_path(&output_path, args, used_filenames, dir_cache)?;
+            if was_renamed && !args.quiet {
+                eprintln!(
+                    "Filename collision: '{}' -> '{}'",
+                    output_path.display(),
+                    resolved_path.display()
+                );
+            }
+            output_path = resolved_path;
+            // Update final_filename if path changed
+            if let Some(fname) = output_path.file_name().and_then(|s| s.to_str()) {
+                final_filename = fname.to_string();
+            }
+            *resolved_output = Some(output_path.clone());
         }
     }
 
@@ -3498,6 +3645,12 @@ async fn download_file(
                                 tp.display()
                             );
                         }
+                        // Verify before finalizing: a temp file left behind by an
+                        // earlier run (e.g. after a failed verification with
+                        // --keep-temp) must not be promoted unchecked.
+                        if let Some(expected) = expected_sha256 {
+                            verify_sha256_file(tp, expected, args.quiet, dir_cache)?;
+                        }
                         perform_atomic_move(tp, &output_path, args, dir_cache)?;
                         if args.server_timestamps {
                             apply_server_timestamp(
@@ -3552,6 +3705,10 @@ async fn download_file(
                     if !args.quiet {
                         eprintln!("File already fully downloaded.");
                     }
+                    // --json-verify-hash must still check a pre-existing file
+                    if let Some(expected) = expected_sha256 {
+                        verify_sha256_file(&output_path, expected, args.quiet, dir_cache)?;
+                    }
                     return Ok(());
                 }
 
@@ -3589,6 +3746,10 @@ async fn download_file(
             {
                 if !args.quiet {
                     eprintln!("File already fully downloaded.");
+                }
+                // --json-verify-hash must still check a pre-existing file
+                if let Some(expected) = expected_sha256 {
+                    verify_sha256_file(&output_path, expected, args.quiet, dir_cache)?;
                 }
                 return Ok(());
             }
@@ -3646,7 +3807,9 @@ async fn download_file(
             request = request.header(IF_MODIFIED_SINCE, http_date);
         }
 
-        if let Some(ref u) = args.user {
+        // Credentials are only sent when the final URL is still on the
+        // originally requested host (see resolve_final_url_and_client).
+        if send_auth && let Some(ref u) = args.user {
             request = request.basic_auth(u, args.password.as_deref());
         }
 
@@ -3681,11 +3844,18 @@ async fn download_file(
             if !args.quiet {
                 eprintln!("File already fully downloaded.");
             }
-            // If we were using a temp file, rename it
+            // If we were using a temp file, verify (when requested) and rename it
             if let Some(ref tp) = temp_path
                 && temp_info.is_some()
             {
+                if let Some(expected) = expected_sha256 {
+                    verify_sha256_file(tp, expected, args.quiet, dir_cache)?;
+                }
                 perform_atomic_move(tp, &output_path, args, dir_cache)?;
+            } else if let Some(expected) = expected_sha256 {
+                // Non-temp resume: the presumed-complete data already sits at
+                // the output path; --json-verify-hash must still check it.
+                verify_sha256_file(&output_path, expected, args.quiet, dir_cache)?;
             }
             if args.server_timestamps {
                 apply_server_timestamp(&output_path, head_last_modified, args.debug, dir_cache);
@@ -3744,8 +3914,10 @@ async fn download_file(
             .and_then(|s| s.parse::<u64>().ok());
 
         // Re-check Content-Disposition from GET response (some servers only set it on GET, not HEAD)
-        // Only relevant when no explicit --output was given
-        if args.output.is_none() && !is_stdout {
+        // Only relevant when no explicit --output was given. Skipped when the
+        // output path was pinned by a previous attempt: a retry must keep
+        // writing to the exact file the first attempt chose.
+        if args.output.is_none() && !is_stdout && !output_pinned {
             let get_cd = current_response
                 .headers()
                 .get(CONTENT_DISPOSITION)
@@ -3753,16 +3925,17 @@ async fn download_file(
                 .and_then(parse_content_disposition_header);
 
             if let Some(ref new_name) = get_cd
-                && *new_name != final_filename
+                && *new_name != head_filename
             {
                 if args.debug {
                     eprintln!(
                         "[DEBUG] Content-Disposition changed on GET: '{}' -> '{}'",
-                        final_filename, new_name
+                        head_filename, new_name
                     );
                 }
 
-                let old_filename = final_filename.clone();
+                let old_filename = head_filename.clone();
+                head_filename = new_name.clone();
                 final_filename = new_name.clone();
                 output_path = if let Some(ref dir_str) = args.output_dir {
                     Path::new(dir_str).join(&final_filename)
@@ -3789,6 +3962,7 @@ async fn download_file(
                 if let Some(fname) = output_path.file_name().and_then(|s| s.to_str()) {
                     final_filename = fname.to_string();
                 }
+                *resolved_output = Some(output_path.clone());
 
                 if args.temp {
                     let parent = output_path.parent().unwrap_or(Path::new("."));
@@ -3807,13 +3981,20 @@ async fn download_file(
                 // the top-of-function logic). A pre-existing target must not be
                 // silently clobbered unless --continue/--overwrite/--newer is set.
                 if let Some(out_info) = stat_file_via_cache(&output_path, dir_cache)? {
-                    if let Some(total) = content_length
-                        && out_info.size >= total
+                    // content_length is only the REMAINING byte count when this
+                    // is a 206 response, so compare against the full size
+                    // (start_byte + remaining), not the remainder alone.
+                    if let Some(remaining) = content_length
+                        && out_info.size >= start_byte.saturating_add(remaining)
                         && !args.newer
                         && !args.overwrite
                     {
                         if !args.quiet {
                             eprintln!("File already fully downloaded.");
+                        }
+                        // --json-verify-hash must still check a pre-existing file
+                        if let Some(expected) = expected_sha256 {
+                            verify_sha256_file(&output_path, expected, args.quiet, dir_cache)?;
                         }
                         return Ok(());
                     }
@@ -4087,8 +4268,22 @@ async fn download_to_temp(
 
     // Verify SHA256 on the temp file BEFORE renaming to the final path.
     // This way a corrupt download never overwrites a good file.
-    if let Some(expected) = expected_sha256 {
-        verify_sha256_file(&temp_path, expected, args.quiet, dir_cache)?;
+    if let Some(expected) = expected_sha256
+        && let Err(e) = verify_sha256_file(&temp_path, expected, args.quiet, dir_cache)
+    {
+        {
+            let mut guard = CURRENT_TEMP_PATH.lock().unwrap();
+            *guard = None;
+        }
+        // A temp file that failed verification must not survive by default:
+        // with the deterministic temp name a later `--temp --continue` run
+        // would see it as size-complete and finalize it. With --keep-temp it
+        // is kept for inspection; the finalize paths re-verify before
+        // promoting it.
+        if !args.keep_temp {
+            let _ = std::fs::remove_file(&temp_path);
+        }
+        return Err(e);
     }
 
     let move_result = perform_atomic_move(&temp_path, output_path, args, dir_cache);
@@ -4334,7 +4529,14 @@ pub fn apply_security_sandbox() -> Result<(), Box<dyn std::error::Error>> {
     ctx.add_rule(ScmpAction::Errno(libc::EPERM), ScmpSyscall::from_name("listen")?)?;
     ctx.add_rule(ScmpAction::Errno(libc::EPERM), ScmpSyscall::from_name("ptrace")?)?;
 
-    // Block specific socket families
+    // Block specific socket families.
+    // NOTE: glibc's getaddrinfo() opens an AF_NETLINK socket (__check_pf) to
+    // enumerate local addresses and may try AF_UNIX to reach nscd or
+    // systemd-resolved. Blocking these relies on glibc's fallback paths: on
+    // socket() failure it assumes both address families are configured and
+    // falls back to plain DNS via resolv.conf. musl is unaffected. If name
+    // resolution ever breaks under this filter, these families are the first
+    // suspects.
     let blocked_families =
         [libc::AF_UNIX, libc::AF_NETLINK, libc::AF_PACKET, libc::AF_BLUETOOTH, libc::AF_VSOCK];
 
