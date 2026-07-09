@@ -2331,94 +2331,147 @@ fn open_file_securely(
     let filename = path.file_name().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "Path has no filename")
     })?;
-
     let dir = get_cached_dir(cache, parent)?;
 
-    let mut file_existed = false;
-    let mut existing_is_regular = false;
-    match dir.symlink_metadata(filename) {
-        Ok(_metadata) => {
-            file_existed = true;
-            existing_is_regular = _metadata.file_type().is_file();
+    let is_append = start_byte > 0;
+    let authorized_replace = args.overwrite || args.resume || args.newer || force_truncate;
 
-            #[cfg(unix)]
-            {
-                use cap_std::fs::MetadataExt;
-                if let Some(device_type) = is_block_or_char_device(_metadata.mode()) {
-                    return if device_type == "block" {
-                        Err(PermanentError::BlockDeviceNotAllowed(path.to_path_buf()).into())
-                    } else {
-                        Err(PermanentError::CharDeviceNotAllowed(path.to_path_buf()).into())
-                    };
+    // Parsed once; applied to every open attempt below.
+    #[cfg(unix)]
+    let file_mode: Option<u32> = if let Some(ref mode_str) = args.filemode {
+        u32::from_str_radix(mode_str, 8).ok()
+    } else {
+        None
+    };
+
+    // The pre-open classification (symlink_metadata) is inherently racy: the
+    // object can change between the stat and the open. It is therefore used only
+    // to *pick a strategy*; safety comes from the open flags (O_EXCL, O_NOFOLLOW,
+    // O_TRUNC) plus the post-open fstat check on the real fd. When an O_EXCL
+    // attempt loses a creation race and replacing is authorized, we re-classify
+    // and retry a bounded number of times instead of failing spuriously.
+    const MAX_ATTEMPTS: u32 = 3;
+    for attempt in 0..MAX_ATTEMPTS {
+        // -- Classify whatever currently sits at the destination --
+        let mut file_existed = false;
+        let mut existing_is_regular = false;
+        match dir.symlink_metadata(filename) {
+            Ok(_metadata) => {
+                file_existed = true;
+                existing_is_regular = _metadata.file_type().is_file();
+                #[cfg(unix)]
+                {
+                    use cap_std::fs::MetadataExt;
+                    // Early, user-friendly rejection only; the authoritative
+                    // device check is the post-open fstat on the fd below.
+                    if let Some(device_type) = is_block_or_char_device(_metadata.mode()) {
+                        return if device_type == "block" {
+                            Err(PermanentError::BlockDeviceNotAllowed(path.to_path_buf()).into())
+                        } else {
+                            Err(PermanentError::CharDeviceNotAllowed(path.to_path_buf()).into())
+                        };
+                    }
                 }
             }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
-    }
-
-    let is_append = start_byte > 0;
-    let mut opts = OpenOptions::new();
-    opts.write(true);
-
-    if is_append {
-        opts.append(true);
-    } else if file_existed
-        && existing_is_regular
-        && (args.overwrite || args.resume || args.newer || force_truncate)
-    {
-        // Existing regular file that we are authorized to replace (--overwrite,
-        // -N, --continue resuming from 0 bytes, or a forced restart; a plain
-        // pre-existing file without those flags was already rejected upstream with
-        // FileAlreadyExists). Delete and recreate it fresh via O_EXCL rather than
-        // truncating in place, so the replacement works regardless of the file's
-        // ownership (unlinking needs write access to the parent directory, not
-        // ownership of the file).
-        match dir.remove_file(filename) {
-            Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
-        opts.create_new(true);
-    } else if file_existed {
-        // Existing entry we will not unlink: a symlink, FIFO, or other non-regular
-        // object (or, defensively, a regular file reached without an authorizing
-        // flag). Open with O_TRUNC (no O_EXCL); combined with O_NOFOLLOW set below
-        // this makes a symlink fail with ELOOP (preserving the anti-symlink
-        // guarantee), while a FIFO opens for writing into the pipe.
-        opts.create(true).truncate(true);
-    } else {
-        // Nothing exists yet: create a brand-new file (O_EXCL keeps it
-        // TOCTOU-safe against a file appearing between the stat and the open).
-        opts.create_new(true);
-    }
 
-    #[cfg(unix)]
-    {
-        use cap_std::fs::OpenOptionsExt;
-
-        let custom_flags = libc::O_NOCTTY | libc::O_NOFOLLOW;
-        opts.custom_flags(custom_flags);
-
-        if let Some(ref mode_str) = args.filemode
-            && let Ok(m) = u32::from_str_radix(mode_str, 8)
+        // -- Pick the open strategy --
+        let mut opts = OpenOptions::new();
+        opts.write(true);
+        #[cfg(unix)]
         {
-            opts.mode(m);
+            use cap_std::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NOCTTY | libc::O_NOFOLLOW);
+            if let Some(m) = file_mode {
+                opts.mode(m);
+            }
+        }
+        // True when the resulting fd may refer to a pre-existing object and must
+        // therefore be fstat-verified after the open. The O_EXCL branches always
+        // yield a brand-new file we just created, so they are exempt.
+        let mut opened_preexisting = false;
+        // True when this attempt uses O_EXCL and can lose a creation race.
+        let mut used_excl = false;
+
+        if is_append {
+            opts.append(true);
+            opened_preexisting = true;
+        } else if file_existed && existing_is_regular && authorized_replace {
+            // Existing regular file that we are authorized to replace (--overwrite,
+            // -N, --continue resuming from 0 bytes, or a forced restart). Delete and
+            // recreate it fresh via O_EXCL rather than truncating in place, so the
+            // replacement works regardless of the file's ownership (unlinking needs
+            // write access to the parent directory, not ownership of the file) and
+            // never writes through the old, possibly hard-linked, inode.
+            match dir.remove_file(filename) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            opts.create_new(true);
+            used_excl = true;
+        } else if file_existed && existing_is_regular {
+            // Defensive: a regular file reached without an authorizing flag. The
+            // pre-download checks already reject this case with FileAlreadyExists,
+            // so reaching it means that check was bypassed or raced -- fail rather
+            // than truncate user data.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "Destination exists",
+            )
+            .into());
+        } else if file_existed {
+            // Existing non-regular object (symlink, FIFO, ...): never unlink or
+            // follow it. Open with O_TRUNC (no O_EXCL); combined with O_NOFOLLOW
+            // set above this makes a symlink fail with ELOOP (preserving the
+            // anti-symlink guarantee), while a FIFO opens for writing into the pipe.
+            opts.create(true).truncate(true);
+            opened_preexisting = true;
+        } else {
+            // Nothing exists yet: create a brand-new file (O_EXCL keeps it
+            // TOCTOU-safe against a file appearing between the stat and the open).
+            opts.create_new(true);
+            used_excl = true;
+        }
+
+        // -- Open and verify --
+        match dir.open_with(filename, &opts) {
+            Ok(cap_file) => {
+                let std_file = cap_file.into_std();
+                // Post-open TOCTOU check whenever the fd may refer to a
+                // pre-existing object: verify on the real fd that it is not a
+                // device and, when appending (unless --insecure-owner), that it
+                // is owned by us. (No-op stub on non-unix.)
+                if opened_preexisting {
+                    check_file_after_open(&std_file, path, is_append, args.insecure_owner)?;
+                }
+                return Ok((std_file, file_existed));
+            }
+            Err(e)
+                if used_excl
+                    && e.kind() == std::io::ErrorKind::AlreadyExists
+                    && authorized_replace
+                    && attempt + 1 < MAX_ATTEMPTS =>
+            {
+                // Lost a creation race while authorized to replace: something
+                // appeared between our stat/remove and the O_EXCL open.
+                // Re-classify and retry: a raced-in regular file is removed like
+                // the original; a raced-in symlink is routed to the
+                // O_TRUNC+O_NOFOLLOW branch and fails with ELOOP; a raced-in
+                // device is caught by the pre-open or post-open device check.
+                continue;
+            }
+            // Unauthorized creation race (plain AlreadyExists, mapped upstream to
+            // FileAppearedDuringDownload), ELOOP from O_NOFOLLOW, and everything
+            // else: fail closed.
+            Err(e) => return Err(e.into()),
         }
     }
-
-    let cap_file = dir.open_with(filename, &opts)?;
-    let std_file = cap_file.into_std();
-
-    // Post-open TOCTOU check only matters when appending: we verify the real fd
-    // is not a device and (unless --insecure-owner) is owned by us. Overwrite and
-    // create-new paths produce a brand-new file we just created via O_EXCL, so no
-    // owner check applies there.
-    if is_append {
-        check_file_after_open(&std_file, path, true, args.insecure_owner)?;
-    }
-
-    Ok((std_file, file_existed))
+    // Every iteration either returns or retries, and the last iteration cannot
+    // retry, so the loop cannot fall through.
+    unreachable!("open_file_securely: retry loop exited without returning")
 }
 
 /// Because cap-std does not expose Linux's renameat2 (with RENAME_NOREPLACE), we use a hybrid
