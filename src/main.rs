@@ -2487,17 +2487,12 @@ fn perform_atomic_move(
                     let _ = dir_from.remove_file(file_from);
                     Ok(())
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
-                Err(_) => {
-                    // Last resort: check existence and standard rename
-                    if dir_to.symlink_metadata(file_to).is_ok() {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::AlreadyExists,
-                            "Destination exists",
-                        ));
-                    }
-                    dir_from.rename(file_from, dir_to, file_to)
-                }
+                // Any error is propagated unchanged: AlreadyExists preserves the
+                // no-replace guarantee, and other errors (e.g. EXDEV, or a
+                // filesystem without hard-link support) must not fall back to a
+                // check-then-rename, because another process could create the
+                // destination between the check and the rename (TOCTOU).
+                Err(e) => Err(e),
             }
         }
     };
