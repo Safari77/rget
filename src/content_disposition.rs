@@ -189,7 +189,7 @@ fn parse_param_content(content: &str) -> ParamContent {
     for unwrap_key in unwrap_key_list {
         let mut unwrapped_value = String::new();
         let mut index = 0;
-        while let Some(wrapped_value_part) = map.remove(&format!("{}*{}", &unwrap_key, index)) {
+        while let Some(wrapped_value_part) = map.remove(&format!("{}*{}", unwrap_key, index)) {
             index += 1;
             unwrapped_value.push_str(&wrapped_value_part);
         }
