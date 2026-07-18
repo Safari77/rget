@@ -3833,6 +3833,8 @@ async fn download_file(
     let mut content_length;
     let mut get_last_modified;
 
+    let mut cd_redirect_count = 0;
+
     // Loop added to safely retry the entire request if we discover a different
     // Content-Disposition dynamically and need to reset an active partial-resume context.
     loop {
@@ -4057,6 +4059,11 @@ async fn download_file(
                 // Range header. When start_byte is 0 the current response already
                 // holds the full body, so there is no need to re-issue.
                 if start_byte > 0 {
+                    if cd_redirect_count >= MAX_REDIRECTS {
+                        return Err(PermanentError::TooManyRedirects(MAX_REDIRECTS).into());
+                    }
+                    cd_redirect_count += 1;
+
                     if !args.quiet {
                         eprintln!(
                             "Filename changed during resume ('{}' -> '{}'), restarting download.",
