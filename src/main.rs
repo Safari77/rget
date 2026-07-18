@@ -2237,10 +2237,7 @@ fn check_file_after_open(
 }
 
 fn check_path_before_open(path: &Path, cache: &mut DirCache) -> Result<bool> {
-    let mut parent = path.parent().unwrap_or_else(|| Path::new("."));
-    if parent.as_os_str().is_empty() {
-        parent = Path::new(".");
-    }
+    let parent = safe_parent(path);
     let filename = path.file_name().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "Path has no filename")
     })?;
@@ -2753,10 +2750,7 @@ fn set_file_mtime(path: &Path, server_time: SystemTime, cache: &mut DirCache) ->
         },
     };
 
-    let mut parent = path.parent().unwrap_or_else(|| Path::new("."));
-    if parent.as_os_str().is_empty() {
-        parent = Path::new(".");
-    }
+    let parent = safe_parent(path);
     let filename = path.file_name().ok_or_else(|| anyhow::anyhow!("Path has no filename"))?;
 
     let dir = get_cached_dir(cache, parent)?;
@@ -2770,10 +2764,7 @@ fn set_file_mtime(path: &Path, server_time: SystemTime, cache: &mut DirCache) ->
 /// Windows fallback: reopen the file securely via DirCache and use std FileTimes.
 #[cfg(not(unix))]
 fn set_file_mtime(path: &Path, server_time: SystemTime, cache: &mut DirCache) -> Result<()> {
-    let mut parent = path.parent().unwrap_or_else(|| Path::new("."));
-    if parent.as_os_str().is_empty() {
-        parent = Path::new(".");
-    }
+    let parent = safe_parent(path);
     let filename = path.file_name().ok_or_else(|| anyhow::anyhow!("Path has no filename"))?;
 
     // 1. Ensure parent directory handle is securely in the cache
