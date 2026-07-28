@@ -3605,7 +3605,8 @@ async fn download_file(
     }
 
     // Stat output file through DirCache for size/mtime checks below
-    let output_info = if !is_stdout { stat_file_via_cache(&output_path, dir_cache)? } else { None };
+    let mut output_info =
+        if !is_stdout { stat_file_via_cache(&output_path, dir_cache)? } else { None };
 
     // Handle -N (--newer) mode: check if remote file is newer than local file
     if args.newer
@@ -3654,7 +3655,7 @@ async fn download_file(
     };
 
     // Stat temp file through DirCache
-    let temp_info =
+    let mut temp_info =
         if let Some(ref tp) = temp_path { stat_file_via_cache(tp, dir_cache)? } else { None };
 
     let mut start_byte: u64 = 0;
@@ -4026,10 +4027,18 @@ async fn download_file(
 
                 check_path_before_open(&output_path, dir_cache)?;
 
+                // Refresh cached metadata for the NEW target: the restarted GET
+                // (If-Modified-Since), the post-loop -N overwrite logic and the 416
+                // finalize path must act on the new path's state, not the old name's.
+                output_info = stat_file_via_cache(&output_path, dir_cache)?;
+                if let Some(ref tp) = temp_path {
+                    temp_info = stat_file_via_cache(tp, dir_cache)?;
+                }
+
                 // Re-evaluate the existing-output guard for the new name (mirrors
                 // the top-of-function logic). A pre-existing target must not be
                 // silently clobbered unless --continue/--overwrite/--newer is set.
-                if let Some(out_info) = stat_file_via_cache(&output_path, dir_cache)? {
+                if let Some(ref out_info) = output_info {
                     // content_length is only the REMAINING byte count when this
                     // is a 206 response, so compare against the full size
                     // (start_byte + remaining), not the remainder alone.
