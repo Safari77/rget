@@ -2594,17 +2594,95 @@ fn perform_atomic_move(
     }
 }
 
-/// Parse Content-Range header to extract the start byte
-/// Format: "bytes START-END/TOTAL" or "bytes START-END/*"
+/// A fully parsed and validated `range-resp` for the `bytes` unit (§14.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContentRangeResp {
+    /// Offset of the first enclosed byte (`first-pos`).
+    first_pos: u64,
+    /// Offset of the last enclosed byte, inclusive (`last-pos`).
+    last_pos: u64,
+    /// Total representation length; `None` when the sender used `*`
+    /// (complete length unknown, §14.4).
+    complete_length: Option<u64>,
+}
+
+/// Parse an RFC 9110 §14.4 `Content-Range` header, returning the start byte
+/// (`first-pos`) of the enclosed range.
+///
+/// Grammar (§14.4):
+///
+/// ```text
+/// Content-Range       = range-unit SP ( range-resp / unsatisfied-range )
+/// range-resp          = incl-range "/" ( complete-length / "*" )
+/// incl-range          = first-pos "-" last-pos
+/// unsatisfied-range   = "*/" complete-length
+/// complete-length     = 1*DIGIT
+/// ```
+///
+/// Fully-compliant behavior for the `bytes` unit:
+///
+/// * Range units are case-insensitive (§14.1); any unit other than `bytes`
+///   fails closed (§14.4: unknown units MUST NOT be recombined).
+/// * `first-pos` / `last-pos` / `complete-length` must each be exactly
+///   `1*DIGIT` — no `+`, no whitespace, no separators — and must fit in a
+///   `u64` (§14.1.2 requires anticipating large numerals without overflow).
+/// * Semantic validity is enforced (§14.4): `last-pos >= first-pos`, and
+///   `complete-length > last-pos` when the length is known.
+/// * The `unsatisfied-range` form (`bytes */1234`, sent with 416) carries no
+///   start position and yields `None`.
+///
+/// `None` means "not a valid byte-range response". Callers treat it as
+/// "cannot validate" — never as a mismatch.
 fn parse_content_range(header_value: &str) -> Option<u64> {
-    let header_value = header_value.trim();
-    if !header_value.starts_with("bytes ") {
+    parse_content_range_resp(header_value).map(|r| r.first_pos)
+}
+
+fn parse_content_range_resp(header_value: &str) -> Option<ContentRangeResp> {
+    // OWS (SP / HTAB) around the field value itself is tolerated; the
+    // Content-Range grammar admits no other whitespace.
+    let value = header_value.trim_matches(|c| c == ' ' || c == '\t');
+
+    // range-unit SP — exactly one space separates unit from range-resp.
+    let (unit, range) = value.split_once(' ')?;
+    if !unit.eq_ignore_ascii_case("bytes") {
         return None;
     }
-    let range_part = &header_value[6..]; // Skip "bytes "
-    let dash_pos = range_part.find('-')?;
-    let start_str = &range_part[..dash_pos];
-    start_str.parse::<u64>().ok()
+
+    // incl-range = first-pos "-" last-pos. The unsatisfied-range form
+    // ("*/1234") has no '-' and fails here naturally — by design, it has
+    // no start position.
+    let (first_pos, rest) = range.split_once('-')?;
+    let first_pos = parse_decimal(first_pos)?;
+
+    let (last_pos, complete_length) = rest.split_once('/')?;
+    let last_pos = parse_decimal(last_pos)?;
+
+    // §14.4: invalid if last-pos is less than first-pos.
+    if last_pos < first_pos {
+        return None;
+    }
+
+    // "*" = complete length unknown when the header was generated (§14.4);
+    // the complete-length check is then impossible and skipped.
+    let complete_length = if complete_length == "*" {
+        None
+    } else {
+        let len = parse_decimal(complete_length)?;
+        // §14.4: invalid if complete-length <= last-pos.
+        if len <= last_pos {
+            return None;
+        }
+        Some(len)
+    };
+
+    Some(ContentRangeResp { first_pos, last_pos, complete_length })
+}
+
+/// Parse `1*DIGIT` as `u64`: pure ASCII digits only — notably rejecting the
+/// leading `+` that `u64::from_str` would wrongly accept — and fail closed
+/// on overflow (§14.1.2).
+fn parse_decimal(s: &str) -> Option<u64> {
+    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) { s.parse().ok() } else { None }
 }
 
 /// Check if an error is permanent (should not be retried)

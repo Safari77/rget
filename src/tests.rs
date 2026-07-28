@@ -661,10 +661,7 @@ fn test_truncate_filename_long_extension() {
 
 #[test]
 fn test_parse_content_range() {
-    assert_eq!(parse_content_range("bytes 0-499/1234"), Some(0));
-    assert_eq!(parse_content_range("bytes 500-999/1234"), Some(500));
     assert_eq!(parse_content_range("bytes 1000-1999/*"), Some(1000));
-    assert_eq!(parse_content_range("bytes 0-0/1"), Some(0));
 
     // Invalid formats
     assert_eq!(parse_content_range("bytes"), None);
@@ -1087,21 +1084,131 @@ fn test_validate_url_gopher_scheme() {
 
 #[test]
 fn test_parse_content_range_overflow() {
-    // Very large numbers that might overflow
+    // first-pos exactly at u64::MAX must still parse (§14.1.2 requires
+    // anticipating large numerals — up to the representable limit).
     assert_eq!(
-        parse_content_range("bytes 18446744073709551615-18446744073709551616/1"),
+        parse_content_range("bytes 18446744073709551615-18446744073709551615/*"),
         Some(u64::MAX)
     );
 
+    assert_eq!(
+        parse_content_range("bytes 18446744073709551614-18446744073709551615/*"),
+        Some(u64::MAX - 1)
+    );
+
+    // This header is doubly invalid under RFC 9110: last-pos = u64::MAX + 1
+    // overflows (§14.1.2), and complete-length (1) <= last-pos (§14.4).
+    // Previously it slipped through because only first-pos was parsed.
+    assert_eq!(parse_content_range("bytes 18446744073709551615-18446744073709551616/1"), None);
+
     // Number larger than u64::MAX
-    let result = parse_content_range("bytes 99999999999999999999999999999-100/1");
-    assert!(result.is_none(), "Should fail on number too large for u64");
+    assert_eq!(parse_content_range("bytes 99999999999999999999999999999-100/1"), None);
 }
 
 #[test]
 fn test_parse_content_range_negative() {
     // Negative numbers (should fail, u64 doesn't support negative)
     assert_eq!(parse_content_range("bytes -1-100/200"), None);
+}
+
+#[test]
+fn test_parse_content_range_ci() {
+    // Range units are case-insensitive (RFC 9110 §14.1.2)
+    assert_eq!(parse_content_range("Bytes 100-199/200"), Some(100));
+}
+
+#[test]
+fn test_parse_content_range_unknown_units_rejected() {
+    // RFC 9110 §14.2: a range unit that is not understood must not be acted
+    // upon. We only issue byte ranges, so every non-bytes unit must fail
+    // closed — regardless of casing.
+    assert_eq!(parse_content_range("octets 0-100/200"), None);
+    assert_eq!(parse_content_range("OCTETS 0-100/200"), None);
+    assert_eq!(parse_content_range("items 0-9/100"), None);
+    assert_eq!(parse_content_range("pages 1-2/10"), None);
+    assert_eq!(parse_content_range("byte 0-100/200"), None); // singular is not "bytes"
+}
+
+#[test]
+fn test_parse_content_range_whitespace_handling() {
+    // Field-value OWS around the whole header is tolerated (common in the wild).
+    assert_eq!(parse_content_range("  bytes 100-199/200"), Some(100));
+    assert_eq!(parse_content_range("bytes 100-199/200  "), Some(100));
+    assert_eq!(parse_content_range("\tbytes 100-199/200\t"), Some(100));
+
+    // But the grammar has exactly one SP between unit and range-spec
+    // (§14.4): Content-Range = range-unit SP range-resp.
+    // A double space shifts the digits into a whitespace-prefixed slice,
+    // which fails u64 parsing — fail closed instead of guessing.
+    assert_eq!(parse_content_range("bytes  100-199/200"), None);
+
+    // A tab is not SP and must be rejected outright (no split point).
+    assert_eq!(parse_content_range("bytes\t100-199/200"), None);
+}
+
+#[test]
+fn test_parse_content_range_unsatisfied_range_form() {
+    // RFC 9110 §14.4: a 416 (Range Not Satisfiable) response uses the
+    // unsatisfied-range form `bytes */complete-length`, which carries NO
+    // start position. It must never be mistaken for a valid resume offset.
+    assert_eq!(parse_content_range("bytes */0"), None);
+    assert_eq!(parse_content_range("Bytes */1234"), None);
+    // Bare asterisk with no complete-length at all:
+    assert_eq!(parse_content_range("bytes *"), None);
+}
+
+#[test]
+fn test_parse_content_range_suffix_range_rejected_in_response() {
+    // RFC 9110 §14.1.1: suffix-range (`bytes=-500`) is request-side grammar
+    // only. A valid Content-Range int-range always has an explicit first-pos,
+    // so an empty start position must fail parsing.
+    assert_eq!(parse_content_range("bytes -500/1000"), None);
+    assert_eq!(parse_content_range("bytes -500/*"), None);
+}
+
+#[test]
+fn test_parse_content_range_leading_zeros() {
+    // first-pos/last-pos are 1*DIGIT; leading zeros are valid and harmless.
+    assert_eq!(parse_content_range("bytes 007-099/200"), Some(7));
+    assert_eq!(parse_content_range("bytes 0000-0000/1"), Some(0));
+}
+
+#[test]
+fn test_parse_content_range_full_range_validated() {
+    // Renamed from `test_parse_content_range_only_start_is_validated`: the
+    // parser now validates the COMPLETE range-resp grammar and semantics
+    // (§14.4) — exactly the hardening that test's comment anticipated: "these
+    // assertions must be flipped to None deliberately."
+
+    // Malformed after the dash → whole header rejected.
+    assert_eq!(parse_content_range("bytes 100-junk/junk"), None);
+
+    // §14.1.1/§14.4: last-pos < first-pos is invalid; a recipient MUST NOT
+    // recombine such content with a stored representation.
+    assert_eq!(parse_content_range("bytes 500-499/1000"), None);
+
+    // §14.1.1: comma-joined range-sets are request-side grammar; they can
+    // never appear in a single-range 206 Content-Range → reject.
+    assert_eq!(parse_content_range("bytes 0-499, 600-799/1234"), None);
+}
+
+#[test]
+fn test_content_range_resume_mismatch_scenario() {
+    // Mirrors the validation in download_file: we requested `bytes={start}-`
+    // and must abort if the 206 response begins elsewhere (§14.2: a 206
+    // carries content corresponding to the satisfiable range requested).
+    let requested: u64 = 123_456;
+
+    // Server honored our offset exactly -> no mismatch.
+    assert_eq!(parse_content_range("bytes 123456-246799/246800"), Some(requested));
+
+    // Server began somewhere else -> ContentRangeMismatch fires (assert_ne).
+    assert_ne!(parse_content_range("bytes 0-123455/246800"), Some(requested));
+    assert_ne!(parse_content_range("bytes 123457-246799/246800"), Some(requested));
+
+    // Unparseable/absent ranges yield None; call sites treat None as
+    // "cannot validate" (check skipped), never as a mismatch.
+    assert_eq!(parse_content_range("garbage"), None);
 }
 
 #[test]
@@ -1127,6 +1234,142 @@ fn test_parse_content_range_malformed() {
             header
         );
     }
+}
+
+// =============================================================================
+// SECTION 5b: Full RFC 9110 §14.4 grammar and semantic validation
+// =============================================================================
+
+#[test]
+fn test_parse_content_range_rfc9110_examples() {
+    // Every range-resp example from §14.4 (selected representation = 1234 bytes).
+    assert_eq!(parse_content_range("bytes 42-1233/1234"), Some(42));
+    assert_eq!(parse_content_range("bytes 42-1233/*"), Some(42));
+    assert_eq!(parse_content_range("bytes 0-499/1234"), Some(0));
+    assert_eq!(parse_content_range("bytes 500-999/1234"), Some(500));
+    assert_eq!(parse_content_range("bytes 500-1233/1234"), Some(500));
+    assert_eq!(parse_content_range("bytes 734-1233/1234"), Some(734));
+    // The §14.4 416 example uses unsatisfied-range grammar: no start byte.
+    assert_eq!(parse_content_range("bytes */1234"), None);
+}
+
+#[test]
+fn test_parse_content_range_last_pos_ordering_enforced() {
+    // §14.4: a range-resp with last-pos < first-pos is invalid ...
+    assert_eq!(parse_content_range("bytes 1-0/2"), None);
+    assert_eq!(parse_content_range("bytes 499-498/1000"), None);
+    assert_eq!(parse_content_range("bytes 18446744073709551615-0/*"), None);
+    // ... while last-pos == first-pos is a perfectly valid 1-byte range.
+    assert_eq!(parse_content_range("bytes 0-0/1"), Some(0));
+    assert_eq!(parse_content_range("bytes 999-999/1000"), Some(999));
+}
+
+#[test]
+fn test_parse_content_range_complete_length_enforced() {
+    // §14.4: invalid when complete-length <= last-pos.
+    assert_eq!(parse_content_range("bytes 0-499/499"), None); // len == last-pos
+    assert_eq!(parse_content_range("bytes 0-499/123"), None); // len <  last-pos
+    assert_eq!(parse_content_range("bytes 1000-1999/1500"), None);
+    assert_eq!(parse_content_range("bytes 0-0/0"), None); // 0-length has no ranges
+    // Smallest valid complete-length is last-pos + 1.
+    assert_eq!(parse_content_range("bytes 0-499/500"), Some(0));
+    assert_eq!(parse_content_range("bytes 500-999/1000"), Some(500));
+    // With "*" the check is impossible and skipped by design.
+    assert_eq!(parse_content_range("bytes 500-999/*"), Some(500));
+}
+
+#[test]
+fn test_parse_content_range_star_complete_length_exact_form() {
+    assert_eq!(parse_content_range("bytes 0-0/*"), Some(0));
+    // The grammar is exactly "*" — nothing around it.
+    assert_eq!(parse_content_range("bytes 0-0/**"), None);
+    assert_eq!(parse_content_range("bytes 0-0/*1"), None);
+    assert_eq!(parse_content_range("bytes 0-0/1*"), None);
+    assert_eq!(parse_content_range("bytes 0-0/ *"), None);
+    assert_eq!(parse_content_range("bytes 0-0/\t*"), None);
+    // ... but OWS around the whole field value remains fine.
+    assert_eq!(parse_content_range("bytes 0-0/* "), Some(0));
+}
+
+#[test]
+fn test_parse_content_range_strict_digits_only() {
+    // u64::from_str would accept a leading '+'; 1*DIGIT does not.
+    assert_eq!(parse_content_range("bytes +100-199/200"), None);
+    assert_eq!(parse_content_range("bytes 100-+199/200"), None);
+    assert_eq!(parse_content_range("bytes 100-199/+200"), None);
+    // No grouping, radix, or exponent forms.
+    assert_eq!(parse_content_range("bytes 1_000-1_999/2000"), None);
+    assert_eq!(parse_content_range("bytes 0x64-199/200"), None);
+    assert_eq!(parse_content_range("bytes 1e2-199/200"), None);
+    // No embedded whitespace inside any numeric field.
+    assert_eq!(parse_content_range("bytes 1 00-199/200"), None);
+    assert_eq!(parse_content_range("bytes 100-19 9/200"), None);
+    assert_eq!(parse_content_range("bytes 100-199/2 00"), None);
+}
+
+#[test]
+fn test_parse_content_range_no_ows_inside_value() {
+    // OWS is stripped around the WHOLE field value only ...
+    assert_eq!(parse_content_range(" \tbytes 0-499/1234\t "), Some(0));
+    // ... never inside range-resp (the grammar admits zero whitespace there).
+    assert_eq!(parse_content_range("bytes 0 -499/1234"), None);
+    assert_eq!(parse_content_range("bytes 0- 499/1234"), None);
+    assert_eq!(parse_content_range("bytes 0-499 /1234"), None);
+    assert_eq!(parse_content_range("bytes 0-499/ 1234"), None);
+}
+
+#[test]
+fn test_parse_content_range_delimiters_and_trailing_garbage() {
+    assert_eq!(parse_content_range("bytes 100"), None); // "-" and "/" missing
+    assert_eq!(parse_content_range("bytes 100-199"), None); // "/" missing
+    assert_eq!(parse_content_range("bytes 100-199/"), None); // empty complete-length
+    assert_eq!(parse_content_range("bytes 100/-200"), None); // empty last-pos
+    assert_eq!(parse_content_range("bytes 100--199/200"), None); // second '-' not DIGIT
+    assert_eq!(parse_content_range("bytes 100-199//200"), None);
+    assert_eq!(parse_content_range("bytes 100-199/200/300"), None);
+    assert_eq!(parse_content_range("bytes 100-199/200 300-399/500"), None);
+    assert_eq!(parse_content_range("bytes 100-199/200,"), None);
+}
+
+#[test]
+fn test_parse_content_range_overflow_in_any_position() {
+    // §14.1.2: large numerals must not cause conversion overflow anywhere.
+    // u64::MAX + 1 in each numeric field:
+    assert_eq!(parse_content_range("bytes 18446744073709551616-5/10"), None);
+    assert_eq!(parse_content_range("bytes 0-18446744073709551616/*"), None);
+    assert_eq!(parse_content_range("bytes 0-1/18446744073709551616"), None);
+    // Absurdly long numerals (100 digits) are handled without panic/overflow:
+    let huge = "9".repeat(100);
+    assert_eq!(parse_content_range(&format!("bytes {huge}-0/1")), None);
+    assert_eq!(parse_content_range(&format!("bytes 0-{huge}/*")), None);
+    assert_eq!(parse_content_range(&format!("bytes 0-1/{huge}")), None);
+    assert_eq!(parse_content_range("bytes 0-18446744073709551614/18446744073709551615"), Some(0));
+}
+
+#[test]
+fn test_parse_content_range_resp_structured() {
+    // The full parser exposes every validated component for future checks.
+    assert_eq!(
+        parse_content_range_resp("bytes 42-1233/1234"),
+        Some(ContentRangeResp { first_pos: 42, last_pos: 1233, complete_length: Some(1234) })
+    );
+    assert_eq!(
+        parse_content_range_resp("bytes 42-1233/*"),
+        Some(ContentRangeResp { first_pos: 42, last_pos: 1233, complete_length: None })
+    );
+    assert_eq!(parse_content_range_resp("bytes */1234"), None);
+    assert_eq!(parse_content_range_resp("bytes 42-41/1234"), None);
+}
+
+#[test]
+fn test_parse_content_range_none_means_cannot_validate() {
+    // Call-site contract: `None` = "cannot validate" → check skipped, never a
+    // ContentRangeMismatch. Hardening the parser can therefore only *skip*
+    // validation on misbehaving servers — it cannot introduce false
+    // mismatches against compliant ones.
+    assert_eq!(parse_content_range("bytes 123456-246799/246800"), Some(123_456));
+    assert_eq!(parse_content_range("bytes 123456-246799/246799"), None); // invalid
+    assert_eq!(parse_content_range("bytes junk"), None);
 }
 
 #[test]
