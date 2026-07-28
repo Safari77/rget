@@ -1221,8 +1221,10 @@ async fn resolve_final_url_and_client(
             response = get_request.send().await.context("Failed to send GET request")?;
         }
 
-        if !args.no_hsts_update && current_url.scheme() == "https" {
-            // RFC 6797 §8.1: STS headers received over insecure (http) transport MUST be ignored.
+        if !args.no_hsts_update && !args.insecure && current_url.scheme() == "https" {
+            // RFC 6797 §8.1: STS headers received over insecure (http) transport MUST be ignored;
+            // likewise, a TLS connection whose certificate was not verified
+            // (--insecure) must not seed the persistent HSTS database.
             update_hsts(hsts_db, &current_url, response.headers(), args.debug);
         }
 
