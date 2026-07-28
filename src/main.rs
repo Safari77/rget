@@ -1243,9 +1243,10 @@ async fn resolve_final_url_and_client(
         let status = response.status();
         let headers = response.headers().clone();
 
-        if status.is_redirection()
-            && let Some(location) = headers.get(LOCATION)
-        {
+        if status.is_redirection() {
+            let Some(location) = headers.get(LOCATION) else {
+                return Err(PermanentError::RedirectWithoutLocation(status.as_u16()).into());
+            };
             let location_str = location.to_str().context("Invalid Location header")?;
             let next_url =
                 current_url.join(location_str).context("Failed to resolve redirect URL")?;
