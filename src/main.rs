@@ -1006,7 +1006,12 @@ fn build_client(
     let mut builder = Client::builder()
         .use_rustls_tls()
         .redirect(reqwest::redirect::Policy::none()) // Manual redirects
-        .user_agent(args.user_agent.as_deref().unwrap_or(concat!(env!("CARGO_PKG_NAME"), "/1.0")))
+        //.user_agent(args.user_agent.as_deref().unwrap_or(concat!(env!("CARGO_PKG_NAME"), "/1.0"))) // alternative
+        .user_agent(args.user_agent.as_deref().unwrap_or(concat!(
+            env!("CARGO_PKG_NAME"),
+            "/",
+            env!("CARGO_PKG_VERSION")
+        )))
         .connect_timeout(Duration::from_secs(30))
         .no_gzip()
         .no_brotli()
