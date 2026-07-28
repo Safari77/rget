@@ -3467,7 +3467,7 @@ async fn process_json_downloads(
             let digest_opt = entry.hash.as_deref().filter(|s| !s.is_empty());
             if let Some(digest_str) = digest_opt {
                 if let Some((algo, hex_hash)) = parse_digest_field(digest_str) {
-                    if algo != "sha256" {
+                    if !algo.eq_ignore_ascii_case("sha256") {
                         eprintln!(
                             "Failed: {}",
                             PermanentError::JsonHashUnsupportedAlgo(algo.to_string())
