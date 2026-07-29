@@ -373,6 +373,11 @@ const DEFAULT_PERSONALIZATION: &str = "rget-default-key-v1";
 /// Maximum filename length in bytes (POSIX NAME_MAX is typically 255)
 const MAX_FILENAME_BYTES: usize = 255;
 
+/// Longest suffix (including the leading dot) still treated as an extension
+/// when a filename has to be shortened. Anything longer is considered part of
+/// the name itself and is truncated away like the rest of it.
+const MAX_EXTENSION_BYTES: usize = 20;
+
 /// Config file name (placed in platform-specific config directory)
 /// - Linux: ~/.config/rget/resumekey.conf
 /// - macOS: ~/Library/Application Support/rget/resumekey.conf
@@ -442,6 +447,7 @@ struct Args {
     #[arg(
         short = 'P',
         long = "output-dir",
+        conflicts_with = "output",
         help = "Output directory (must exist, not created automatically)"
     )]
     output_dir: Option<String>,
@@ -1404,10 +1410,17 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
         }
     }
 
-    // Validate --output-dir + --output=-  is contradictory
-    if args.output_dir.is_some() && args.output.as_deref() == Some("-") {
+    // --output and --output-dir are mutually exclusive: -O already names the
+    // full destination path, so combining the two is ambiguous (and with
+    // '-O -' outright contradictory). Normally clap rejects this at parse time
+    // (conflicts_with on output_dir); this check is the safety net for Args
+    // built programmatically. NOTE: it deliberately runs on the top-level args
+    // only -- JSON mode sets entry_args.output from --json-name-field and does
+    // rely on --output-dir prefixing that name.
+    if args.output_dir.is_some() && args.output.is_some() {
         return Err(PermanentError::InvalidArguments(
-            "--output-dir cannot be used with --output - (stdout)".to_string(),
+            "--output-dir cannot be used with --output (-O already specifies the full path)"
+                .to_string(),
         )
         .into());
     }
@@ -1669,22 +1682,28 @@ fn truncate_str_to_byte_limit(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+/// Split a filename into (base, extension) for shortening purposes.
+/// The returned extension includes the leading dot and always satisfies
+/// `format!("{}{}", base, ext) == filename`.
+/// Only treat as extension if it's reasonable (not at start, not too long).
+fn split_filename_ext(filename: &str) -> (&str, &str) {
+    if let Some(dot_pos) = filename.rfind('.')
+        && dot_pos > 0
+        && filename.len() - dot_pos <= MAX_EXTENSION_BYTES
+    {
+        (&filename[..dot_pos], &filename[dot_pos..])
+    } else {
+        (filename, "")
+    }
+}
+
 /// Truncate a filename to fit within MAX_FILENAME_BYTES, preserving extension if possible.
 fn truncate_filename_to_limit(filename: &str) -> String {
     if filename.len() <= MAX_FILENAME_BYTES {
         return filename.to_string();
     }
 
-    let (base, ext) = if let Some(dot_pos) = filename.rfind('.') {
-        // Only treat as extension if it's reasonable (not at start, not too long)
-        if dot_pos > 0 && filename.len() - dot_pos <= 20 {
-            (&filename[..dot_pos], &filename[dot_pos..])
-        } else {
-            (filename, "")
-        }
-    } else {
-        (filename, "")
-    };
+    let (base, ext) = split_filename_ext(filename);
 
     let ext_bytes = ext.len();
     let max_base_bytes = MAX_FILENAME_BYTES.saturating_sub(ext_bytes);
@@ -2755,6 +2774,10 @@ fn is_permanent_error(err: &anyhow::Error) -> bool {
                     | ErrorKind::IsADirectory
                     | ErrorKind::StorageFull
                     | ErrorKind::BrokenPipe
+                    // ENAMETOOLONG: filenames are truncated proactively in
+                    // download_file, so if it still surfaces (e.g. filesystem
+                    // NAME_MAX < MAX_FILENAME_BYTES) retrying cannot help
+                    | ErrorKind::InvalidFilename
                     | ErrorKind::QuotaExceeded // | ErrorKind::FilesystemLoop // https://github.com/rust-lang/rust/issues/86442
             ) {
                 return true;
@@ -2881,6 +2904,10 @@ fn set_mtime_on_fd(file: &std::fs::File, mtime: SystemTime) -> Result<()> {
 /// Generate a numbered filename to avoid collisions.
 /// With keep_extension=false: file.ext -> file.ext.1
 /// With keep_extension=true: file.ext -> file.1.ext
+/// The result never exceeds MAX_FILENAME_BYTES: when appending the number would
+/// push it over (the name was already truncated to the limit), the base is
+/// shortened to make room. The number itself is always preserved, otherwise the
+/// numbered variants would collide with each other.
 fn generate_numbered_filename(path: &Path, number: u32, keep_extension: bool) -> PathBuf {
     let parent = path.parent().unwrap_or(Path::new("."));
     let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("download");
@@ -2897,7 +2924,40 @@ fn generate_numbered_filename(path: &Path, number: u32, keep_extension: bool) ->
         format!("{}.{}", filename, number)
     };
 
+    let new_name = if new_name.len() > MAX_FILENAME_BYTES {
+        truncate_numbered_filename(filename, number, keep_extension)
+    } else {
+        new_name
+    };
+
     parent.join(new_name)
+}
+
+/// Shorten `filename` so that it still fits within MAX_FILENAME_BYTES once the
+/// --multiple-copies number is appended. Only the base is shortened; the number
+/// and (when it stays at the end) the extension are preserved.
+fn truncate_numbered_filename(filename: &str, number: u32, keep_extension: bool) -> String {
+    let (base, ext) = split_filename_ext(filename);
+
+    // Everything that must survive: the ".N" and the extension, in whichever
+    // order this mode places them.
+    let suffix = if keep_extension {
+        format!(".{}{}", number, ext) // file.1.ext
+    } else {
+        format!("{}.{}", ext, number) // file.ext.1
+    };
+
+    if suffix.len() >= MAX_FILENAME_BYTES {
+        // No room left for any of the base: drop the extension and truncate the
+        // whole name, keeping only the number (which is at most 10 digits, so
+        // this always fits).
+        let num = format!(".{}", number);
+        let max_base_bytes = MAX_FILENAME_BYTES.saturating_sub(num.len());
+        return format!("{}{}", truncate_str_to_byte_limit(filename, max_base_bytes), num);
+    }
+
+    let max_base_bytes = MAX_FILENAME_BYTES - suffix.len();
+    format!("{}{}", truncate_str_to_byte_limit(base, max_base_bytes), suffix)
 }
 
 /// Resolve a unique output path, handling --multiple-copies numbering.
@@ -3649,6 +3709,25 @@ async fn download_file(
         }
     }
 
+    // Proactively truncate an over-long filename so the stat/open calls below
+    // do not fail with ENAMETOOLONG (which would surface from
+    // check_path_before_open before the reactive truncation in download_direct
+    // / perform_atomic_move gets a chance to run). Keeps the extension when one
+    // is present (see truncate_filename_to_limit). Paths without a valid UTF-8
+    // filename fall through to the existing error handling below.
+    if !is_stdout
+        && let Some(fname) = output_path.file_name().and_then(|s| s.to_str())
+        && fname.len() > MAX_FILENAME_BYTES
+    {
+        let truncated_name = truncate_filename_to_limit(fname);
+        let truncated_path = output_path.parent().unwrap_or(Path::new(".")).join(&truncated_name);
+        if !args.quiet {
+            eprintln!("Filename too long, truncating to: {}", truncated_path.display());
+        }
+        output_path = truncated_path;
+        final_filename = truncated_name;
+    }
+
     // Handle --multiple-copies: resolve unique output path before any file checks.
     // On retry attempts the path pinned by the first attempt is reused:
     // re-resolving with the auto-set resume flag would skip collision numbering
@@ -4070,6 +4149,23 @@ async fn download_file(
                 } else {
                     PathBuf::from(&final_filename)
                 };
+
+                // Proactively truncate the new name too (same rules as the
+                // initial path above). head_filename intentionally keeps the
+                // untruncated name so a re-issued GET carrying the same
+                // Content-Disposition does not re-trigger this branch.
+                if let Some(fname) = output_path.file_name().and_then(|s| s.to_str())
+                    && fname.len() > MAX_FILENAME_BYTES
+                {
+                    let truncated_name = truncate_filename_to_limit(fname);
+                    let truncated_path =
+                        output_path.parent().unwrap_or(Path::new(".")).join(&truncated_name);
+                    if !args.quiet {
+                        eprintln!("Filename too long, truncating to: {}", truncated_path.display());
+                    }
+                    output_path = truncated_path;
+                    final_filename = truncated_name;
+                }
 
                 // The output path changed, so re-run the same collision/existence
                 // checks that were performed for the original name at the top of
