@@ -4719,13 +4719,16 @@ async fn write_response_to_file<W: AsyncWrite + Unpin>(
                 bytes_written += chunk_len;
                 accumulated_bytes += chunk_len;
 
+                // Reset inactivity timeout on EVERY chunk received,
+                // not just when the UI updates.
+                sleep_timer.as_mut().reset(Instant::now() + Duration::from_secs(args.timeout));
+
                 // Throttled UI updates
                 if last_update.elapsed().as_millis() > 25 {
                     if !args.quiet {
                         pb.inc(accumulated_bytes);
                     }
                     accumulated_bytes = 0;
-                    sleep_timer.as_mut().reset(Instant::now() + Duration::from_secs(args.timeout));
                     last_update = Instant::now();
                 }
             }
@@ -4833,10 +4836,9 @@ async fn main() -> ExitCode {
         },
         _ = shutdown_signal() => {
             let keep_temp = KEEP_TEMP_ON_CANCEL.load(Ordering::SeqCst);
+            let temp_path = CURRENT_TEMP_PATH.lock().unwrap().take();
 
             if keep_temp {
-                // Check if there's a temp file to keep
-                let temp_path = CURRENT_TEMP_PATH.lock().unwrap().clone();
                 if let Some(tp) = temp_path {
                     eprintln!("\nDownload cancelled. Keeping temporary file: {}", tp.display());
                     eprintln!("Resume with: {} --temp --continue <url>", env!("CARGO_PKG_NAME"));
@@ -4844,9 +4846,9 @@ async fn main() -> ExitCode {
                     eprintln!("\nDownload cancelled.");
                 }
             } else {
-                // Clean up temp file if exists
-                let temp_path = CURRENT_TEMP_PATH.lock().unwrap().take();
                 if let Some(tp) = temp_path {
+                    // Blocking I/O is acceptable here: the runtime is shutting down
+                    // and no other tasks can be running.
                     if tp.exists() {
                         let _ = fs::remove_file(&tp);
                         eprintln!("\nDownload cancelled. Temporary file removed.");
