@@ -2531,50 +2531,158 @@ fn perform_atomic_move(
 
         let overwrite_or_resume = args.overwrite || args.resume;
 
-        // LINUX FAST-PATH: Use rustix for RENAME_NOREPLACE using the cap-std file descriptors
-        #[cfg(target_os = "linux")]
+        // ─── LINUX FAST-PATH (excluding Android) ───────────────────────────
+        // Use rustix for RENAME_NOREPLACE via cap-std file descriptors.
+        // Android is excluded because its FUSE layer and SELinux policies
+        // make renameat2 behavior inconsistent and hard_link unreliable.
+        #[cfg(all(target_os = "linux", not(target_os = "android")))]
         {
             use rustix::fs::RenameFlags;
             use std::os::fd::AsFd;
 
-            let flags =
-                if overwrite_or_resume { RenameFlags::empty() } else { RenameFlags::NOREPLACE };
-
-            match rustix::fs::renameat_with(
+            // Always attempt NOREPLACE first — it's the only truly atomic
+            // no-clobber primitive. Even when overwriting, trying NOREPLACE
+            // first gives us an atomic "target doesn't exist" confirmation.
+            let noreplace_result = rustix::fs::renameat_with(
                 dir_from.as_fd(),
                 file_from,
                 dir_to.as_fd(),
                 file_to,
-                flags,
-            ) {
+                RenameFlags::NOREPLACE,
+            );
+
+            match noreplace_result {
                 Ok(_) => return Ok(()),
-                Err(e) if e == rustix::io::Errno::EXIST => return Err(std::io::Error::from(e)),
-                Err(_) => {} // Fallthrough to std fallbacks for EXDEV / unsupported NOREPLACE
+
+                // Target exists: if overwrite is allowed, retry with plain rename
+                Err(rustix::io::Errno::EXIST) if overwrite_or_resume => {
+                    match rustix::fs::renameat_with(
+                        dir_from.as_fd(),
+                        file_from,
+                        dir_to.as_fd(),
+                        file_to,
+                        RenameFlags::empty(),
+                    ) {
+                        Ok(_) => return Ok(()),
+                        Err(e) => return Err(std::io::Error::from(e)),
+                    }
+                }
+
+                // Target exists but overwrite not allowed → propagate AlreadyExists
+                Err(rustix::io::Errno::EXIST) => {
+                    return Err(std::io::Error::from(rustix::io::Errno::EXIST));
+                }
+
+                // Cross-device link: fall through to cap-std which handles EXDEV
+                Err(rustix::io::Errno::XDEV) => {}
+
+                // Syscall genuinely unsupported: fall through to cap-std fallback
+                Err(
+                    rustix::io::Errno::NOSYS | rustix::io::Errno::NOTSUP | rustix::io::Errno::INVAL,
+                ) => {}
+
+                // ALL OTHER ERRORS (EACCES, EPERM, EIO, ENOSPC, etc.)
+                // MUST propagate immediately. Never swallow these.
+                Err(e) => return Err(std::io::Error::from(e)),
             }
         }
 
-        // CROSS-PLATFORM / FALLBACK PATH using cap-std
+        // ─── ANDROID-SPECIFIC PATH ─────────────────────────────────────────
+        // Android's FUSE layer supports renameat2(NOREPLACE) in many cases
+        // but hard_link() reliably returns EACCES. We use renameat2 via
+        // rustix when possible, then fall back to cap-std rename (never
+        // hard_link).
+        #[cfg(target_os = "android")]
+        {
+            use rustix::fs::RenameFlags;
+            use std::os::fd::AsFd;
+
+            // Try NOREPLACE first — strace confirms this works on Termux FUSE
+            let noreplace_result = rustix::fs::renameat_with(
+                dir_from.as_fd(),
+                file_from,
+                dir_to.as_fd(),
+                file_to,
+                RenameFlags::NOREPLACE,
+            );
+
+            match noreplace_result {
+                Ok(_) => return Ok(()),
+
+                // Target exists and overwrite allowed: plain rename
+                Err(rustix::io::Errno::EXIST) if overwrite_or_resume => {
+                    match rustix::fs::renameat_with(
+                        dir_from.as_fd(),
+                        file_from,
+                        dir_to.as_fd(),
+                        file_to,
+                        RenameFlags::empty(),
+                    ) {
+                        Ok(_) => return Ok(()),
+                        Err(e) => return Err(std::io::Error::from(e)),
+                    }
+                }
+
+                // Target exists, no overwrite
+                Err(rustix::io::Errno::EXIST) => {
+                    return Err(std::io::Error::from(rustix::io::Errno::EXIST));
+                }
+
+                // renameat2 entirely unsupported on this Android build/kernel:
+                // fall through to cap-std rename below (NOT hard_link)
+                Err(
+                    rustix::io::Errno::NOSYS | rustix::io::Errno::NOTSUP | rustix::io::Errno::INVAL,
+                ) => {}
+
+                // Cross-device: fall through to cap-std
+                Err(rustix::io::Errno::XDEV) => {}
+
+                // Real errors propagate immediately
+                Err(e) => return Err(std::io::Error::from(e)),
+            }
+
+            // Fallback for Android when renameat2 is unsupported:
+            // cap-std rename WITHOUT hard_link (hard_link returns EACCES on FUSE)
+            if overwrite_or_resume {
+                return dir_from.rename(file_from, dir_to, file_to);
+            } else {
+                // Non-atomic check-then-rename: accepted TOCTOU risk because
+                // Android FUSE provides no atomic no-clobber alternative.
+                // The pre-download existence checks already passed; this is
+                // a last-resort safety net, not a guarantee.
+                if dir_to.symlink_metadata(file_to).is_ok() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "target exists and atomic no-replace is unsupported on this filesystem",
+                    ));
+                }
+                return dir_from.rename(file_from, dir_to, file_to);
+            }
+        }
+
+        // ─── CROSS-PLATFORM FALLBACK (macOS, Windows, other Unix) ─────────
+        // Only reached on non-Linux/non-Android, or on Linux when renameat2
+        // returned NOSYS/NOTSUP/INVAL/XDEV.
         if overwrite_or_resume {
-            // Atomic replace
             dir_from.rename(file_from, dir_to, file_to)
         } else {
-            // Safe fallback for NOREPLACE: hardlink then remove
+            // Safe NOREPLACE emulation via hard_link + remove.
+            // This is safe on macOS/Windows/real Linux filesystems.
+            // Never reached on Android (handled above).
             match dir_from.hard_link(file_from, dir_to, file_to) {
                 Ok(()) => {
                     let _ = dir_from.remove_file(file_from);
                     Ok(())
                 }
-                // Any error is propagated unchanged: AlreadyExists preserves the
-                // no-replace guarantee, and other errors (e.g. EXDEV, or a
-                // filesystem without hard-link support) must not fall back to a
-                // check-then-rename, because another process could create the
-                // destination between the check and the rename (TOCTOU).
+                // AlreadyExists preserves the no-replace guarantee.
+                // EXDEV or unsupported hard_link must NOT fall back to
+                // check-then-rename (TOCTOU vulnerability).
                 Err(e) => Err(e),
             }
         }
     };
 
-    // The rest of your logic handles retries and ENAMETOOLONG
+    // ─── RETRY / ERROR HANDLING WRAPPER ────────────────────────────────────
     match try_move(temp_path, target_path, cache) {
         Ok(_) => Ok(target_path.to_path_buf()),
 
@@ -2582,9 +2690,8 @@ fn perform_atomic_move(
             if args.overwrite || args.resume {
                 Err(e.into())
             } else {
-                // The pre-download existence checks already passed for this
-                // target, so AlreadyExists at rename time means the file
-                // appeared during the download (TOCTOU race).
+                // Pre-download existence checks passed, so AlreadyExists at
+                // rename time means the file appeared during download (TOCTOU).
                 Err(PermanentError::FileAppearedDuringDownload(target_path.to_path_buf()).into())
             }
         }
