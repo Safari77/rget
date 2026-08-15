@@ -150,6 +150,7 @@ pub enum PermanentError {
     JsonNoUrlsExtracted,
     JsonUrlHashCountMismatch { urls: usize, hashes: usize },
     JsonUrlNameCountMismatch { urls: usize, names: usize },
+    JsonUrlSizeCountMismatch { urls: usize, sizes: usize },
     JsonHashMissing(String),
     JsonHashMismatch { file: String, expected: String, actual: String },
     JsonHashUnsupportedAlgo(String),
@@ -316,6 +317,13 @@ impl std::fmt::Display for PermanentError {
                     f,
                     "--json-url-field extracted {} URLs but --json-name-field extracted {} names (must be equal)",
                     urls, names
+                )
+            }
+            Self::JsonUrlSizeCountMismatch { urls, sizes } => {
+                write!(
+                    f,
+                    "--json-url-field extracted {} URLs but --json-size-field extracted {} sizes (must be equal)",
+                    urls, sizes
                 )
             }
             Self::JsonHashMissing(file) => {
@@ -664,6 +672,10 @@ struct Args {
         help = "JSON path to output filename field (e.g. .assets[].name)"
     )]
     json_name_field: Option<String>,
+
+    /// JSON path expression to extract expected file size (parallel to --json-url-field)
+    #[arg(long = "json-size-field", help = "JSON path to file size field (e.g. .assets[].size)")]
+    json_size_field: Option<String>,
 
     /// Regex to filter URLs extracted from JSON
     #[arg(
@@ -1178,7 +1190,17 @@ async fn resolve_final_url_and_client(
                 || std::env::var("http_proxy").is_ok()
                 || std::env::var("https_proxy").is_ok())
         {
-            build_client(args, None, tls_config)?
+            let cache_key = "__proxy_client__";
+            if let Some(cached_client) = client_cache.get(cache_key) {
+                if args.verbose {
+                    eprintln!("   Reusing connection via proxy");
+                }
+                cached_client.clone()
+            } else {
+                let new_client = build_client(args, None, tls_config)?;
+                client_cache.insert(cache_key.to_string(), new_client.clone());
+                new_client
+            }
         } else {
             let host = current_url.host_str().ok_or_else(|| anyhow::anyhow!("No host in URL"))?;
 
@@ -1368,16 +1390,17 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
     if args.json_verify_hash && args.json_hash_field.is_none() {
         return Err(PermanentError::JsonVerifyHashWithoutHashField.into());
     }
-    // --json-hash-field, --json-name-field, --json-filter, --json-verify-hash imply --json-parse
+    // --json-hash-field, --json-name-field, --json-size-field, --json-filter, --json-verify-hash imply --json-parse
     if (args.json_url_field.is_some()
         || args.json_hash_field.is_some()
         || args.json_name_field.is_some()
+        || args.json_size_field.is_some()
         || args.json_filter.is_some()
         || args.json_verify_hash)
         && !args.json_parse
     {
         return Err(PermanentError::InvalidArguments(
-            "--json-url-field, --json-hash-field, --json-name-field, --json-filter, and --json-verify-hash require --json-parse".to_string()
+            "--json-url-field, --json-hash-field, --json-name-field, --json-size-field, --json-filter, and --json-verify-hash require --json-parse".to_string()
         ).into());
     }
 
@@ -1777,6 +1800,21 @@ fn is_private_ip(ip: &IpAddr) -> bool {
                     .to_ipv4_mapped()
                     .map(|v4| is_private_ip(&IpAddr::V4(v4)))
                     .unwrap_or(false)
+                // IPv4-compatible IPv6 (deprecated RFC 4291 §2.5.5.1): ::x.x.x.x
+                || (ipv6.segments()[0] == 0
+                    && ipv6.segments()[1] == 0
+                    && ipv6.segments()[2] == 0
+                    && ipv6.segments()[3] == 0
+                    && ipv6.segments()[4] == 0
+                    && ipv6.segments()[5] == 0
+                    && !ipv6.is_unspecified()
+                    && !ipv6.is_loopback()
+                    && is_private_ip(&IpAddr::V4(std::net::Ipv4Addr::new(
+                        (ipv6.segments()[6] >> 8) as u8,
+                        (ipv6.segments()[6] & 0xff) as u8,
+                        (ipv6.segments()[7] >> 8) as u8,
+                        (ipv6.segments()[7] & 0xff) as u8,
+                    ))))
         }
     }
 }
@@ -3020,7 +3058,10 @@ fn generate_numbered_filename(path: &Path, number: u32, keep_extension: bool) ->
     let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("download");
 
     let new_name = if keep_extension {
-        if let Some(dot_pos) = filename.rfind('.') {
+        if let Some(dot_pos) = filename.rfind('.')
+            && dot_pos > 0
+            && filename.len() - dot_pos <= MAX_EXTENSION_BYTES
+        {
             let base = &filename[..dot_pos];
             let ext = &filename[dot_pos..]; // includes the dot
             format!("{}.{}{}", base, number, ext)
@@ -3179,13 +3220,22 @@ fn parse_jq_path(path: &str) -> Result<Vec<JqSegment>> {
                 }
                 chars.next(); // consume '['
                 let mut bracket_content = String::new();
+                let mut closed = false;
                 while let Some(&bc) = chars.peek() {
                     if bc == ']' {
                         chars.next(); // consume ']'
+                        closed = true;
                         break;
                     }
                     bracket_content.push(bc);
                     chars.next();
+                }
+                if !closed {
+                    return Err(PermanentError::JsonPathError(format!(
+                        "Unclosed bracket in path expression: [{}]",
+                        bracket_content
+                    ))
+                    .into());
                 }
                 if bracket_content.is_empty() {
                     segments.push(JqSegment::ArrayIter);
@@ -3379,6 +3429,7 @@ struct JsonDownloadEntry {
     url: String,
     name: Option<String>,
     hash: Option<String>, // raw digest field value
+    size: Option<u64>,
 }
 
 /// Fetch JSON body from a URL (using existing client/redirect infrastructure).
@@ -3529,6 +3580,38 @@ async fn process_json_downloads(
         None
     };
 
+    // 5b. Extract sizes (if specified)
+    let sizes: Option<Vec<Option<u64>>> = if let Some(ref size_field) = args.json_size_field {
+        let s_vals = json_path_extract(&json_value, size_field)?;
+        if args.debug {
+            eprintln!(
+                "[DEBUG] Extracted {} size(s) from JSON path '{}':",
+                s_vals.len(),
+                size_field
+            );
+            for (i, sv) in s_vals.iter().enumerate() {
+                eprintln!("[DEBUG]   [{}] {}", i, sv);
+            }
+        }
+        if s_vals.len() != urls.len() {
+            return Err(PermanentError::JsonUrlSizeCountMismatch {
+                urls: urls.len(),
+                sizes: s_vals.len(),
+            }
+            .into());
+        }
+        let parsed_sizes: Vec<Option<u64>> = s_vals
+            .into_iter()
+            .map(|s| {
+                let trimmed = s.trim().trim_matches('"');
+                trimmed.parse::<u64>().ok()
+            })
+            .collect();
+        Some(parsed_sizes)
+    } else {
+        None
+    };
+
     // 6. Build entries
     let mut entries: Vec<JsonDownloadEntry> = Vec::new();
     for (i, url_str) in urls.iter().enumerate() {
@@ -3536,6 +3619,7 @@ async fn process_json_downloads(
             url: url_str.clone(),
             name: names.as_ref().map(|n| n[i].clone()),
             hash: hashes.as_ref().map(|h| h[i].clone()),
+            size: sizes.as_ref().and_then(|s| s[i]),
         });
     }
 
@@ -3561,7 +3645,7 @@ async fn process_json_downloads(
     }
 
     // 7b. Drop entries whose URL is the empty-string sentinel produced when a
-    // .url field is null or missing in the JSON. The parallel fields (hash/name)
+    // .url field is null or missing in the JSON. The parallel fields (hash/name/size)
     // are still aligned within each JsonDownloadEntry, so dropping by entry is safe.
     let before_sentinel_drop = entries.len();
     entries.retain(|e| !e.url.is_empty());
@@ -3582,6 +3666,9 @@ async fn process_json_downloads(
         for (i, entry) in entries.iter().enumerate() {
             let display_name = entry.name.as_deref().unwrap_or("(from URL)");
             eprintln!("  [{}] {} ({})", i + 1, display_name, entry.url);
+            if let Some(s) = entry.size {
+                eprintln!("      size: {} ({} bytes)", HumanBytes(s), s);
+            }
             if let Some(ref hash) = entry.hash {
                 eprintln!("      hash: {}", hash);
             }
@@ -3642,6 +3729,17 @@ async fn process_json_downloads(
                         failed_count += 1;
                         continue;
                     }
+                    if hex_hash.len() != 64 || !hex_hash.chars().all(|c| c.is_ascii_hexdigit()) {
+                        eprintln!(
+                            "Failed: {}",
+                            PermanentError::JsonHashInvalidFormat {
+                                url: entry.url.clone(),
+                                digest: digest_str.to_string(),
+                            }
+                        );
+                        failed_count += 1;
+                        continue;
+                    }
                     Some(hex_hash.to_lowercase())
                 } else {
                     eprintln!(
@@ -3696,7 +3794,10 @@ async fn process_json_downloads(
                             eprintln!("Final URL: {}", final_url);
                         }
 
-                        if let (Some(max), Some(size)) = (current_args.max_size, content_length)
+                        let effective_content_length = content_length.or(entry.size);
+
+                        if let (Some(max), Some(size)) =
+                            (current_args.max_size, effective_content_length)
                             && size > max
                         {
                             return Err(PermanentError::FileSizeExceedsLimit {
@@ -3710,7 +3811,7 @@ async fn process_json_downloads(
                             &dl_client,
                             &final_url,
                             &current_args,
-                            content_length,
+                            effective_content_length,
                             content_disposition.as_deref(),
                             last_modified.as_deref(),
                             &mut attempt_used_filenames,
@@ -3839,13 +3940,30 @@ async fn download_file(
     // On retry attempts the path pinned by the first attempt is reused:
     // re-resolving with the auto-set resume flag would skip collision numbering
     // and append the resumed download into an unrelated pre-existing file.
+    let mut initial_canonical_key: Option<PathBuf> = None;
     if !is_stdout {
         if let Some(prev) = resolved_output.as_ref() {
             output_path = prev.clone();
             if let Some(fname) = output_path.file_name().and_then(|s| s.to_str()) {
                 final_filename = fname.to_string();
             }
+            // Re-record in used_filenames so that retries commit the registered output path
+            let canonical_key = if let Some(output) = &args.output {
+                PathBuf::from(output)
+            } else if let Some(ref dir_str) = args.output_dir {
+                Path::new(dir_str).join(&head_filename)
+            } else {
+                PathBuf::from(&head_filename)
+            };
+            if args.multiple_copies {
+                let entry = used_filenames.entry(canonical_key.clone()).or_insert(1);
+                *entry = (*entry).max(2);
+            } else {
+                used_filenames.insert(canonical_key.clone(), 1);
+            }
+            initial_canonical_key = Some(canonical_key);
         } else {
+            let unnumbered_output_path = output_path.clone();
             let (resolved_path, was_renamed) =
                 resolve_unique_output_path(&output_path, args, used_filenames, dir_cache)?;
             if was_renamed && !args.quiet {
@@ -3861,6 +3979,7 @@ async fn download_file(
                 final_filename = fname.to_string();
             }
             *resolved_output = Some(output_path.clone());
+            initial_canonical_key = Some(unnumbered_output_path);
         }
     }
 
@@ -3884,15 +4003,36 @@ async fn download_file(
         {
             if let Some(local_mtime) = out_info.modified {
                 if server_time <= local_mtime {
-                    if !args.quiet {
-                        eprintln!(
-                            "Server file is not newer than local file '{}', skipping.",
-                            output_path.display()
-                        );
+                    // Check if local file size matches expected server size (if known)
+                    if let Some(total) = expected_length {
+                        if out_info.size == total {
+                            if !args.quiet {
+                                eprintln!(
+                                    "Server file is not newer than local file '{}', skipping.",
+                                    output_path.display()
+                                );
+                            }
+                            if let Some(expected) = expected_sha256 {
+                                verify_sha256_file(&output_path, expected, args.quiet, dir_cache)?;
+                            }
+                            return Ok(());
+                        } else if args.verbose {
+                            eprintln!(
+                                "Local file size ({}) differs from server ({}), downloading entire file.",
+                                HumanBytes(out_info.size),
+                                HumanBytes(total)
+                            );
+                        }
+                    } else {
+                        if !args.quiet {
+                            eprintln!(
+                                "Server file is not newer than local file '{}', skipping.",
+                                output_path.display()
+                            );
+                        }
+                        return Ok(());
                     }
-                    return Ok(());
-                }
-                if args.verbose {
+                } else if args.verbose {
                     eprintln!("Server file is newer than local file, proceeding with download.");
                 }
             }
@@ -4108,9 +4248,17 @@ async fn download_file(
         }
 
         // -N mode without --no-if-modified-since: add If-Modified-Since header
+        // ONLY if local file size matches expected server size (if expected size is known).
+        // If size differs, the local file is incomplete/corrupted, so do not send If-Modified-Since.
+        let size_matches = match (expected_length, output_info.as_ref()) {
+            (Some(exp_len), Some(out_info)) => out_info.size == exp_len,
+            _ => true,
+        };
+
         if args.newer
             && !args.no_if_modified_since
             && !is_stdout
+            && size_matches
             && let Some(ref out_info) = output_info
             && let Some(local_mtime) = out_info.modified
             && let Some(http_date) = format_http_date(local_mtime)
@@ -4132,13 +4280,75 @@ async fn download_file(
 
         // Handle 304 Not Modified (from If-Modified-Since in -N mode)
         if status == StatusCode::NOT_MODIFIED {
-            if !args.quiet {
-                eprintln!(
-                    "Server file is not newer than local file '{}', skipping.",
-                    output_path.display()
-                );
+            let local_size = output_info.as_ref().map(|i| i.size).unwrap_or(0);
+            if let Some(exp_len) = expected_length
+                && local_size != exp_len
+            {
+                if !args.quiet {
+                    eprintln!(
+                        "Server returned 304 Not Modified but local file size ({}) differs from server ({}), downloading entire file.",
+                        HumanBytes(local_size),
+                        HumanBytes(exp_len)
+                    );
+                }
+                start_byte = 0;
+                force_truncate = true;
+                let mut full_request = client.get(url.clone());
+                if send_auth && let Some(ref u) = args.user {
+                    full_request = full_request.basic_auth(u, args.password.as_deref());
+                }
+                let full_response =
+                    full_request.send().await.context("Failed to send GET request")?;
+                let full_status = full_response.status();
+                if full_status.is_redirection() {
+                    if let Some(location) = full_response.headers().get(LOCATION) {
+                        let location_str = location.to_str().unwrap_or("<invalid>");
+                        return Err(PermanentError::RedirectOnGet {
+                            status: full_status.as_u16(),
+                            location: location_str.to_string(),
+                        }
+                        .into());
+                    }
+                    return Err(
+                        PermanentError::RedirectWithoutLocation(full_status.as_u16()).into()
+                    );
+                }
+                if full_status.is_client_error() || full_status.is_server_error() {
+                    if args.content_on_error {
+                        if !args.quiet {
+                            eprintln!(
+                                "Warning: HTTP {} returned. Saving error body to file due to --content-on-error.",
+                                full_status
+                            );
+                        }
+                    } else {
+                        return Err(PermanentError::HttpClientError(full_status.as_u16()).into());
+                    }
+                }
+                get_last_modified = full_response
+                    .headers()
+                    .get(LAST_MODIFIED)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+                content_length = full_response
+                    .headers()
+                    .get(CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok());
+                response = full_response;
+                break;
+            } else {
+                if !args.quiet {
+                    eprintln!(
+                        "Server file is not newer than local file '{}', skipping.",
+                        output_path.display()
+                    );
+                }
+                if let Some(expected) = expected_sha256 {
+                    verify_sha256_file(&output_path, expected, args.quiet, dir_cache)?;
+                }
+                return Ok(());
             }
-            return Ok(());
         }
 
         // Check for redirect on GET (HEAD and GET may behave differently)
@@ -4276,10 +4486,13 @@ async fn download_file(
 
                 // The output path changed, so re-run the same collision/existence
                 // checks that were performed for the original name at the top of
-                // this function. Without this, --multiple-copies numbering, the
-                // FileAlreadyExists guard and the device check would all be
-                // bypassed for the new name, and an unrelated existing file could
-                // be silently overwritten.
+                // this function. Remove the old registered filename so it does
+                // not stay marked as used.
+                if let Some(old_key) = initial_canonical_key.take() {
+                    used_filenames.remove(&old_key);
+                }
+
+                let unnumbered_new_path = output_path.clone();
                 let (resolved_path, was_renamed) =
                     resolve_unique_output_path(&output_path, args, used_filenames, dir_cache)?;
                 if was_renamed && !args.quiet {
@@ -4294,6 +4507,7 @@ async fn download_file(
                     final_filename = fname.to_string();
                 }
                 *resolved_output = Some(output_path.clone());
+                initial_canonical_key = Some(unnumbered_new_path);
 
                 if args.temp {
                     let parent = output_path.parent().unwrap_or(Path::new("."));
@@ -4459,6 +4673,8 @@ fn open_temp_file_safely(
 
     let dir = get_cached_dir(cache, parent)?;
 
+    let is_append = start_byte > 0 && !force_truncate;
+
     let mut opts = OpenOptions::new();
     opts.write(true);
 
@@ -4475,64 +4691,87 @@ fn open_temp_file_safely(
         }
     }
 
-    // Execute the correct open strategy via cap-std handles
-    let (cap_file, file_existed) = if start_byte > 0 && !force_truncate {
-        opts.append(true);
-        (dir.open_with(filename, &opts)?, true)
-    } else {
-        // Attempt O_CREAT | O_EXCL
+    const MAX_ATTEMPTS: u32 = 3;
+    for attempt in 0..MAX_ATTEMPTS {
         let mut excl_opts = opts.clone();
-        excl_opts.create_new(true);
+        let mut opened_preexisting = false;
 
-        match dir.open_with(filename, &excl_opts) {
-            Ok(f) => (f, false),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                // Something already sits at the temp path. Inspect it without
-                // following symlinks to decide how to proceed.
-                match dir.symlink_metadata(filename) {
-                    // Stale regular temp file: delete and recreate fresh via
-                    // O_EXCL. Unlinking depends on directory write access rather
-                    // than the file's ownership, matching --overwrite semantics.
-                    Ok(meta) if meta.file_type().is_file() => {
-                        match dir.remove_file(filename) {
-                            Ok(()) => {}
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                            Err(e) => return Err(e.into()),
-                        }
-                        (dir.open_with(filename, &excl_opts)?, false)
-                    }
-                    // Symlink/FIFO/other: never unlink or follow it. O_TRUNC plus
-                    // O_NOFOLLOW makes a symlink fail with ELOOP; a FIFO opens for
-                    // writing into the pipe.
-                    Ok(_) => {
-                        let mut trunc_opts = opts.clone();
-                        trunc_opts.create(true).truncate(true);
-                        (dir.open_with(filename, &trunc_opts)?, true)
-                    }
-                    // Vanished between the O_EXCL attempt and the stat: create fresh.
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        (dir.open_with(filename, &excl_opts)?, false)
-                    }
-                    Err(e) => return Err(e.into()),
-                }
+        let (cap_file, file_existed) = if is_append {
+            excl_opts.append(true);
+            opened_preexisting = true;
+            {
+                let f = dir.open_with(filename, &excl_opts)?;
+                (f, true)
             }
-            Err(e) => return Err(e.into()),
+        } else {
+            // Attempt O_CREAT | O_EXCL
+            excl_opts.create_new(true);
+
+            match dir.open_with(filename, &excl_opts) {
+                Ok(f) => (f, false),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Something already sits at the temp path. Inspect it without
+                    // following symlinks to decide how to proceed.
+                    match dir.symlink_metadata(filename) {
+                        // Stale regular temp file: delete and recreate fresh via
+                        // O_EXCL. Unlinking depends on directory write access rather
+                        // than the file's ownership, matching --overwrite semantics.
+                        Ok(meta) if meta.file_type().is_file() => {
+                            match dir.remove_file(filename) {
+                                Ok(()) => {}
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(e) => return Err(e.into()),
+                            }
+                            match dir.open_with(filename, &excl_opts) {
+                                Ok(f) => (f, false),
+                                Err(e)
+                                    if e.kind() == std::io::ErrorKind::AlreadyExists
+                                        && attempt + 1 < MAX_ATTEMPTS =>
+                                {
+                                    continue;
+                                }
+                                Err(e) => return Err(e.into()),
+                            }
+                        }
+                        // Symlink/FIFO/other: never unlink or follow it. O_TRUNC plus
+                        // O_NOFOLLOW makes a symlink fail with ELOOP; a FIFO opens for
+                        // writing into the pipe.
+                        Ok(_) => {
+                            let mut trunc_opts = opts.clone();
+                            trunc_opts.create(true).truncate(true);
+                            opened_preexisting = true;
+                            (dir.open_with(filename, &trunc_opts)?, true)
+                        }
+                        // Vanished between the O_EXCL attempt and the stat: retry loop
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            if attempt + 1 < MAX_ATTEMPTS {
+                                continue;
+                            }
+                            (dir.open_with(filename, &excl_opts)?, false)
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
+
+        // Convert the cap-std file to a standard file
+        let std_file = cap_file.into_std();
+
+        // Post-open TOCTOU check on any pre-existing object we actually opened (an
+        // appended temp file, or a non-regular object such as a FIFO): verify on the
+        // real fd that it is not a device and (unless --insecure-owner) is owned by
+        // us. The delete-and-recreate path produced a brand-new O_EXCL file we own, so
+        // it is exempt.
+        if opened_preexisting || file_existed {
+            check_file_after_open(&std_file, path, true, args.insecure_owner)?;
         }
-    };
 
-    // Convert the cap-std file to a standard file
-    let std_file = cap_file.into_std();
-
-    // Post-open TOCTOU check on any pre-existing object we actually opened (an
-    // appended temp file, or a non-regular object such as a FIFO): verify on the
-    // real fd that it is not a device and (unless --insecure-owner) is owned by
-    // us. The delete-and-recreate path produced a brand-new O_EXCL file we own, so
-    // it is exempt.
-    if file_existed {
-        check_file_after_open(&std_file, path, true, args.insecure_owner)?;
+        return Ok(std_file);
     }
 
-    Ok(std_file)
+    unreachable!("open_temp_file_safely: retry loop exited without returning")
 }
 
 async fn download_to_temp(
