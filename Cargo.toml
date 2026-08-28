@@ -20,7 +20,6 @@ env_logger = "0.11"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
-tokio-util = { version = "0.7", features = ["io"] }
 tokio-stream = "0.1"
 
 # Command-line argument parsing
@@ -35,9 +34,6 @@ tempfile = "3"
 # Error handling
 thiserror = "2"
 anyhow = "1"
-
-# For async streaming
-futures-util = "0.3"
 
 # Progress bar
 indicatif = "0.18"
@@ -60,7 +56,6 @@ sha2 = "0.11"
 regex = "1"
 rustix = "1"
 cap-std = { version = "4", features = ["fs_utf8"] }
-camino = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libseccomp = "0.4"
