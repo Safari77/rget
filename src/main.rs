@@ -18,6 +18,9 @@
 //! - Windows Reserved Filename protection
 //! - Mutual TLS (mTLS) support via --cert and --key
 //! - HSTS Persistence to enforce HTTPS for known hosts
+//! - End-of-stream Content-Length verification (truncated download detection)
+//! - Hash verification (--json-verify-hash) always writes via temp file + atomic rename
+//! - --timeout applies to connection establishment and stalled reads
 
 //     This program is free software: you can redistribute it and/or modify it under the terms of the
 //     GNU General Public License as published by the Free Software Foundation, either version 3 of
@@ -28,15 +31,6 @@
 //     the GNU General Public License for more details.
 
 //     You should have received a copy of the GNU General Public License along with this program. If not, see <https://www.gnu.org/licenses/>.
-
-/*
-#[cfg(not(target_env = "msvc"))]
-use tikv_jemallocator::Jemalloc;
-
-#[cfg(not(target_env = "msvc"))]
-#[global_allocator]
-static GLOBAL: Jemalloc = Jemalloc;
-*/
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -541,7 +535,7 @@ struct Args {
         long = "timeout",
         default_value_t = 300,
         value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(1..),
-        help = "Timeout in seconds (no data received, must be >= 1)"
+        help = "Timeout in seconds (connection establishment + stalled reads, must be >= 1)"
     )]
     timeout: u64,
 
@@ -773,6 +767,13 @@ fn save_hsts_db(path: &Path, map: &HstsMap) {
         }
     }
 
+    // Make the bytes durable on disk before the atomic rename, so a crash
+    // cannot leave an empty or truncated HSTS DB behind.
+    if let Err(e) = tmp.as_file().sync_all() {
+        eprintln!("Failed to sync HSTS DB '{}': {}", tmp_path_display, e);
+        return;
+    }
+
     // Atomically rename the temp file over the target.
     if let Err(e) = tmp.persist(path) {
         eprintln!("Failed to atomically replace HSTS DB '{}': {}", path.display(), e);
@@ -890,9 +891,12 @@ fn update_hsts(map: &mut HstsMap, url: &Url, headers: &HeaderMap, debug: bool) {
                 if v.len() >= 2 && v.starts_with('"') && v.ends_with('"') {
                     v = &v[1..v.len() - 1];
                 }
-                match v.parse::<u64>() {
-                    Ok(age) => max_age = Some(age),
-                    Err(_) => {
+                // max-age-value = 1*DIGIT (RFC 6797 §6.1.1). Parse strictly:
+                // u64::from_str would also accept a leading '+', which is not
+                // 1*DIGIT, so use the strict decimal parser instead.
+                match parse_decimal(v) {
+                    Some(age) => max_age = Some(age),
+                    None => {
                         if debug {
                             eprintln!("[DEBUG] HSTS: malformed max-age '{}', ignoring header", val);
                         }
@@ -1030,7 +1034,12 @@ fn build_client(
             "/",
             env!("CARGO_PKG_VERSION")
         )))
-        .connect_timeout(Duration::from_secs(30))
+        // --timeout governs both the connection establishment phase and reads
+        // (waiting for response headers and each body read). The stream loop
+        // in write_response_to_file additionally enforces a per-chunk idle
+        // timer, which is redundant belt-and-braces for buffered streams.
+        .connect_timeout(Duration::from_secs(args.timeout))
+        .read_timeout(Duration::from_secs(args.timeout))
         .no_gzip()
         .no_brotli()
         .no_deflate();
@@ -1169,10 +1178,16 @@ async fn resolve_final_url_and_client(
             // MUST be converted to 443; any other explicit port is preserved;
             // and if no explicit port is present, none is added. url::Url's
             // set_scheme does not touch the port for us, so do it here.
+            // Both setters are fallible (e.g. cannot-be-a-base URLs): failing
+            // silently must NOT leave the request on http://, so error out.
             if current_url.port() == Some(80) {
-                let _ = current_url.set_port(Some(443));
+                current_url.set_port(Some(443)).map_err(|_| {
+                    anyhow::anyhow!("HSTS upgrade: cannot set port 443 on '{}'", current_url)
+                })?;
             }
-            let _ = current_url.set_scheme("https");
+            current_url.set_scheme("https").map_err(|_| {
+                anyhow::anyhow!("HSTS upgrade: cannot set scheme to https on '{}'", current_url)
+            })?;
         }
         if redirect_count >= MAX_REDIRECTS {
             return Err(PermanentError::TooManyRedirects(MAX_REDIRECTS).into());
@@ -1243,9 +1258,15 @@ async fn resolve_final_url_and_client(
         let mut response = request.send().await.context("Failed to send HEAD request")?;
         if response.status() == StatusCode::METHOD_NOT_ALLOWED {
             if args.debug {
-                eprintln!("[DEBUG] HEAD status: 405 Method Not Allowed. Retrying with GET...");
+                eprintln!(
+                    "[DEBUG] HEAD status: 405 Method Not Allowed. Probing with GET (Range: bytes=0-0)..."
+                );
             }
-            let mut get_request = client.get(current_url.clone());
+            // Probe with a 1-byte ranged GET instead of a full-body GET: the
+            // URL is fetched again (with the real download) right after, so
+            // pulling the whole body here would double the transfer. The probe
+            // is only used for its headers.
+            let mut get_request = client.get(current_url.clone()).header(RANGE, "bytes=0-0");
             if let Some(ref u) = args.user
                 && same_host
             {
@@ -1293,10 +1314,22 @@ async fn resolve_final_url_and_client(
             continue;
         }
 
-        let content_length = headers
-            .get(CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok());
+        // For a 206 response the Content-Length header is the *remaining* byte
+        // count, and the full resource size lives in Content-Range's
+        // complete-length field. This matters for the 405->GET probe above,
+        // which sends `Range: bytes=0-0` (its Content-Length would be 1).
+        let content_length = if status == StatusCode::PARTIAL_CONTENT {
+            headers
+                .get(CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_content_range_resp)
+                .and_then(|r| r.complete_length)
+        } else {
+            headers
+                .get(CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+        };
 
         let content_disposition =
             headers.get(CONTENT_DISPOSITION).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
@@ -1386,6 +1419,15 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
     // Validate --json-parse requirements
     if args.json_parse && args.json_url_field.is_none() {
         return Err(PermanentError::JsonUrlFieldRequired.into());
+    }
+    // -O points every JSON entry at a single filename: without --json-name-field
+    // all entries would collide on that one file (later entries failing with
+    // FileAlreadyExists, or silently overwriting with --overwrite).
+    if args.json_parse && args.output.is_some() && args.json_name_field.is_none() {
+        return Err(PermanentError::InvalidArguments(
+            "--output (-O) with --json-parse requires --json-name-field (otherwise all entries would collide on one filename)".to_string(),
+        )
+        .into());
     }
     if args.json_verify_hash && args.json_hash_field.is_none() {
         return Err(PermanentError::JsonVerifyHashWithoutHashField.into());
@@ -2007,6 +2049,11 @@ fn sanitize_filename(filename: &str) -> String {
             };
         }
     }
+
+    // A filename of "-" must never flip downstream handling into stdout mode
+    // (--output reserves "-" for stdout), so map it to "_" like the other
+    // shell-hostile names.
+    let sanitized = if sanitized == "-" { "_".to_string() } else { sanitized };
 
     if sanitized.is_empty() { "download".to_string() } else { sanitized }
 }
@@ -3498,7 +3545,13 @@ async fn fetch_json_body(
     }
 
     // JSON is UTF-8 (RFC 8259 §8.1); reject anything else instead of guessing.
-    String::from_utf8(body_bytes).context("JSON response body is not valid UTF-8")
+    // This MUST be a PermanentError: the body encoding does not change between
+    // retries, so a transient classification would only burn --retries.
+    // (map_err the value, then `?` — that coerces PermanentError into anyhow::Error.)
+    let body = String::from_utf8(body_bytes).map_err(|e| {
+        PermanentError::JsonParseError(format!("Response body is not valid UTF-8 ({})", e))
+    })?;
+    Ok(body)
 }
 
 /// Process JSON mode: parse JSON, extract entries, download each, optionally verify hashes.
@@ -3707,10 +3760,9 @@ async fn process_json_downloads(
             if !name.is_empty() {
                 // The name comes from server-controlled JSON: sanitize it like a
                 // Content-Disposition filename so it can neither traverse
-                // directories nor become '-' (which --output reserves for stdout).
-                let safe_name = sanitize_filename(name);
-                entry_args.output =
-                    Some(if safe_name == "-" { "_".to_string() } else { safe_name });
+                // directories nor become '-' (which --output reserves for stdout):
+                // sanitize_filename now maps '-' to '_' directly.
+                entry_args.output = Some(sanitize_filename(name));
             }
         }
 
@@ -3940,6 +3992,18 @@ async fn download_file(
     // On retry attempts the path pinned by the first attempt is reused:
     // re-resolving with the auto-set resume flag would skip collision numbering
     // and append the resumed download into an unrelated pre-existing file.
+    //
+    // Pinned-retry bookkeeping invariant: on a retry, the canonical
+    // used_filenames key is recomputed from the *current* attempt's unnumbered
+    // head_filename (plus --output/--output-dir). When the server is consistent
+    // between HEADs, this reproduces exactly the key committed by the first
+    // attempt — including the case where attempt 1 flipped to a GET
+    // Content-Disposition, because the pinned HEAD then replays the post-flip
+    // name. A server whose Content-Disposition flaps between HEADs can at most
+    // desync this informational numbering state; every actual write is still
+    // guarded against the on-disk state by resolve_unique_output_path's
+    // stat_file_via_cache checks and the O_EXCL/O_NOFOLLOW/fstat strategy in
+    // open_file_securely, so no data can be written to the wrong file.
     let mut initial_canonical_key: Option<PathBuf> = None;
     if !is_stdout {
         if let Some(prev) = resolved_output.as_ref() {
@@ -4044,8 +4108,15 @@ async fn download_file(
     }
     // If not --no-if-modified-since, we'll add If-Modified-Since to the GET request below
 
+    // Hash verification forces the temp-then-rename path: direct mode unlinks
+    // and recreates the destination before writing, so a corrupt or truncated
+    // download would replace a good file before the digest could be checked.
+    // Writing to the deterministic temp file and renaming only after the
+    // digest verifies keeps the destination intact on failure.
+    let force_temp_for_verify = expected_sha256.is_some();
+
     // 2. Prepare Temp Path (using sanitized filename)
-    let mut temp_path = if args.temp && !is_stdout {
+    let mut temp_path = if (args.temp || force_temp_for_verify) && !is_stdout {
         let parent = output_path.parent().unwrap_or(Path::new("."));
         Some(generate_deterministic_temp_filename(
             url,
@@ -4242,8 +4313,15 @@ async fn download_file(
     // Loop added to safely retry the entire request if we discover a different
     // Content-Disposition dynamically and need to reset an active partial-resume context.
     loop {
+        // True when THIS request carries a Range header. The 416 handler must
+        // only interpret a 416 as "resume state says we're complete" when a
+        // range was actually requested; a 416 on a plain GET means the server
+        // rejected the request itself and is handled by the generic 4xx logic
+        // below (or saved as an error body under --content-on-error).
+        let range_sent = start_byte > 0;
+
         let mut request = client.get(url.clone());
-        if start_byte > 0 {
+        if range_sent {
             request = request.header(RANGE, format!("bytes={}-", start_byte));
         }
 
@@ -4364,7 +4442,10 @@ async fn download_file(
             return Err(PermanentError::RedirectWithoutLocation(status.as_u16()).into());
         }
 
-        if status == StatusCode::RANGE_NOT_SATISFIABLE {
+        if status == StatusCode::RANGE_NOT_SATISFIABLE && range_sent {
+            // Only a 416 in response to our own Range request signals that the
+            // resume state already covers the whole resource. (A 416 on a plain
+            // GET falls through to the generic 4xx handling below.)
             if !args.quiet {
                 eprintln!("File already fully downloaded.");
             }
@@ -4509,7 +4590,14 @@ async fn download_file(
                 *resolved_output = Some(output_path.clone());
                 initial_canonical_key = Some(unnumbered_new_path);
 
-                if args.temp {
+                // Capture the old temp state BEFORE temp_path/temp_info are
+                // replaced below: the old temp file's deterministic name is
+                // derived from the old filename.
+                let old_temp = temp_path.clone();
+                let old_temp_existed = temp_info.is_some();
+
+                let uses_temp_here = args.temp || force_temp_for_verify;
+                if uses_temp_here {
                     let parent = output_path.parent().unwrap_or(Path::new("."));
                     temp_path = Some(generate_deterministic_temp_filename(
                         url,
@@ -4528,6 +4616,27 @@ async fn download_file(
                 output_info = stat_file_via_cache(&output_path, dir_cache)?;
                 if let Some(ref tp) = temp_path {
                     temp_info = stat_file_via_cache(tp, dir_cache)?;
+                }
+
+                // Best-effort cleanup of the now-orphaned old temp file,
+                // through the pinned directory handle. NotFound and any other
+                // error are deliberately ignored: this is housekeeping, and
+                // failing the download over it would be worse.
+                if let Some(old_tp) = old_temp.as_deref()
+                    && old_temp_existed
+                {
+                    let parent = safe_parent(old_tp);
+                    if let Ok(dir) = get_cached_dir(dir_cache, parent)
+                        && let Some(old_name) = old_tp.file_name()
+                    {
+                        let _ = dir.remove_file(old_name);
+                        if args.debug {
+                            eprintln!(
+                                "[DEBUG] Removed orphaned temp file '{}' (filename changed on resume)",
+                                old_tp.display()
+                            );
+                        }
+                    }
                 }
 
                 // Re-evaluate the existing-output guard for the new name (mirrors
@@ -4622,6 +4731,11 @@ async fn download_file(
     let mut effective_args = args.clone();
     if args.newer && output_info.is_some() {
         effective_args.overwrite = true;
+    }
+    // Route hash-verified downloads through temp + atomic rename (see
+    // force_temp_for_verify at the top of this function).
+    if force_temp_for_verify {
+        effective_args.temp = true;
     }
 
     if effective_args.temp {
@@ -4977,7 +5091,9 @@ async fn download_direct(
         drop(file);
     }
 
-    // Verify SHA256 after writing and syncing
+    // Verify SHA256 after writing and syncing. (Note: when a hash is expected,
+    // download_file routes through download_to_temp instead, so this path only
+    // runs for defensive/legacy callers; both destinations are final paths.)
     if let Some(expected) = expected_sha256 {
         verify_sha256_file(&actual_path, expected, args.quiet, dir_cache)?;
     }
@@ -5001,13 +5117,19 @@ async fn write_response_to_file<W: AsyncWrite + Unpin>(
     start_byte: u64,
     output_path_str: &str,
 ) -> Result<u64> {
+    // Stdout ("-") is the only destination where a BrokenPipe raised by the
+    // *consumer* side is a legitimate, successful end of transfer
+    // (e.g. `rget -O- url | head`). For a real file it means the underlying
+    // storage failed and must be reported as an error.
+    let is_stdout_dest = output_path_str == "-";
+
     let mut bytes_written: u64 = 0;
-    let buf_capacity = if output_path_str == "-" { 64 * 1024 } else { BUFFER_SIZE };
+    let buf_capacity = if is_stdout_dest { 64 * 1024 } else { BUFFER_SIZE };
     let mut writer = TokBufWriter::with_capacity(buf_capacity, writer_dest);
 
     // Progress Bar Setup
     // Hide progress bar when writing to stdout to avoid polluting the output
-    let pb = if args.quiet || output_path_str == "-" {
+    let pb = if args.quiet || is_stdout_dest {
         ProgressBar::hidden()
     } else if let Some(len) = remaining_bytes {
         let pb = ProgressBar::new(len);
@@ -5029,12 +5151,17 @@ async fn write_response_to_file<W: AsyncWrite + Unpin>(
     // buffering to avoid cross-thread wakeups, because there are no other threads.
     let mut stream = response.bytes_stream();
 
-    // Reusable timer
+    // Reusable inactivity timer. (The client also carries read_timeout/connect_timeout
+    // derived from --timeout; this timer resets on every chunk received.)
     let sleep_timer = tokio::time::sleep(Duration::from_secs(args.timeout));
     tokio::pin!(sleep_timer);
 
     let mut accumulated_bytes: u64 = 0;
     let mut last_update = Instant::now();
+    // Set when the consumer closed the pipe on us (`| head`): we stop writing
+    // cleanly and skip the end-of-stream length check below, because a short
+    // read is exactly what the consumer asked for.
+    let mut pipe_closed = false;
 
     loop {
         let chunk_result = tokio::select! {
@@ -5055,8 +5182,9 @@ async fn write_response_to_file<W: AsyncWrite + Unpin>(
                 }
 
                 if let Err(e) = writer.write_all(&chunk).await {
-                    if e.kind() == std::io::ErrorKind::BrokenPipe {
+                    if e.kind() == std::io::ErrorKind::BrokenPipe && is_stdout_dest {
                         // Consumer closed the pipe (e.g. `| head`). Stop cleanly.
+                        pipe_closed = true;
                         break;
                     }
                     return Err(e.into());
@@ -5086,12 +5214,28 @@ async fn write_response_to_file<W: AsyncWrite + Unpin>(
     if !args.quiet && accumulated_bytes > 0 {
         pb.inc(accumulated_bytes);
     }
-    // Flush and ignore BrokenPipe on flush too
+    // Flush; on stdout a broken pipe here is also a clean consumer-side close.
     if let Err(e) = writer.flush().await
-        && e.kind() != std::io::ErrorKind::BrokenPipe
+        && !(is_stdout_dest && e.kind() == std::io::ErrorKind::BrokenPipe) {
+            return Err(e.into());
+        }
+
+    // End-of-stream length check: a natural EOF must have delivered exactly
+    // the announced Content-Length.
+    if !pipe_closed
+        && let Some(expected) = remaining_bytes
+        && bytes_written != expected
     {
-        return Err(e.into());
+        if !args.quiet {
+            pb.finish_with_message("Incomplete");
+        }
+        bail!(
+            "Stream ended after {} of {} expected bytes; download truncated",
+            bytes_written,
+            expected
+        );
     }
+
     if !args.quiet {
         pb.finish_with_message("Download complete");
     }
