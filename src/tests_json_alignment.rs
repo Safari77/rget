@@ -432,6 +432,7 @@ fn test_json_argument_validation_scenarios() {
         force_tty_write: false,
         hsts_file: None,
         no_hsts_update: true,
+        disable_hsts: false,
         newer: false,
         no_if_modified_since: false,
         server_timestamps: false,

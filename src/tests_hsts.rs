@@ -2,6 +2,57 @@
 
 use super::*;
 
+fn make_test_args() -> Args {
+    Args {
+        urls: vec!["http://example.com".to_string()],
+        output: None,
+        output_dir: None,
+        insecure: false,
+        no_proxy: false,
+        ipv4_only: false,
+        ipv6_only: false,
+        overwrite: false,
+        temp: false,
+        resume: false,
+        quiet: true,
+        verbose: false,
+        max_size: None,
+        no_private_ips: false,
+        retries: 1,
+        timeout: 30,
+        keep_temp: false,
+        debug: false,
+        content_on_error: false,
+        header: vec![],
+        input_file: None,
+        password: None,
+        user: None,
+        referer: None,
+        user_agent: None,
+        insecure_owner: false,
+        tempnamelen: 16,
+        filemode: None,
+        hsts_file: None,
+        no_hsts_update: false,
+        disable_hsts: false,
+        newer: false,
+        no_if_modified_since: false,
+        server_timestamps: false,
+        multiple_copies: false,
+        keep_extension: false,
+        json_parse: false,
+        json_url_field: None,
+        json_hash_field: None,
+        json_name_field: None,
+        json_size_field: None,
+        json_filter: None,
+        json_verify_hash: false,
+        cert: None,
+        key: None,
+        force_tty_write: false,
+    }
+}
+
 #[cfg(test)]
 mod hsts_tests {
     //! Tests for the HSTS handling functions in this file (check_hsts,
@@ -160,5 +211,76 @@ mod hsts_tests {
         let kept_old =
             (0..MAX_HSTS_ENTRIES).filter(|i| map.contains_key(&format!("h{}.example", i))).count();
         assert_eq!(kept_old, MAX_HSTS_ENTRIES - 1);
+    }
+
+    #[test]
+    fn test_domain_in_hsts_list_upgrades_http_without_insecure() {
+        let mut db: HstsMap = HashMap::new();
+        let future_expiry = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 86400;
+
+        db.insert(
+            "example.com".to_string(),
+            HstsEntry { expiry: future_expiry, include_subdomains: false },
+        );
+
+        let mut url = Url::parse("http://example.com/archive.zip").unwrap();
+        let args = make_test_args();
+
+        let upgraded = try_hsts_upgrade(&mut url, &db, &args).unwrap();
+
+        assert!(upgraded);
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.as_str(), "https://example.com/archive.zip");
+        assert!(validate_url(&url, args.insecure).is_ok());
+    }
+
+    #[test]
+    fn test_domain_in_hsts_list_with_port_80_upgrades_to_443() {
+        let mut db: HstsMap = HashMap::new();
+        let future_expiry = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 86400;
+
+        db.insert(
+            "example.com".to_string(),
+            HstsEntry { expiry: future_expiry, include_subdomains: false },
+        );
+
+        let mut url = Url::parse("http://example.com:80/archive.zip").unwrap();
+        let args = make_test_args();
+
+        let upgraded = try_hsts_upgrade(&mut url, &db, &args).unwrap();
+
+        assert!(upgraded);
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.port(), None);
+        assert_eq!(url.port_or_known_default(), Some(443));
+        assert_eq!(url.as_str(), "https://example.com/archive.zip");
+    }
+
+    #[test]
+    fn test_domain_in_hsts_list_respects_disable_hsts_flag() {
+        let mut db: HstsMap = HashMap::new();
+        let future_expiry = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 86400;
+
+        db.insert(
+            "example.com".to_string(),
+            HstsEntry { expiry: future_expiry, include_subdomains: false },
+        );
+
+        let mut url = Url::parse("http://example.com/archive.zip").unwrap();
+        let mut args = make_test_args();
+        args.disable_hsts = true;
+
+        let upgraded = try_hsts_upgrade(&mut url, &db, &args).unwrap();
+
+        assert!(!upgraded);
+        assert_eq!(url.scheme(), "http");
+
+        let err = validate_url(&url, args.insecure).unwrap_err();
+        match err.downcast_ref::<PermanentError>() {
+            Some(PermanentError::InsecureUrl(u)) => {
+                assert_eq!(u, "http://example.com/archive.zip");
+            }
+            _ => panic!("Expected PermanentError::InsecureUrl"),
+        }
     }
 }

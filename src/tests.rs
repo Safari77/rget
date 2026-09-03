@@ -33,6 +33,7 @@ fn make_args() -> Args {
         tempnamelen: 16,
         filemode: None,
         hsts_file: None,
+        disable_hsts: false,
         cert: None,
         key: None,
         force_tty_write: false,

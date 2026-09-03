@@ -605,6 +605,10 @@ struct Args {
     )]
     hsts_file: Option<String>,
 
+    /// Disable HSTS processing (ignore cached HSTS entries, skip upgrades, and skip updates)
+    #[arg(long = "disable-hsts", help = "Disable HSTS processing and upgrades")]
+    disable_hsts: bool,
+
     /// Disable loading, updating, and saving the HSTS database
     #[arg(long = "no-hsts-update", help = "Disable HSTS database persistence and updates")]
     no_hsts_update: bool,
@@ -724,6 +728,38 @@ fn load_hsts_db(path: &Path) -> HstsMap {
             HashMap::new()
         }
     }
+}
+
+/// Upgrades an HTTP URL to HTTPS if the domain is a known HSTS host and HSTS is not disabled.
+///
+/// RFC 6797 §8.3: Known HSTS hosts automatically rewrite http:// requests to https://
+/// before emitting any traffic over the network. Port 80 is rewritten to 443, while
+/// explicit non-80 ports are preserved.
+fn try_hsts_upgrade(url: &mut Url, hsts_db: &HstsMap, args: &Args) -> Result<bool> {
+    if !args.disable_hsts
+        && url.scheme() == "http"
+        && let Some(host) = url.host_str()
+        && check_hsts(hsts_db, host)
+    {
+        if args.verbose {
+            eprintln!("HSTS: Upgrading insecure request to {}", host);
+        }
+        // RFC 6797 §8.3: when upgrading to https, an explicit port of 80
+        // MUST be converted to 443; any other explicit port is preserved;
+        // and if no explicit port is present, none is added. url::Url's
+        // set_scheme does not touch the port for us, so do it here.
+        // Both setters are fallible (e.g. cannot-be-a-base URLs): failing
+        // silently must NOT leave the request on http://, so error out.
+        if url.port() == Some(80) {
+            url.set_port(Some(443))
+                .map_err(|_| anyhow::anyhow!("HSTS upgrade: cannot set port 443 on '{}'", url))?;
+        }
+        url.set_scheme("https").map_err(|_| {
+            anyhow::anyhow!("HSTS upgrade: cannot set scheme to https on '{}'", url)
+        })?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn save_hsts_db(path: &Path, map: &HstsMap) {
@@ -1155,7 +1191,9 @@ async fn resolve_final_url_and_client(
     // --insecure regardless of HSTS state. HSTS upgrade still applies to
     // redirect targets returned by the server (handled inside the loop below),
     // which preserves HSTS's anti-TLS-stripping purpose on redirect chains.
-    validate_url(&initial_url, args.insecure)?;
+    //
+    // UPDATE: In accordance with RFC 6797 §8.3, HSTS hosts automatically upgrade
+    // to HTTPS before validation, so try_hsts_upgrade runs first inside the loop.
 
     // Remember the host the user actually asked for: HTTP credentials are only
     // ever sent to this host. A redirect that changes the host must not receive
@@ -1166,29 +1204,12 @@ async fn resolve_final_url_and_client(
     let mut redirect_count = 0;
 
     loop {
-        // HSTS Upgrade Check
-        if current_url.scheme() == "http"
-            && let Some(host) = current_url.host_str()
-            && check_hsts(hsts_db, host)
-        {
-            if args.verbose {
-                eprintln!("HSTS: Upgrading insecure request to {}", host);
-            }
-            // RFC 6797 §8.3: when upgrading to https, an explicit port of 80
-            // MUST be converted to 443; any other explicit port is preserved;
-            // and if no explicit port is present, none is added. url::Url's
-            // set_scheme does not touch the port for us, so do it here.
-            // Both setters are fallible (e.g. cannot-be-a-base URLs): failing
-            // silently must NOT leave the request on http://, so error out.
-            if current_url.port() == Some(80) {
-                current_url.set_port(Some(443)).map_err(|_| {
-                    anyhow::anyhow!("HSTS upgrade: cannot set port 443 on '{}'", current_url)
-                })?;
-            }
-            current_url.set_scheme("https").map_err(|_| {
-                anyhow::anyhow!("HSTS upgrade: cannot set scheme to https on '{}'", current_url)
-            })?;
-        }
+        // HSTS Upgrade Check (RFC 6797 §8.3): Known HSTS hosts automatically rewrite
+        // http:// requests to https:// before emitting any traffic over the network.
+        // Running this before validate_url allows cached HSTS domains to be seamlessly
+        // upgraded without requiring the --insecure flag.
+        try_hsts_upgrade(&mut current_url, hsts_db, args)?;
+
         if redirect_count >= MAX_REDIRECTS {
             return Err(PermanentError::TooManyRedirects(MAX_REDIRECTS).into());
         }
@@ -1275,7 +1296,11 @@ async fn resolve_final_url_and_client(
             response = get_request.send().await.context("Failed to send GET request")?;
         }
 
-        if !args.no_hsts_update && !args.insecure && current_url.scheme() == "https" {
+        if !args.disable_hsts
+            && !args.no_hsts_update
+            && !args.insecure
+            && current_url.scheme() == "https"
+        {
             // RFC 6797 §8.1: STS headers received over insecure (http) transport MUST be ignored;
             // likewise, a TLS connection whose certificate was not verified
             // (--insecure) must not seed the persistent HSTS database.
@@ -5216,9 +5241,10 @@ async fn write_response_to_file<W: AsyncWrite + Unpin>(
     }
     // Flush; on stdout a broken pipe here is also a clean consumer-side close.
     if let Err(e) = writer.flush().await
-        && !(is_stdout_dest && e.kind() == std::io::ErrorKind::BrokenPipe) {
-            return Err(e.into());
-        }
+        && !(is_stdout_dest && e.kind() == std::io::ErrorKind::BrokenPipe)
+    {
+        return Err(e.into());
+    }
 
     // End-of-stream length check: a natural EOF must have delivered exactly
     // the announced Content-Length.
@@ -5308,8 +5334,8 @@ async fn main() -> ExitCode {
     // Set global flag for signal handler
     KEEP_TEMP_ON_CANCEL.store(args.keep_temp, Ordering::SeqCst);
 
-    // Load HSTS database once at startup (skip if --no-hsts-update)
-    let no_hsts_update = args.no_hsts_update;
+    // Load HSTS database once at startup (skip if --no-hsts-update or --disable-hsts)
+    let no_hsts_update = args.no_hsts_update || args.disable_hsts;
     let hsts_path =
         if let Some(ref p) = args.hsts_file { PathBuf::from(p) } else { get_default_hsts_path() };
     let mut hsts_db = if no_hsts_update { HashMap::new() } else { load_hsts_db(&hsts_path) };
@@ -5353,7 +5379,7 @@ async fn main() -> ExitCode {
         }
     };
 
-    // Save HSTS database exactly once, regardless of how we exited (skip if --no-hsts-update)
+    // Save HSTS database exactly once, regardless of how we exited (skip if --no-hsts-update or --disable-hsts)
     if !no_hsts_update {
         save_hsts_db(&hsts_path, &hsts_db);
     }
