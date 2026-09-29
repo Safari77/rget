@@ -52,8 +52,9 @@ use data_encoding::BASE32_NOPAD;
 use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
 use regex::Regex;
 use reqwest::header::{
-    CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, IF_MODIFIED_SINCE,
-    LAST_MODIFIED, LOCATION, RANGE, STRICT_TRANSPORT_SECURITY,
+    AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, COOKIE,
+    IF_MODIFIED_SINCE, LAST_MODIFIED, LOCATION, PROXY_AUTHORIZATION, RANGE,
+    STRICT_TRANSPORT_SECURITY,
 };
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Client, Identity, Response, StatusCode};
@@ -74,8 +75,11 @@ mod content_disposition;
 /// Global flag to track if we should keep temp files on cancellation
 static KEEP_TEMP_ON_CANCEL: AtomicBool = AtomicBool::new(false);
 
-/// Global storage for temp file path during download (for cleanup decision)
-static CURRENT_TEMP_PATH: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+/// Global storage for the temp file during download (for cleanup decision): the
+/// pinned parent directory handle plus the temp file's path. The signal handler
+/// unlinks through the handle (unlinkat) rather than the ambient path, so a
+/// swapped directory component cannot redirect the unlink.
+static CURRENT_TEMP_PATH: std::sync::Mutex<Option<(Dir, PathBuf)>> = std::sync::Mutex::new(None);
 
 // A cache to keep directory handles permanently open during the run
 type DirCache = std::collections::HashMap<PathBuf, Dir>;
@@ -100,6 +104,10 @@ pub enum PermanentError {
     NoSafeIpv4(String),
     NoSafeIpv6(String),
     NoSafePublicIp(String),
+
+    // A proxy is configured through the environment, but the IP-level policy
+    // flags (--no-private-ips, -4, -6) cannot be enforced through a proxy
+    ProxyIpPolicyConflict(String),
 
     // Server misbehavior (won't change on retry)
     TooManyRedirects(usize),
@@ -201,6 +209,13 @@ impl std::fmt::Display for PermanentError {
             }
             Self::NoSafePublicIp(host) => {
                 write!(f, "Could not resolve '{}' to a safe public IP", host)
+            }
+            Self::ProxyIpPolicyConflict(flags) => {
+                write!(
+                    f,
+                    "A proxy is configured in the environment (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY), but {} cannot be enforced through a proxy because the proxy resolves names and connects on its own. Use --no-proxy to connect directly, or unset the proxy variables.",
+                    flags
+                )
             }
             Self::TooManyRedirects(max) => {
                 write!(f, "Too many redirects (maximum: {})", max)
@@ -321,7 +336,13 @@ impl std::fmt::Display for PermanentError {
                 )
             }
             Self::JsonHashMissing(file) => {
-                write!(f, "--json-verify-hash: no hash found in JSON for file '{}'", file)
+                // 'file' is a URL taken from server-supplied JSON: neutralize
+                // terminal escape sequences before printing it.
+                write!(
+                    f,
+                    "--json-verify-hash: no hash found in JSON for file '{}'",
+                    terminal_safe(file)
+                )
             }
             Self::JsonHashMismatch { file, expected, actual } => {
                 write!(
@@ -334,7 +355,7 @@ impl std::fmt::Display for PermanentError {
                 write!(
                     f,
                     "Unsupported hash algorithm in JSON digest field: '{}' (only sha256 supported)",
-                    algo
+                    terminal_safe(algo)
                 )
             }
             Self::JsonVerifyHashWithoutHashField => {
@@ -344,7 +365,12 @@ impl std::fmt::Display for PermanentError {
                 write!(f, "--json-parse requires --json-url-field")
             }
             Self::JsonHashInvalidFormat { url, digest } => {
-                write!(f, "--json-verify-hash: unparseable digest field {:?} for {}", digest, url)
+                write!(
+                    f,
+                    "--json-verify-hash: unparseable digest field {:?} for {}",
+                    digest,
+                    terminal_safe(url)
+                )
             }
             Self::JsonDownloadsFailed { failed, total } => {
                 write!(
@@ -1134,18 +1160,14 @@ fn build_client(
             eprintln!("Warning: Invalid referer URL ignored");
         }
     }
-    for h in &args.header {
-        if let Some((k, v)) = h.split_once(':') {
-            if let (Ok(k_name), Ok(v_val)) =
-                (HeaderName::from_bytes(k.trim().as_bytes()), HeaderValue::from_str(v.trim()))
-            {
-                headers.insert(k_name, v_val);
-            } else {
-                eprintln!("Warning: Invalid header ignored: {}", h);
-            }
-        } else {
-            eprintln!("Warning: Invalid header format (missing colon): {}", h);
-        }
+    // Credential-bearing headers (Authorization, Cookie, Proxy-Authorization) are
+    // deliberately NOT installed as client defaults: redirects are followed
+    // manually, so a default header would follow them to any host (and every
+    // JSON-listed host). They are attached per request instead, only when the
+    // target is the host the user named (see with_sensitive_headers).
+    let (custom_headers, _) = parse_custom_headers(args, true);
+    for (name, value) in custom_headers.iter() {
+        headers.insert(name.clone(), value.clone());
     }
     if !headers.is_empty() {
         builder = builder.default_headers(headers);
@@ -1161,6 +1183,104 @@ fn build_client(
         .map_err(|e| PermanentError::ClientBuilderError(format!("TLS/Builder error: {}", e)).into())
 }
 
+/// Header names that carry credentials. The same set curl strips on a
+/// cross-host redirect.
+fn is_sensitive_header(name: &HeaderName) -> bool {
+    *name == AUTHORIZATION || *name == COOKIE || *name == PROXY_AUTHORIZATION
+}
+
+/// Parse the user's --header values into (ordinary headers, credential-bearing
+/// headers). Malformed entries are skipped, with a warning when `warn` is set.
+/// Within each map a later occurrence of a header name replaces an earlier one.
+fn parse_custom_headers(args: &Args, warn: bool) -> (HeaderMap, HeaderMap) {
+    let mut plain = HeaderMap::new();
+    let mut sensitive = HeaderMap::new();
+    for h in &args.header {
+        if let Some((k, v)) = h.split_once(':') {
+            if let (Ok(k_name), Ok(v_val)) =
+                (HeaderName::from_bytes(k.trim().as_bytes()), HeaderValue::from_str(v.trim()))
+            {
+                if is_sensitive_header(&k_name) {
+                    sensitive.insert(k_name, v_val);
+                } else {
+                    plain.insert(k_name, v_val);
+                }
+            } else if warn {
+                eprintln!("Warning: Invalid header ignored: {}", h);
+            }
+        } else if warn {
+            eprintln!("Warning: Invalid header format (missing colon): {}", h);
+        }
+    }
+    (plain, sensitive)
+}
+
+/// Attach the user's credential-bearing --header values (Authorization, Cookie,
+/// Proxy-Authorization) to one request, but only when `allowed` (the target is
+/// the host the user named, see CredentialScope).
+fn with_sensitive_headers(
+    request: reqwest::RequestBuilder,
+    args: &Args,
+    allowed: bool,
+) -> reqwest::RequestBuilder {
+    if !allowed {
+        return request;
+    }
+    let (_, mut sensitive) = parse_custom_headers(args, false);
+    if args.user.is_some() {
+        // --user's basic auth takes precedence over a --header Authorization
+        sensitive.remove(AUTHORIZATION);
+    }
+    if sensitive.is_empty() { request } else { request.headers(sensitive) }
+}
+
+/// Where HTTP credentials (--user/--password and credential-bearing --header
+/// values) may be sent. It is derived from the URL the *user* supplied: only
+/// that host is trusted (never one named in server-supplied JSON or reached
+/// through a redirect), and when that URL was https the credentials are never
+/// sent over plain http (e.g. a same-host https -> http redirect under
+/// --insecure).
+#[derive(Debug, Clone)]
+struct CredentialScope {
+    host: String,
+    require_https: bool,
+}
+
+impl CredentialScope {
+    fn from_url(url: &Url) -> Option<Self> {
+        url.host_str().map(|h| Self { host: h.to_string(), require_https: url.scheme() == "https" })
+    }
+
+    fn allows(&self, url: &Url) -> bool {
+        url.host_str() == Some(self.host.as_str())
+            && (!self.require_https || url.scheme() == "https")
+    }
+}
+
+/// Make an untrusted string safe to print to a terminal: control characters
+/// (including ESC, which starts terminal escape sequences, and the C1 range) and
+/// Unicode bidi override/isolate characters are shown as \u{..} escapes instead
+/// of being interpreted.
+fn terminal_safe(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_control() || is_bidi_control(c) {
+            out.extend(c.escape_unicode());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Unicode bidirectional embedding/override/isolate characters. They can make
+/// a name display differently from what it really is ("evil\u{202E}txt.exe").
+/// LRM/RLM (U+200E/U+200F) are deliberately excluded: they occur in legitimate
+/// RTL filenames.
+fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
 fn load_certs(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
     use rustls::pki_types::pem::PemObject;
     rustls::pki_types::CertificateDer::pem_file_iter(path)
@@ -1174,13 +1294,13 @@ fn load_key(path: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {
     rustls::pki_types::PrivateKeyDer::from_pem_file(path)
         .map_err(|e| anyhow::anyhow!("Invalid or missing private key in '{}': {}", path, e))
 }
-
 async fn resolve_final_url_and_client(
     initial_url: Url,
     args: &Args,
     client_cache: &mut HashMap<String, Client>,
     hsts_db: &mut HstsMap,
     tls_config: &Option<ClientConfig>,
+    cred_scope: Option<&CredentialScope>,
 ) -> Result<(Client, Url, Option<u64>, Option<String>, Option<String>, bool)> {
     // CLI policy: validate the URL the user actually supplied BEFORE any HSTS
     // rewriting. Without this, 'http://example.com' would silently succeed
@@ -1192,13 +1312,11 @@ async fn resolve_final_url_and_client(
     // redirect targets returned by the server (handled inside the loop below),
     // which preserves HSTS's anti-TLS-stripping purpose on redirect chains.
     //
-    // UPDATE: In accordance with RFC 6797 §8.3, HSTS hosts automatically upgrade
+    // In accordance with RFC 6797 §8.3, HSTS hosts automatically upgrade
     // to HTTPS before validation, so try_hsts_upgrade runs first inside the loop.
 
-    // Remember the host the user actually asked for: HTTP credentials are only
-    // ever sent to this host. A redirect that changes the host must not receive
-    // the credentials (matching curl's default without --location-trusted).
-    let initial_host = initial_url.host_str().map(|h| h.to_string());
+    // HTTP credentials (--user/--password and credential-bearing --header values)
+    // are only ever sent to the host in `cred_scope`.
 
     let mut current_url = initial_url;
     let mut redirect_count = 0;
@@ -1223,9 +1341,28 @@ async fn resolve_final_url_and_client(
         let client = if !args.no_proxy
             && (std::env::var("HTTP_PROXY").is_ok()
                 || std::env::var("HTTPS_PROXY").is_ok()
+                || std::env::var("ALL_PROXY").is_ok()
                 || std::env::var("http_proxy").is_ok()
-                || std::env::var("https_proxy").is_ok())
+                || std::env::var("https_proxy").is_ok()
+                || std::env::var("all_proxy").is_ok())
         {
+            // A proxy resolves names and connects on its own, so resolve_safe_ip
+            // (and with it --no-private-ips, -4 and -6) is never consulted.
+            // Fail closed instead of silently dropping the requested policy.
+            if args.no_private_ips || args.ipv4_only || args.ipv6_only {
+                let mut flags: Vec<&str> = Vec::new();
+                if args.no_private_ips {
+                    flags.push("--no-private-ips");
+                }
+                if args.ipv4_only {
+                    flags.push("-4");
+                }
+                if args.ipv6_only {
+                    flags.push("-6");
+                }
+                return Err(PermanentError::ProxyIpPolicyConflict(flags.join(", ")).into());
+            }
+
             let cache_key = "__proxy_client__";
             if let Some(cached_client) = client_cache.get(cache_key) {
                 if args.verbose {
@@ -1260,9 +1397,10 @@ async fn resolve_final_url_and_client(
             }
         };
 
-        // Only send credentials to the originally requested host, never to a
-        // host reached through a redirect.
-        let same_host = current_url.host_str() == initial_host.as_deref();
+        // Only send credentials to the host the user named, never to a host
+        // reached through a redirect or listed in JSON, and never after an
+        // https -> http downgrade.
+        let same_host = cred_scope.is_some_and(|scope| scope.allows(&current_url));
 
         let mut request = client.head(current_url.clone());
         if let Some(ref u) = args.user {
@@ -1270,11 +1408,12 @@ async fn resolve_final_url_and_client(
                 request = request.basic_auth(u, args.password.as_deref());
             } else if args.verbose {
                 eprintln!(
-                    "   Not sending credentials to '{}' (host differs from original URL)",
+                    "   Not sending credentials to '{}' (not the host of the URL you supplied, or scheme downgraded from https)",
                     current_url.host_str().unwrap_or("<none>")
                 );
             }
         }
+        request = with_sensitive_headers(request, args, same_host);
 
         let mut response = request.send().await.context("Failed to send HEAD request")?;
         if response.status() == StatusCode::METHOD_NOT_ALLOWED {
@@ -1293,6 +1432,7 @@ async fn resolve_final_url_and_client(
             {
                 get_request = get_request.basic_auth(u, args.password.as_deref());
             }
+            get_request = with_sensitive_headers(get_request, args, same_host);
             response = get_request.send().await.context("Failed to send GET request")?;
         }
 
@@ -1548,6 +1688,10 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
             }
         };
 
+        // HTTP credentials may only go to the host of the URL the user supplied
+        // (URLs listed in server-supplied JSON are not trusted with them).
+        let cred_scope = CredentialScope::from_url(&url);
+
         if !args.quiet {
             eprintln!("Starting download: {}", url);
         }
@@ -1570,6 +1714,7 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                         &mut client_cache,
                         hsts_db,
                         &tls_config,
+                        cred_scope.as_ref(),
                     )
                     .await
                     {
@@ -1593,6 +1738,7 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                                 &mut attempt_used_filenames,
                                 &mut dir_cache,
                                 &tls_config,
+                                cred_scope.as_ref(),
                                 send_auth,
                             )
                             .await
@@ -1647,9 +1793,12 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
         // auto-set resume flag cannot re-route the download into a different
         // pre-existing file (see download_file).
         let mut resolved_output: Option<PathBuf> = None;
+        // Set by download_file once an attempt reaches the point of opening the
+        // destination (or its temp file).
+        let mut dest_touched = false;
         loop {
             let mut current_args = args.clone();
-            if attempt > 0 {
+            if attempt > 0 && dest_touched {
                 current_args.resume = true;
             }
             // 1. Snapshot the cache before the attempt begins
@@ -1663,6 +1812,7 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                     &mut client_cache,
                     hsts_db,
                     &tls_config,
+                    cred_scope.as_ref(),
                 )
                 .await
                 {
@@ -1699,6 +1849,7 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                             None,
                             &mut dir_cache,
                             &mut resolved_output,
+                            &mut dest_touched,
                             send_auth,
                         )
                         .await
@@ -1852,12 +2003,25 @@ fn is_private_ip(ip: &IpAddr) -> bool {
                 || ipv6.is_multicast()
                 // Link-local: fe80::/10 (first 10 bits are 1111111010)
                 || (ipv6.segments()[0] & 0xffc0) == 0xfe80
+                // Site-local (deprecated, RFC 3879): fec0::/10
+                || (ipv6.segments()[0] & 0xffc0) == 0xfec0
                 // Unique Local Address (ULA): fc00::/7 (first 7 bits are 1111110)
                 || (ipv6.segments()[0] & 0xfe00) == 0xfc00
                 // Documentation: 2001:db8::/32
                 || (ipv6.segments()[0] == 0x2001 && ipv6.segments()[1] == 0x0db8)
-                // Teredo: 2001:0::/32 - tunneling mechanism that can reach private IPv4
-                || (ipv6.segments()[0] == 0x2001 && ipv6.segments()[1] == 0x0000)
+                // Documentation: 3fff::/20 (RFC 9637)
+                || (ipv6.segments()[0] == 0x3fff && (ipv6.segments()[1] & 0xf000) == 0)
+                // IETF Protocol Assignments: 2001::/23 (RFC 6890). Covers Teredo
+                // (2001:0::/32 - a tunneling mechanism that can reach private IPv4),
+                // benchmarking (2001:2::/48) and ORCHIDv2 (2001:20::/28)
+                || (ipv6.segments()[0] == 0x2001 && (ipv6.segments()[1] & 0xfe00) == 0)
+                // Discard-only: 100::/64 (RFC 6666)
+                || (ipv6.segments()[0] == 0x0100
+                    && ipv6.segments()[1] == 0
+                    && ipv6.segments()[2] == 0
+                    && ipv6.segments()[3] == 0)
+                // Segment Routing (SRv6) SIDs: 5f00::/16 (RFC 9602)
+                || ipv6.segments()[0] == 0x5f00
                 // 6to4: 2002::/16 - embeds IPv4 address, check if embedded IP is private
                 || is_6to4_private(ipv6)
                 // NAT64: 64:ff9b::/96 (RFC 6052) embeds IPv4; 64:ff9b:1::/48 (RFC 8215)
@@ -2032,12 +2196,13 @@ fn sanitize_filename(filename: &str) -> String {
     // 1. Manually handle both / and \ as separators for cross-platform robustness
     let filename = filename.rsplit(['/', '\\']).next().unwrap_or(filename);
 
-    // 2. Basic Character Sanitization
+    // 2. Basic Character Sanitization (control characters and Unicode bidi
+    // override/isolate characters, which can disguise a name's real extension)
     let mut sanitized: String = filename
         .chars()
         .map(|c| match c {
             '/' | '\\' | '\0' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-            c if c.is_control() => '_',
+            c if c.is_control() || is_bidi_control(c) => '_',
             c => c,
         })
         .collect();
@@ -2409,8 +2574,18 @@ fn check_path_before_open(path: &Path, cache: &mut DirCache) -> Result<bool> {
     }
 }
 
-/// Normalizes a path purely lexically (no disk I/O).
-/// Strips out `.` and resolves `..` where possible.
+/// Normalizes a path purely lexically (no disk I/O), using only rewrites that
+/// are valid under POSIX pathname resolution:
+/// - `.` components, repeated slashes and trailing slashes are dropped.
+/// - `/..` resolves to `/` (the root directory is its own parent).
+/// - A `..` that follows a normal component is NEVER folded away. POSIX resolves
+///   `link/..` through the symlink's target, so it is not lexically equal to
+///   "the parent of `link`": folding it would yield a path that opens a
+///   different directory than the one the user named. Such `..` components are
+///   kept verbatim and left for the OS to resolve when the directory is opened.
+///
+/// The result is therefore always equivalent to the input when it is used to
+/// open a directory. For paths starting with `..` (no anchor), the `..` is preserved.
 fn normalize_path_lexically(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
 
@@ -2421,19 +2596,11 @@ fn normalize_path_lexically(path: &Path) -> PathBuf {
             }
             Component::CurDir => {} // Ignore `.`
             Component::ParentDir => {
-                // Pop the last component if it's a normal directory.
-                // After a RootDir, drop the `..` entirely — can't go above filesystem root.
-                // For paths starting with `..` (no anchor), preserve the `..`.
-                match normalized.components().next_back() {
-                    Some(Component::Normal(_)) => {
-                        normalized.pop();
-                    }
-                    Some(Component::RootDir) => {
-                        // No-op: "/.." resolves to "/"
-                    }
-                    _ => {
-                        normalized.push(component);
-                    }
+                // Directly after the root, `..` can only resolve to the root itself
+                // ("/.." is "/"), so drop it. Anywhere else keep the `..` as is:
+                // the preceding component may be a symlink (see above).
+                if !matches!(normalized.components().next_back(), Some(Component::RootDir)) {
+                    normalized.push(component);
                 }
             }
         }
@@ -2444,7 +2611,9 @@ fn normalize_path_lexically(path: &Path) -> PathBuf {
 }
 
 /// Get (or open and cache) the Dir handle for `parent`, keyed by its lexical
-/// normalization so "./a", "a/../a", etc. all map to one cache entry.
+/// normalization so "./a", "a/./" and "a//" all map to one cache entry. Paths
+/// containing `..` are keyed verbatim (see normalize_path_lexically: `..` is not
+/// folded because it must be resolved by the OS, symlinks included).
 fn get_cached_dir<'a>(cache: &'a mut DirCache, parent: &Path) -> std::io::Result<&'a Dir> {
     let key = normalize_path_lexically(parent);
     if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(key.clone()) {
@@ -2453,7 +2622,6 @@ fn get_cached_dir<'a>(cache: &'a mut DirCache, parent: &Path) -> std::io::Result
     }
     Ok(cache.get(&key).unwrap())
 }
-
 fn open_file_securely(
     path: &Path,
     args: &Args,
@@ -3515,6 +3683,7 @@ async fn fetch_json_body(
     if send_auth && let Some(ref u) = args.user {
         request = request.basic_auth(u, args.password.as_deref());
     }
+    request = with_sensitive_headers(request, args, send_auth);
 
     let response = request.send().await.context("Failed to send GET request for JSON")?;
     let status = response.status();
@@ -3589,6 +3758,7 @@ async fn process_json_downloads(
     used_filenames: &mut HashMap<PathBuf, u32>,
     dir_cache: &mut DirCache,
     tls_config: &Option<ClientConfig>,
+    cred_scope: Option<&CredentialScope>,
     send_auth: bool,
 ) -> Result<()> {
     let json_url_field = args.json_url_field.as_ref().expect("--json-url-field required");
@@ -3607,12 +3777,17 @@ async fn process_json_downloads(
     let json_value: serde_json::Value =
         serde_json::from_str(&body).map_err(|e| PermanentError::JsonParseError(e.to_string()))?;
 
+    // The parsed tree can be many times larger than the text it came from (a
+    // body of `[0,0,...]` expands about 16x), so release the raw body before
+    // walking the tree instead of holding both until the function returns.
+    drop(body);
+
     // 3. Extract URLs
     let urls = json_path_extract(&json_value, json_url_field)?;
     if args.debug {
         eprintln!("[DEBUG] Extracted {} URL(s) from JSON path '{}':", urls.len(), json_url_field);
         for (i, u) in urls.iter().enumerate() {
-            eprintln!("[DEBUG]   [{}] {}", i, u);
+            eprintln!("[DEBUG]   [{}] {}", i, terminal_safe(u));
         }
     }
 
@@ -3622,7 +3797,7 @@ async fn process_json_downloads(
         if args.debug {
             eprintln!("[DEBUG] Extracted {} hash(es) from JSON path '{}':", h.len(), hash_field);
             for (i, hv) in h.iter().enumerate() {
-                eprintln!("[DEBUG]   [{}] {}", i, hv);
+                eprintln!("[DEBUG]   [{}] {}", i, terminal_safe(hv));
             }
         }
         if h.len() != urls.len() {
@@ -3643,7 +3818,7 @@ async fn process_json_downloads(
         if args.debug {
             eprintln!("[DEBUG] Extracted {} name(s) from JSON path '{}':", n.len(), name_field);
             for (i, nv) in n.iter().enumerate() {
-                eprintln!("[DEBUG]   [{}] {}", i, nv);
+                eprintln!("[DEBUG]   [{}] {}", i, terminal_safe(nv));
             }
         }
         if n.len() != urls.len() {
@@ -3668,7 +3843,7 @@ async fn process_json_downloads(
                 size_field
             );
             for (i, sv) in s_vals.iter().enumerate() {
-                eprintln!("[DEBUG]   [{}] {}", i, sv);
+                eprintln!("[DEBUG]   [{}] {}", i, terminal_safe(sv));
             }
         }
         if s_vals.len() != urls.len() {
@@ -3689,6 +3864,10 @@ async fn process_json_downloads(
     } else {
         None
     };
+
+    // All fields have been extracted into plain strings: the (potentially very
+    // large) JSON tree is no longer needed while the downloads run.
+    drop(json_value);
 
     // 6. Build entries
     let mut entries: Vec<JsonDownloadEntry> = Vec::new();
@@ -3739,16 +3918,23 @@ async fn process_json_downloads(
     }
 
     // 8. Print summary
+    // (name, URL and hash come from server-supplied JSON and may contain terminal
+    // escape sequences, so they are neutralized before printing)
     if !args.quiet {
         eprintln!("JSON: {} file(s) to download:", entries.len());
         for (i, entry) in entries.iter().enumerate() {
             let display_name = entry.name.as_deref().unwrap_or("(from URL)");
-            eprintln!("  [{}] {} ({})", i + 1, display_name, entry.url);
+            eprintln!(
+                "  [{}] {} ({})",
+                i + 1,
+                terminal_safe(display_name),
+                terminal_safe(&entry.url)
+            );
             if let Some(s) = entry.size {
                 eprintln!("      size: {} ({} bytes)", HumanBytes(s), s);
             }
             if let Some(ref hash) = entry.hash {
-                eprintln!("      hash: {}", hash);
+                eprintln!("      hash: {}", terminal_safe(hash));
             }
         }
     }
@@ -3765,7 +3951,7 @@ async fn process_json_downloads(
         let url = match Url::parse(&entry.url) {
             Ok(u) => u,
             Err(e) => {
-                eprintln!("Error parsing URL '{}': {}", entry.url, e);
+                eprintln!("Error parsing URL '{}': {}", terminal_safe(&entry.url), e);
                 failed_count += 1;
                 continue;
             }
@@ -3842,9 +4028,13 @@ async fn process_json_downloads(
         // Output path pinned by the first attempt; retries reuse it so the
         // auto-set resume flag cannot re-route the download (see download_file).
         let mut resolved_output: Option<PathBuf> = None;
+        // Set by download_file once an attempt reaches the point of opening the
+        // destination (or its temp file); a retry only auto-resumes after that,
+        // so a pre-existing file under --overwrite/-N is never appended to.
+        let mut dest_touched = false;
         let entry_failed = loop {
             let mut current_args = entry_args.clone();
-            if attempt > 0 {
+            if attempt > 0 && dest_touched {
                 current_args.resume = true;
             }
             let mut attempt_used_filenames = used_filenames.clone();
@@ -3856,6 +4046,7 @@ async fn process_json_downloads(
                     client_cache,
                     hsts_db,
                     tls_config,
+                    cred_scope,
                 )
                 .await
                 {
@@ -3895,6 +4086,7 @@ async fn process_json_downloads(
                             parsed_sha256.as_deref(),
                             dir_cache,
                             &mut resolved_output,
+                            &mut dest_touched,
                             entry_send_auth,
                         )
                         .await
@@ -3946,7 +4138,6 @@ async fn process_json_downloads(
         Err(PermanentError::JsonDownloadsFailed { failed: failed_count, total }.into())
     }
 }
-
 async fn download_file(
     client: &Client,
     url: &Url,
@@ -3958,6 +4149,7 @@ async fn download_file(
     expected_sha256: Option<&str>,
     dir_cache: &mut DirCache,
     resolved_output: &mut Option<PathBuf>,
+    dest_touched: &mut bool,
     send_auth: bool,
 ) -> Result<()> {
     // True when a previous attempt already resolved (pinned) the output path;
@@ -4372,11 +4564,12 @@ async fn download_file(
             request = request.header(IF_MODIFIED_SINCE, http_date);
         }
 
-        // Credentials are only sent when the final URL is still on the
-        // originally requested host (see resolve_final_url_and_client).
+        // Credentials are only sent when the final URL is still on the host the
+        // user named, without an https -> http downgrade
         if send_auth && let Some(ref u) = args.user {
             request = request.basic_auth(u, args.password.as_deref());
         }
+        request = with_sensitive_headers(request, args, send_auth);
 
         let current_response = request.send().await.context("Failed to send GET request")?;
         let status = current_response.status();
@@ -4400,6 +4593,7 @@ async fn download_file(
                 if send_auth && let Some(ref u) = args.user {
                     full_request = full_request.basic_auth(u, args.password.as_deref());
                 }
+                full_request = with_sensitive_headers(full_request, args, send_auth);
                 let full_response =
                     full_request.send().await.context("Failed to send GET request")?;
                 let full_status = full_response.status();
@@ -4495,7 +4689,9 @@ async fn download_file(
 
         // Handle HTTP 4xx and 5xx errors
         if status.is_client_error() || status.is_server_error() {
-            if args.content_on_error {
+            // --content-on-error saves the error body, but never over data being
+            // resumed.
+            if args.content_on_error && !range_sent {
                 if !args.quiet {
                     eprintln!(
                         "Warning: HTTP {} returned. Saving error body to file due to --content-on-error.",
@@ -4763,6 +4959,12 @@ async fn download_file(
         effective_args.temp = true;
     }
 
+    // From here on the destination (or its temp file) is about to be opened and
+    // written, so a retry may legitimately resume from what this attempt leaves
+    // behind. Before this point (timeouts, 4xx/5xx, redirects, early returns) a
+    // pre-existing file is not ours to resume, and the callers do not auto-resume.
+    *dest_touched = true;
+
     if effective_args.temp {
         let path_buf = temp_path.clone().expect("Logic error: temp path missing");
         download_to_temp(
@@ -4913,6 +5115,15 @@ fn open_temp_file_safely(
     unreachable!("open_temp_file_safely: retry loop exited without returning")
 }
 
+/// Remove a temp file through the pinned directory handle.
+fn remove_temp_via_cache(path: &Path, cache: &mut DirCache) {
+    if let Some(name) = path.file_name()
+        && let Ok(dir) = get_cached_dir(cache, safe_parent(path))
+    {
+        let _ = dir.remove_file(name);
+    }
+}
+
 async fn download_to_temp(
     response: Response,
     output_path: &Path,
@@ -4925,10 +5136,13 @@ async fn download_to_temp(
     dir_cache: &mut DirCache,
     server_mtime: Option<SystemTime>,
 ) -> Result<PathBuf> {
-    // Store temp path for potential cleanup on signal
+    // Store the pinned parent directory handle and temp path for potential
+    // cleanup on signal (the handler unlinks through the handle, not the ambient path)
     {
+        let pinned_dir =
+            get_cached_dir(dir_cache, safe_parent(&temp_path)).and_then(|d| d.try_clone()).ok();
         let mut guard = CURRENT_TEMP_PATH.lock().unwrap();
-        *guard = Some(temp_path.clone());
+        *guard = pinned_dir.map(|d| (d, temp_path.clone()));
     }
 
     // Log temporary filename
@@ -5003,7 +5217,7 @@ async fn download_to_temp(
         // is kept for inspection; the finalize paths re-verify before
         // promoting it.
         if !args.keep_temp {
-            let _ = std::fs::remove_file(&temp_path);
+            remove_temp_via_cache(&temp_path, dir_cache);
         }
         return Err(e);
     }
@@ -5030,8 +5244,8 @@ async fn download_to_temp(
         }
         Err(e) => {
             // FAILURE: Clean up the temp file (unless --keep-temp is set)
-            if !args.keep_temp && temp_path.exists() {
-                let _ = std::fs::remove_file(&temp_path);
+            if !args.keep_temp {
+                remove_temp_via_cache(&temp_path, dir_cache);
             }
             Err(e)
         }
@@ -5276,6 +5490,10 @@ pub fn apply_security_sandbox() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut ctx = ScmpFilterContext::new(ScmpAction::Allow)?;
 
+    // Synchronize the filter across ALL threads of the process
+    // (SECCOMP_FILTER_FLAG_TSYNC) instead of only the calling thread.
+    ctx.set_ctl_tsync(true)?;
+
     // Block specific syscalls entirely
     ctx.add_rule(ScmpAction::Errno(libc::EPERM), ScmpSyscall::from_name("execve")?)?;
     ctx.add_rule(ScmpAction::Errno(libc::EPERM), ScmpSyscall::from_name("execveat")?)?;
@@ -5355,18 +5573,19 @@ async fn main() -> ExitCode {
             let temp_path = CURRENT_TEMP_PATH.lock().unwrap().take();
 
             if keep_temp {
-                if let Some(tp) = temp_path {
+                if let Some((_, tp)) = temp_path {
                     eprintln!("\nDownload cancelled. Keeping temporary file: {}", tp.display());
                     eprintln!("Resume with: {} --temp --continue <url>", env!("CARGO_PKG_NAME"));
                 } else {
                     eprintln!("\nDownload cancelled.");
                 }
             } else {
-                if let Some(tp) = temp_path {
+                if let Some((dir, tp)) = temp_path {
                     // Blocking I/O is acceptable here: the runtime is shutting down
-                    // and no other tasks can be running.
-                    if tp.exists() {
-                        let _ = fs::remove_file(&tp);
+                    // and no other tasks can be running. The unlink goes through the
+                    // pinned directory handle, not the ambient path.
+                    let removed = tp.file_name().is_some_and(|name| dir.remove_file(name).is_ok());
+                    if removed {
                         eprintln!("\nDownload cancelled. Temporary file removed.");
                     } else {
                         eprintln!("\nDownload cancelled.");
