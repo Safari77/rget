@@ -56,6 +56,7 @@ sha2 = "0.11"
 regex = "1"
 rustix = "1"
 cap-std = { version = "4", features = ["fs_utf8"] }
+ipnet = "2.12"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libseccomp = "0.4"

@@ -32,12 +32,14 @@
 
 //     You should have received a copy of the GNU General Public License along with this program. If not, see <https://www.gnu.org/licenses/>.
 
+use ipnet::{Ipv4Net, Ipv6Net};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, ErrorKind, IsTerminal, Read, Write};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -71,6 +73,57 @@ use tokio_stream::StreamExt;
 use url::Url;
 
 mod content_disposition;
+
+static BLOCKED_IPV4_NETS: LazyLock<[Ipv4Net; 5]> = LazyLock::new(|| {
+    [
+        // "This network" (RFC 6890): 0.0.0.0/8 - on Linux these
+        // addresses can reach localhost, a classic SSRF bypass
+        "0.0.0.0/8".parse().expect("valid IPv4 CIDR"),
+        // Shared Address Space (RFC 6598): 100.64.0.0/10
+        "100.64.0.0/10".parse().expect("valid IPv4 CIDR"),
+        // IETF Protocol Assignments: 192.0.0.0/24
+        "192.0.0.0/24".parse().expect("valid IPv4 CIDR"),
+        // Benchmarking (RFC 2544): 198.18.0.0/15
+        "198.18.0.0/15".parse().expect("valid IPv4 CIDR"),
+        // Reserved for future use (RFC 1112 §4): 240.0.0.0/4
+        "240.0.0.0/4".parse().expect("valid IPv4 CIDR"),
+    ]
+});
+
+static BLOCKED_IPV6_NETS: LazyLock<[Ipv6Net; 9]> = LazyLock::new(|| {
+    [
+        // Link-local: fe80::/10 (first 10 bits are 1111111010)
+        "fe80::/10".parse().expect("valid IPv6 CIDR"),
+        // Unique Local Address (ULA): fc00::/7 (first 7 bits are 1111110)
+        "fc00::/7".parse().expect("valid IPv6 CIDR"),
+        // Documentation: 2001:db8::/32
+        "2001:db8::/32".parse().expect("valid IPv6 CIDR"),
+        // Documentation: 3fff::/20 (RFC 9637)
+        "3fff::/20".parse().expect("valid IPv6 CIDR"),
+        // Teredo tunneling (RFC 4380 / RFC 6890): 2001:0::/32 (can reach private IPv4)
+        "2001::/32".parse().expect("valid IPv6 CIDR"),
+        // Benchmarking (RFC 5180 / RFC 6890): 2001:2::/48
+        "2001:2::/48".parse().expect("valid IPv6 CIDR"),
+        // ORCHIDv2 (RFC 7343 / RFC 6890): 2001:20::/28
+        "2001:20::/28".parse().expect("valid IPv6 CIDR"),
+        // Discard-only: 100::/64 (RFC 6666)
+        "100::/64".parse().expect("valid IPv6 CIDR"),
+        // Segment Routing (SRv6) SIDs: 5f00::/16 (RFC 9602)
+        "5f00::/16".parse().expect("valid IPv6 CIDR"),
+    ]
+});
+
+static IPV6_6TO4_NET: LazyLock<Ipv6Net> =
+    LazyLock::new(|| "2002::/16".parse().expect("valid IPv6 CIDR"));
+
+static NAT64_LOCAL_NET: LazyLock<Ipv6Net> =
+    LazyLock::new(|| "64:ff9b:1::/48".parse().expect("valid IPv6 CIDR"));
+
+static NAT64_WELL_KNOWN_NET: LazyLock<Ipv6Net> =
+    LazyLock::new(|| "64:ff9b::/96".parse().expect("valid IPv6 CIDR"));
+
+static IPV4_COMPAT_IPV6_NET: LazyLock<Ipv6Net> =
+    LazyLock::new(|| "::/96".parse().expect("valid IPv6 CIDR"));
 
 /// Global flag to track if we should keep temp files on cancellation
 static KEEP_TEMP_ON_CANCEL: AtomicBool = AtomicBool::new(false);
@@ -1982,46 +2035,16 @@ fn is_private_ip(ip: &IpAddr) -> bool {
                 || ipv4.is_broadcast()
                 || ipv4.is_unspecified()
                 || ipv4.is_documentation()
-                // "This network" (RFC 6890): 0.0.0.0/8 - on Linux these
-                // addresses can reach localhost, a classic SSRF bypass
-                || ipv4.octets()[0] == 0
-                // Shared Address Space (RFC 6598): 100.64.0.0/10
-                || (ipv4.octets()[0] == 100 && (ipv4.octets()[1] & 0xC0) == 64)
-                // IETF Protocol Assignments: 192.0.0.0/24
-                || (ipv4.octets()[0] == 192 && ipv4.octets()[1] == 0 && ipv4.octets()[2] == 0)
-                // Benchmarking (RFC 2544): 198.18.0.0/15
-                || (ipv4.octets()[0] == 198 && (ipv4.octets()[1] & 0xFE) == 18)
                 // Multicast (RFC 5771): 224.0.0.0/4
                 || ipv4.is_multicast()
-                // Reserved for future use (RFC 1112 §4): 240.0.0.0/4
-                || ((ipv4.octets()[0] & 0xf0) == 0xf0)
+                || BLOCKED_IPV4_NETS.iter().any(|net| net.contains(ipv4))
         }
         IpAddr::V6(ipv6) => {
             ipv6.is_loopback()
                 || ipv6.is_unspecified()
                 // Multicast: ff00::/8
                 || ipv6.is_multicast()
-                // Link-local: fe80::/10 (first 10 bits are 1111111010)
-                || (ipv6.segments()[0] & 0xffc0) == 0xfe80
-                // Site-local (deprecated, RFC 3879): fec0::/10
-                || (ipv6.segments()[0] & 0xffc0) == 0xfec0
-                // Unique Local Address (ULA): fc00::/7 (first 7 bits are 1111110)
-                || (ipv6.segments()[0] & 0xfe00) == 0xfc00
-                // Documentation: 2001:db8::/32
-                || (ipv6.segments()[0] == 0x2001 && ipv6.segments()[1] == 0x0db8)
-                // Documentation: 3fff::/20 (RFC 9637)
-                || (ipv6.segments()[0] == 0x3fff && (ipv6.segments()[1] & 0xf000) == 0)
-                // IETF Protocol Assignments: 2001::/23 (RFC 6890). Covers Teredo
-                // (2001:0::/32 - a tunneling mechanism that can reach private IPv4),
-                // benchmarking (2001:2::/48) and ORCHIDv2 (2001:20::/28)
-                || (ipv6.segments()[0] == 0x2001 && (ipv6.segments()[1] & 0xfe00) == 0)
-                // Discard-only: 100::/64 (RFC 6666)
-                || (ipv6.segments()[0] == 0x0100
-                    && ipv6.segments()[1] == 0
-                    && ipv6.segments()[2] == 0
-                    && ipv6.segments()[3] == 0)
-                // Segment Routing (SRv6) SIDs: 5f00::/16 (RFC 9602)
-                || ipv6.segments()[0] == 0x5f00
+                || BLOCKED_IPV6_NETS.iter().any(|net| net.contains(ipv6))
                 // 6to4: 2002::/16 - embeds IPv4 address, check if embedded IP is private
                 || is_6to4_private(ipv6)
                 // NAT64: 64:ff9b::/96 (RFC 6052) embeds IPv4; 64:ff9b:1::/48 (RFC 8215)
@@ -2032,15 +2055,10 @@ fn is_private_ip(ip: &IpAddr) -> bool {
                     .map(|v4| is_private_ip(&IpAddr::V4(v4)))
                     .unwrap_or(false)
                 // IPv4-compatible IPv6 (deprecated RFC 4291 §2.5.5.1): ::x.x.x.x
-                || (ipv6.segments()[0] == 0
-                    && ipv6.segments()[1] == 0
-                    && ipv6.segments()[2] == 0
-                    && ipv6.segments()[3] == 0
-                    && ipv6.segments()[4] == 0
-                    && ipv6.segments()[5] == 0
+                || (IPV4_COMPAT_IPV6_NET.contains(ipv6)
                     && !ipv6.is_unspecified()
                     && !ipv6.is_loopback()
-                    && is_private_ip(&IpAddr::V4(std::net::Ipv4Addr::new(
+                    && is_private_ip(&IpAddr::V4(Ipv4Addr::new(
                         (ipv6.segments()[6] >> 8) as u8,
                         (ipv6.segments()[6] & 0xff) as u8,
                         (ipv6.segments()[7] >> 8) as u8,
@@ -2051,15 +2069,15 @@ fn is_private_ip(ip: &IpAddr) -> bool {
 }
 
 /// Check if a 6to4 address (2002::/16) embeds a private IPv4 address
-fn is_6to4_private(ipv6: &std::net::Ipv6Addr) -> bool {
-    if ipv6.segments()[0] != 0x2002 {
+fn is_6to4_private(ipv6: &Ipv6Addr) -> bool {
+    if !IPV6_6TO4_NET.contains(ipv6) {
         return false;
     }
     // 6to4 embeds IPv4 in segments 1-2: 2002:AABB:CCDD::
     // where IPv4 is AA.BB.CC.DD
     let seg1 = ipv6.segments()[1];
     let seg2 = ipv6.segments()[2];
-    let ipv4 = std::net::Ipv4Addr::new(
+    let ipv4 = Ipv4Addr::new(
         (seg1 >> 8) as u8,
         (seg1 & 0xff) as u8,
         (seg2 >> 8) as u8,
@@ -2072,18 +2090,15 @@ fn is_6to4_private(ipv6: &std::net::Ipv6Addr) -> bool {
 /// Covers the well-known prefix 64:ff9b::/96 (RFC 6052), which embeds an IPv4
 /// address in the last 32 bits, and the local-use prefix 64:ff9b:1::/48
 /// (RFC 8215), which is reserved for operator-internal translation.
-fn is_nat64_private(ipv6: &std::net::Ipv6Addr) -> bool {
-    let s = ipv6.segments();
-    if s[0] != 0x0064 || s[1] != 0xff9b {
-        return false;
-    }
+fn is_nat64_private(ipv6: &Ipv6Addr) -> bool {
     // 64:ff9b:1::/48 is local-use; treat the whole prefix as private.
-    if s[2] == 0x0001 {
+    if NAT64_LOCAL_NET.contains(ipv6) {
         return true;
     }
     // Well-known prefix 64:ff9b::/96: IPv4 is embedded in segments 6-7.
-    if s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0 {
-        let ipv4 = std::net::Ipv4Addr::new(
+    if NAT64_WELL_KNOWN_NET.contains(ipv6) {
+        let s = ipv6.segments();
+        let ipv4 = Ipv4Addr::new(
             (s[6] >> 8) as u8,
             (s[6] & 0xff) as u8,
             (s[7] >> 8) as u8,
