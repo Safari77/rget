@@ -1348,7 +1348,7 @@ fn load_key(path: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {
         .map_err(|e| anyhow::anyhow!("Invalid or missing private key in '{}': {}", path, e))
 }
 async fn resolve_final_url_and_client(
-    initial_url: Url,
+    mut initial_url: Url,
     args: &Args,
     client_cache: &mut HashMap<String, Client>,
     hsts_db: &mut HstsMap,
@@ -1370,7 +1370,7 @@ async fn resolve_final_url_and_client(
 
     // HTTP credentials (--user/--password and credential-bearing --header values)
     // are only ever sent to the host in `cred_scope`.
-
+    canonicalize_url_path(&mut initial_url);
     let mut current_url = initial_url;
     let mut redirect_count = 0;
 
@@ -1522,8 +1522,9 @@ async fn resolve_final_url_and_client(
                 return Err(PermanentError::RedirectWithoutLocation(status.as_u16()).into());
             };
             let location_str = location.to_str().context("Invalid Location header")?;
-            let next_url =
+            let mut next_url =
                 current_url.join(location_str).context("Failed to resolve redirect URL")?;
+            canonicalize_url_path(&mut next_url);
             if args.verbose {
                 eprintln!("   Redirecting to: {}", next_url);
             }
@@ -1732,7 +1733,7 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
     let tls_config = build_tls_config(&args)?;
 
     for url_str in &urls {
-        let url = match Url::parse(url_str) {
+        let mut url = match Url::parse(url_str) {
             Ok(u) => u,
             Err(e) => {
                 eprintln!("Error parsing URL '{}': {}", url_str, e);
@@ -1740,6 +1741,7 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                 continue;
             }
         };
+        canonicalize_url_path(&mut url);
 
         // HTTP credentials may only go to the host of the URL the user supplied
         // (URLs listed in server-supplied JSON are not trusted with them).
@@ -2304,6 +2306,31 @@ fn read_personalization_key() -> String {
     }
 }
 
+/// Canonicalize URL path in-place by collapsing consecutive slashes into a single slash.
+/// Preserves scheme, host, port, query parameters, and fragments intact.
+fn canonicalize_url_path(url: &mut Url) {
+    let path = url.path();
+    if !path.contains("//") {
+        return;
+    }
+
+    let mut collapsed = String::with_capacity(path.len());
+    let mut prev_slash = false;
+    for c in path.chars() {
+        if c == '/' {
+            if !prev_slash {
+                collapsed.push(c);
+                prev_slash = true;
+            }
+        } else {
+            collapsed.push(c);
+            prev_slash = false;
+        }
+    }
+
+    url.set_path(&collapsed);
+}
+
 /// Generate a deterministic temporary filename using SHAKE256
 ///
 /// The filename is derived from:
@@ -2323,7 +2350,16 @@ fn generate_deterministic_temp_filename(
     debug: bool,
 ) -> PathBuf {
     let personalization_key = read_personalization_key();
-    let domain_version = "temp-filename-v1";
+    let domain_version = "temp-filename-v2";
+
+    let mut cloned_url;
+    let canonical_url = if url.path().contains("//") {
+        cloned_url = url.clone();
+        canonicalize_url_path(&mut cloned_url);
+        &cloned_url
+    } else {
+        url
+    };
 
     if debug {
         eprintln!("[DEBUG] SHAKE256 inputs for temp filename:");
@@ -2334,7 +2370,7 @@ fn generate_deterministic_temp_filename(
         );
         eprintln!("[DEBUG]   personalization_key: {:?}", personalization_key);
         eprintln!("[DEBUG]   target length: {}", temp_name_len);
-        eprintln!("[DEBUG]   url: {:?}", url.as_str());
+        eprintln!("[DEBUG]   url: {:?}", canonical_url.as_str());
         eprintln!("[DEBUG]   filename: {:?}", actual_filename);
     }
 
@@ -2347,7 +2383,7 @@ fn generate_deterministic_temp_filename(
     hasher.update(b"\x00");
     hasher.update(&(temp_name_len as u64).to_be_bytes());
     hasher.update(b"\x00");
-    hasher.update(url.as_str().as_bytes());
+    hasher.update(canonical_url.as_str().as_bytes());
     hasher.update(b"\x00");
     hasher.update(actual_filename.as_bytes());
 
@@ -3963,7 +3999,7 @@ async fn process_json_downloads(
     let mut failed_count: usize = 0;
 
     for entry in &entries {
-        let url = match Url::parse(&entry.url) {
+        let mut url = match Url::parse(&entry.url) {
             Ok(u) => u,
             Err(e) => {
                 eprintln!("Error parsing URL '{}': {}", terminal_safe(&entry.url), e);
@@ -3971,6 +4007,7 @@ async fn process_json_downloads(
                 continue;
             }
         };
+        canonicalize_url_path(&mut url);
 
         if !args.quiet {
             eprintln!();
