@@ -1625,14 +1625,17 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
     }
 
     // Validate --filemode
-    if let Some(ref mode_str) = args.filemode
-        && u32::from_str_radix(mode_str, 8).is_err()
-    {
-        return Err(PermanentError::InvalidArguments(format!(
-            "Invalid octal file mode: '{}'",
-            mode_str
-        ))
-        .into());
+    if let Some(ref mode_str) = args.filemode {
+        match u32::from_str_radix(mode_str, 8) {
+            Ok(m) if m <= 0o7777 => {}
+            _ => {
+                return Err(PermanentError::InvalidArguments(format!(
+                    "Invalid file mode: '{}' (expect octal digits 0-7, value <= 7777)",
+                    mode_str
+                ))
+                .into());
+            }
+        }
     }
 
     // Validate --json-parse requirements
