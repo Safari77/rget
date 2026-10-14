@@ -2643,6 +2643,7 @@ struct PinnedOutput {
 
 /// Decision returned by `evaluate_local_target` after inspecting `output_info`
 /// and `temp_info`.
+#[derive(Debug)]
 enum LocalTargetAction {
     /// Target file (or finalized temp file) is already complete; skip download.
     AlreadyComplete,

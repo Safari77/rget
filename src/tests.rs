@@ -1574,24 +1574,515 @@ fn test_openat2_security_linux() {
 
     // 1. Verify normal file creation succeeds
     let (file, existed) = open_file_securely(&target_file, &args, 0, false, &mut cache)
-        .expect("Should create file securely via openat2");
+        .expect("Should create file securely via DirCache/openat2");
     assert!(!existed, "File should not have existed");
     drop(file);
 
-    // 2. Verify Symlink protection (RESOLVE_NO_SYMLINKS)
+    // 2. Verify Symlink protection in open_file_securely (pre-open symlink_metadata
+    //    returns PermanentError::IsASymlink; O_NOFOLLOW / RESOLVE_NO_SYMLINKS backs it up)
     let err = open_file_securely(&symlink_file, &args, 0, false, &mut cache)
-        .expect_err("openat2 MUST fail when traversing a symlink");
+        .expect_err("open_file_securely MUST fail when target is a symlink");
 
-    let err_str = err.to_string();
-
-    // ELOOP on Linux is typically OS error 40 ("Too many levels of symbolic links")
     assert!(
-        err_str.contains("Too many levels of symbolic links") || err_str.contains("os error 40"),
-        "Symlink bypass failed! openat2 did not return ELOOP. Got: {}",
-        err_str
+        matches!(err.downcast_ref::<PermanentError>(), Some(PermanentError::IsASymlink(p)) if p == &symlink_file),
+        "Expected PermanentError::IsASymlink({:?}), got: {:#}",
+        symlink_file,
+        err
+    );
+    assert!(is_permanent_error(&err), "Symlink error must be classified as permanent");
+
+    // 3. Verify kernel-level O_NOFOLLOW / openat2 ELOOP protection directly via open_for_read
+    let read_err = open_for_read(&symlink_file, &mut cache)
+        .expect_err("open_for_read MUST fail with ELOOP on a symlink");
+    assert_eq!(
+        read_err.raw_os_error(),
+        Some(libc::ELOOP),
+        "open_for_read did not return ELOOP on symlink. Got: {}",
+        read_err
     );
 
     // Cleanup
     let _ = std::fs::remove_file(&target_file);
     let _ = std::fs::remove_file(&symlink_file);
+}
+
+// =============================================================================
+// SECTION 11: Additional Unit & Security Tests
+// =============================================================================
+
+#[test]
+fn test_ipv6_nat64_and_ipv4_compat_private_detection() {
+    // NAT64 well-known prefix 64:ff9b::/96 (RFC 6052) embedding private IPv4
+    let nat64_loopback: IpAddr = "64:ff9b::7f00:1".parse().unwrap(); // 127.0.0.1
+    let nat64_private: IpAddr = "64:ff9b::c0a8:101".parse().unwrap(); // 192.168.1.1
+    let nat64_public: IpAddr = "64:ff9b::808:808".parse().unwrap(); // 8.8.8.8
+
+    assert!(is_private_ip(&nat64_loopback), "NAT64 loopback must be private");
+    assert!(is_private_ip(&nat64_private), "NAT64 RFC1918 must be private");
+    assert!(!is_private_ip(&nat64_public), "NAT64 8.8.8.8 must be public");
+
+    // NAT64 local-use prefix 64:ff9b:1::/48 (RFC 8215) is always private
+    let nat64_local: IpAddr = "64:ff9b:1::808:808".parse().unwrap();
+    assert!(is_private_ip(&nat64_local), "NAT64 local-use 64:ff9b:1::/48 must be private");
+
+    // Deprecated IPv4-compatible IPv6 ::x.x.x.x (RFC 4291 §2.5.5.1)
+    let compat_private: IpAddr = "::192.168.1.1".parse().unwrap();
+    let compat_this_net: IpAddr = "::0.0.0.1".parse().unwrap();
+    let compat_public: IpAddr = "::8.8.8.8".parse().unwrap();
+
+    assert!(is_private_ip(&compat_private), "IPv4-compatible private IP must be blocked");
+    assert!(is_private_ip(&compat_this_net), "IPv4-compatible 0.0.0.1 must be blocked");
+    assert!(!is_private_ip(&compat_public), "IPv4-compatible 8.8.8.8 must be public");
+
+    // Additional blocked IPv6 ranges (Documentation RFC 9637, Benchmarking, ORCHIDv2, Discard, SRv6)
+    for blocked in
+        ["3fff::1", "2001:db8::1", "2001:2::1", "2001:20::1", "100::1", "5f00::1", "ff02::1"]
+    {
+        let ip: IpAddr = blocked.parse().unwrap();
+        assert!(is_private_ip(&ip), "Address {} should be blocked as non-public", blocked);
+    }
+
+    // Additional blocked IPv4 ranges (0.0.0.0/8, CGNAT 100.64/10, 192.0.0.0/24, 198.18/15, 240/4)
+    for blocked in [
+        "0.0.0.0",
+        "0.1.2.3",
+        "100.64.0.1",
+        "100.127.255.254",
+        "192.0.0.1",
+        "198.18.0.1",
+        "198.19.255.254",
+        "224.0.0.1",
+        "240.0.0.1",
+        "255.255.255.255",
+    ] {
+        let ip: IpAddr = blocked.parse().unwrap();
+        assert!(is_private_ip(&ip), "IPv4 address {} should be blocked", blocked);
+    }
+}
+
+#[test]
+fn test_normalize_path_lexically() {
+    assert_eq!(normalize_path_lexically(Path::new("")), PathBuf::from("."));
+    assert_eq!(normalize_path_lexically(Path::new(".")), PathBuf::from("."));
+    assert_eq!(normalize_path_lexically(Path::new("././.")), PathBuf::from("."));
+    assert_eq!(normalize_path_lexically(Path::new("./a/./b//")), PathBuf::from("a/b"));
+    assert_eq!(normalize_path_lexically(Path::new("/..")), PathBuf::from("/"));
+    assert_eq!(normalize_path_lexically(Path::new("/../../a")), PathBuf::from("/a"));
+
+    // Crucial POSIX guarantee: `..` after a normal component must NOT be folded
+    // away lexically because `link/..` resolves through the symlink target.
+    assert_eq!(normalize_path_lexically(Path::new("link/..")), PathBuf::from("link/.."));
+    assert_eq!(
+        normalize_path_lexically(Path::new("/tmp/link/../target")),
+        PathBuf::from("/tmp/link/../target")
+    );
+    assert_eq!(normalize_path_lexically(Path::new("../outside")), PathBuf::from("../outside"));
+}
+
+#[test]
+fn test_credential_scope_security() {
+    // 1. HTTPS origin: requires exact host, port, and HTTPS scheme
+    let https_origin = Url::parse("https://example.com/secret/file.zip").unwrap();
+    let scope = CredentialScope::from_url(&https_origin).unwrap();
+
+    assert!(scope.allows(&Url::parse("https://example.com/other/path").unwrap()));
+    assert!(scope.allows(&Url::parse("https://example.com:443/other").unwrap()));
+    assert!(
+        !scope.allows(&Url::parse("http://example.com/other").unwrap()),
+        "Credentials must never be sent after an HTTPS -> HTTP scheme downgrade"
+    );
+    assert!(
+        !scope.allows(&Url::parse("https://evil.com/other").unwrap()),
+        "Credentials must never leak to a different host"
+    );
+    assert!(
+        !scope.allows(&Url::parse("https://sub.example.com/other").unwrap()),
+        "Credentials must not leak to subdomains"
+    );
+    assert!(
+        !scope.allows(&Url::parse("https://example.com:8443/other").unwrap()),
+        "Credentials must not leak to a different port"
+    );
+
+    // 2. HTTP origin (e.g. with --insecure): allows same-host HTTP (80) AND HSTS/redirect upgrade to HTTPS (443)
+    let http_origin = Url::parse("http://example.com/file.zip").unwrap();
+    let http_scope = CredentialScope::from_url(&http_origin).unwrap();
+
+    assert!(http_scope.allows(&Url::parse("http://example.com/next").unwrap()));
+    assert!(
+        http_scope.allows(&Url::parse("https://example.com/next").unwrap()),
+        "HTTP port 80 upgraded to HTTPS port 443 on the same host should be allowed"
+    );
+    assert!(
+        !http_scope.allows(&Url::parse("https://example.com:8443/next").unwrap()),
+        "Upgrade to non-standard HTTPS port must not carry credentials"
+    );
+}
+
+#[test]
+fn test_parse_custom_headers_and_sensitive_separation() {
+    let mut args = make_args();
+    args.header = vec![
+        "X-Custom: value1".to_string(),
+        "Authorization: Bearer secret_token".to_string(),
+        "Cookie: sid=12345".to_string(),
+        "Proxy-Authorization: Basic dXNlcjpwYXNz".to_string(),
+        "Accept: application/json".to_string(),
+        "MalformedHeaderWithoutColon".to_string(),
+    ];
+
+    let (plain, sensitive) = parse_custom_headers(&args, false);
+
+    assert_eq!(plain.get("x-custom").unwrap(), "value1");
+    assert_eq!(plain.get("accept").unwrap(), "application/json");
+    assert!(plain.get(AUTHORIZATION).is_none());
+    assert!(plain.get(COOKIE).is_none());
+    assert!(plain.get(PROXY_AUTHORIZATION).is_none());
+
+    assert_eq!(sensitive.get(AUTHORIZATION).unwrap(), "Bearer secret_token");
+    assert_eq!(sensitive.get(COOKIE).unwrap(), "sid=12345");
+    assert_eq!(sensitive.get(PROXY_AUTHORIZATION).unwrap(), "Basic dXNlcjpwYXNz");
+}
+
+#[test]
+fn test_terminal_safe_escapes_control_and_bidi() {
+    // Plain text and safe Unicode pass through unchanged
+    assert_eq!(terminal_safe("hello_world-123.txt"), "hello_world-123.txt");
+    assert_eq!(terminal_safe("café-🦀.tar.gz"), "café-🦀.tar.gz");
+
+    // ANSI escape sequence injection (\x1b[31m) and C0/C1 controls are escaped
+    let ansi = "evil\x1b[31mred\x07bell\nnewline";
+    let safe = terminal_safe(ansi);
+    assert!(!safe.contains('\x1b'));
+    assert!(!safe.contains('\x07'));
+    assert!(!safe.contains('\n'));
+    assert!(safe.contains("\\u{1b}"));
+    assert!(safe.contains("\\u{7}"));
+
+    // Bidi override characters (Trojan Source / extension spoofing) are escaped
+    let bidi = "report\u{202E}txt.exe";
+    let safe_bidi = terminal_safe(bidi);
+    assert!(!safe_bidi.contains('\u{202E}'));
+    assert!(safe_bidi.contains("\\u{202e}"));
+}
+
+#[test]
+fn test_sanitize_filename_dash_and_bidi() {
+    // "-" must never survive as "-" (reserved for stdout in -O-)
+    assert_eq!(sanitize_filename("-"), "_");
+    assert_eq!(sanitize_filename("/path/to/-"), "_");
+    assert_eq!(sanitize_filename(".-"), "_");
+
+    // Bidi override characters must be replaced with '_'
+    assert_eq!(sanitize_filename("evil\u{202E}txt.exe"), "evil_txt.exe");
+    assert_eq!(sanitize_filename("evil\u{2066}name.txt"), "evil_name.txt");
+}
+
+#[test]
+fn test_filename_from_url_encoded_slash_and_special_chars() {
+    // %2F in the last segment is decoded to '/' and then stripped by
+    // sanitize_filename's rsplit(['/', '\\']), leaving the final component
+    // ("file.txt") so it cannot traverse directories.
+    let url = Url::parse("https://example.com/dir/sub%2Ffile.txt").unwrap();
+    assert_eq!(filename_from_url(&url), "file.txt");
+
+    // Trailing %2F in the last segment: picking the raw segment BEFORE decoding
+    // prevents rsplit('/') from seeing an empty trailing segment and falling
+    // back to "index.html"; instead sanitize_filename strips the trailing
+    // empty piece after '/' and falls back to "download".
+    let url_trailing = Url::parse("https://example.com/dir/sub%2F").unwrap();
+    assert_eq!(filename_from_url(&url_trailing), "download");
+
+    // Encoded '?' (%3F) and '#' (%23) inside the filename segment must not
+    // truncate the filename ('?' is sanitized to '_', '#' is preserved).
+    let url_q = Url::parse("https://example.com/a%3Fb%23c.txt").unwrap();
+    assert_eq!(filename_from_url(&url_q), "a_b#c.txt");
+}
+
+#[test]
+fn test_canonicalize_url_path_and_temp_filename() {
+    let mut url = Url::parse("https://example.com//a///b//file.zip?x=1//2#frag").unwrap();
+    canonicalize_url_path(&mut url);
+    assert_eq!(url.path(), "/a/b/file.zip");
+    // Query and fragment must be untouched
+    assert_eq!(url.query(), Some("x=1//2"));
+    assert_eq!(url.fragment(), Some("frag"));
+
+    // Consecutive slashes in URL path must produce the exact same deterministic temp filename
+    let u1 = Url::parse("https://example.com/a/b/file.zip").unwrap();
+    let u2 = Url::parse("https://example.com//a///b//file.zip").unwrap();
+    let parent = Path::new(".");
+    assert_eq!(
+        generate_deterministic_temp_filename(&u1, "file.zip", parent, 16, false),
+        generate_deterministic_temp_filename(&u2, "file.zip", parent, 16, false)
+    );
+}
+
+#[test]
+fn test_parse_unsatisfied_content_range() {
+    assert_eq!(parse_unsatisfied_content_range("bytes */0"), Some(0));
+    assert_eq!(parse_unsatisfied_content_range("bytes */12345"), Some(12345));
+    assert_eq!(parse_unsatisfied_content_range("  BYTES */99  "), Some(99));
+
+    // Satisfied ranges or malformed values must return None
+    assert_eq!(parse_unsatisfied_content_range("bytes 0-0/1"), None);
+    assert_eq!(parse_unsatisfied_content_range("bytes */*"), None);
+    assert_eq!(parse_unsatisfied_content_range("bytes */+10"), None);
+    assert_eq!(parse_unsatisfied_content_range("items */0"), None);
+}
+
+#[test]
+fn test_parse_digest_field() {
+    let hex64 = "a".repeat(64);
+    let prefixed = format!("sha256:{}", hex64);
+    assert_eq!(parse_digest_field(&prefixed), Some(("sha256", hex64.as_str())));
+
+    // Bare 64-char hex is recognized as sha256
+    assert_eq!(parse_digest_field(&hex64), Some(("sha256", hex64.as_str())));
+
+    // Other algorithms parse so caller can reject with JsonHashUnsupportedAlgo
+    assert_eq!(parse_digest_field("sha512:deadbeef"), Some(("sha512", "deadbeef")));
+
+    // Invalid formats return None
+    assert_eq!(parse_digest_field("sha256:"), None);
+    assert_eq!(parse_digest_field("not_a_hash"), None);
+    assert_eq!(parse_digest_field(&"g".repeat(64)), None);
+}
+
+#[test]
+fn test_is_text_content_type() {
+    assert!(is_text_content_type(Some("text/plain")));
+    assert!(is_text_content_type(Some("text/html; charset=utf-8")));
+    assert!(is_text_content_type(Some("Application/JSON; charset=UTF-8")));
+    assert!(is_text_content_type(Some("application/problem+json")));
+    assert!(is_text_content_type(Some("application/atom+xml")));
+    assert!(is_text_content_type(Some("application/javascript")));
+    assert!(is_text_content_type(Some("application/x-yaml")));
+
+    assert!(!is_text_content_type(None));
+    assert!(!is_text_content_type(Some("")));
+    assert!(!is_text_content_type(Some("application/octet-stream")));
+    assert!(!is_text_content_type(Some("image/png")));
+    assert!(!is_text_content_type(Some("application/pdf")));
+}
+
+#[test]
+fn test_http_date_roundtrip() {
+    let date_str = "Sun, 06 Nov 1994 08:49:37 GMT";
+    let parsed = parse_http_date(date_str).expect("Should parse RFC 1123 date");
+    let formatted = format_http_date(parsed).expect("Should format SystemTime");
+    assert_eq!(formatted, date_str);
+
+    // RFC 850 and asctime formats
+    assert!(parse_http_date("Sunday, 06-Nov-94 08:49:37 GMT").is_some());
+    assert!(parse_http_date("Sun Nov  6 08:49:37 1994").is_some());
+    assert!(parse_http_date("not a valid date").is_none());
+}
+
+#[test]
+fn test_generate_numbered_filename_and_truncation() {
+    let p = Path::new("/tmp/archive.tar.gz");
+    assert_eq!(generate_numbered_filename(p, 1, false), PathBuf::from("/tmp/archive.tar.gz.1"));
+    // keep_extension splits at rfind('.') -> before ".gz"
+    assert_eq!(generate_numbered_filename(p, 1, true), PathBuf::from("/tmp/archive.tar.1.gz"));
+
+    // When filename is already at MAX_FILENAME_BYTES (255), numbering must
+    // shorten the base while preserving both the number and extension.
+    let long_name = format!("{}.txt", "a".repeat(251)); // 255 bytes
+    assert_eq!(long_name.len(), MAX_FILENAME_BYTES);
+    let long_path = PathBuf::from(&long_name);
+
+    let numbered_default = generate_numbered_filename(&long_path, 42, false);
+    let fname_default = numbered_default.file_name().unwrap().to_str().unwrap();
+    assert!(fname_default.len() <= MAX_FILENAME_BYTES);
+    assert!(fname_default.ends_with(".txt.42"));
+
+    let numbered_keep_ext = generate_numbered_filename(&long_path, 42, true);
+    let fname_keep_ext = numbered_keep_ext.file_name().unwrap().to_str().unwrap();
+    assert!(fname_keep_ext.len() <= MAX_FILENAME_BYTES);
+    assert!(fname_keep_ext.ends_with(".42.txt"));
+}
+
+#[test]
+fn test_resolve_unique_output_path_multiple_copies() {
+    let dir = tempfile::tempdir().unwrap();
+    let base_path = dir.path().join("file.txt");
+    let mut used = HashMap::new();
+    let mut cache = DirCache::default();
+
+    // Without --multiple-copies: second use in same run fails with FileAlreadyExists
+    let args_no_mc = make_args();
+    let (p1, renamed1) =
+        resolve_unique_output_path(&base_path, &args_no_mc, &mut used, &mut cache).unwrap();
+    assert_eq!(p1, base_path);
+    assert!(!renamed1);
+    let err = resolve_unique_output_path(&base_path, &args_no_mc, &mut used, &mut cache)
+        .expect_err("Duplicate filename without --multiple-copies must fail");
+    assert!(matches!(
+        err.downcast_ref::<PermanentError>(),
+        Some(PermanentError::FileAlreadyExists(_))
+    ));
+
+    // With --multiple-copies and --keep-extension
+    let mut args_mc = make_args();
+    args_mc.multiple_copies = true;
+    args_mc.keep_extension = true;
+    let mut used_mc = HashMap::new();
+
+    // Pre-create file.txt and file.1.txt on disk so resolver must skip both
+    std::fs::write(&base_path, b"existing").unwrap();
+    std::fs::write(dir.path().join("file.1.txt"), b"existing 1").unwrap();
+
+    let (first, was_renamed) =
+        resolve_unique_output_path(&base_path, &args_mc, &mut used_mc, &mut cache).unwrap();
+    assert!(was_renamed);
+    assert_eq!(first, dir.path().join("file.2.txt"));
+
+    let (second, was_renamed2) =
+        resolve_unique_output_path(&base_path, &args_mc, &mut used_mc, &mut cache).unwrap();
+    assert!(was_renamed2);
+    assert_eq!(second, dir.path().join("file.3.txt"));
+}
+
+#[test]
+fn test_is_permanent_error_http_status_classification() {
+    // 4xx (except 429) are permanent
+    for code in [400u16, 401, 403, 404, 416] {
+        let err = anyhow::Error::new(PermanentError::HttpClientError(code));
+        assert!(is_permanent_error(&err), "HTTP {} should be permanent", code);
+    }
+
+    // 429 Too Many Requests and 5xx are transient (retryable)
+    for code in [429u16, 500, 502, 503, 504] {
+        let err = anyhow::Error::new(PermanentError::HttpClientError(code));
+        assert!(!is_permanent_error(&err), "HTTP {} should be transient", code);
+    }
+}
+
+#[test]
+fn test_evaluate_local_target_decisions() {
+    let dir = tempfile::tempdir().unwrap();
+    let out_path = dir.path().join("out.bin");
+    let mut cache = DirCache::default();
+
+    let out_info = FileInfo {
+        size: 100,
+        modified: Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+        is_regular: true,
+    };
+
+    // 1. Default flags + existing incomplete file -> FileAlreadyExists
+    let args = make_args();
+    let res = evaluate_local_target(
+        &out_path,
+        None,
+        Some(&out_info),
+        None,
+        &args,
+        Some(200),
+        None,
+        None,
+        &mut cache,
+    );
+    assert!(matches!(
+        res.expect_err("Should reject existing incomplete file").downcast_ref::<PermanentError>(),
+        Some(PermanentError::FileAlreadyExists(_))
+    ));
+
+    // 2. Default flags + existing file already matching expected_length -> AlreadyComplete
+    let res = evaluate_local_target(
+        &out_path,
+        None,
+        Some(&out_info),
+        None,
+        &args,
+        Some(100),
+        None,
+        None,
+        &mut cache,
+    )
+    .unwrap();
+    assert!(matches!(res, LocalTargetAction::AlreadyComplete));
+
+    // 3. --continue with partial file -> Proceed from byte 100
+    let mut args_resume = make_args();
+    args_resume.resume = true;
+    let res = evaluate_local_target(
+        &out_path,
+        None,
+        Some(&out_info),
+        None,
+        &args_resume,
+        Some(200),
+        None,
+        None,
+        &mut cache,
+    )
+    .unwrap();
+    assert!(matches!(res, LocalTargetAction::Proceed { start_byte: 100, force_truncate: false }));
+
+    // 4. --overwrite even when local size == expected_length -> Proceed from 0
+    let mut args_ow = make_args();
+    args_ow.overwrite = true;
+    let res = evaluate_local_target(
+        &out_path,
+        None,
+        Some(&out_info),
+        None,
+        &args_ow,
+        Some(100),
+        None,
+        None,
+        &mut cache,
+    )
+    .unwrap();
+    assert!(matches!(res, LocalTargetAction::Proceed { start_byte: 0, force_truncate: false }));
+}
+
+#[test]
+fn test_perform_atomic_move_and_sha256_verification() {
+    let dir = tempfile::tempdir().unwrap();
+    let temp_path = dir.path().join(".test.rget.tmp");
+    let target_path = dir.path().join("final.txt");
+    let mut cache = DirCache::default();
+    let args = make_args();
+
+    std::fs::write(&temp_path, b"hello world").unwrap();
+
+    // Move to non-existent target succeeds
+    let final_p = perform_atomic_move(&temp_path, &target_path, &args, &mut cache).unwrap();
+    assert_eq!(final_p, target_path);
+    assert!(!temp_path.exists());
+    assert_eq!(std::fs::read(&target_path).unwrap(), b"hello world");
+
+    // Verify SHA256 of "hello world"
+    let expected_sha = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+    verify_sha256_file(&target_path, expected_sha, true, &mut cache)
+        .expect("Valid SHA256 should succeed");
+
+    let bad_sha = "0".repeat(64);
+    let err = verify_sha256_file(&target_path, &bad_sha, true, &mut cache)
+        .expect_err("Mismatched SHA256 must fail");
+    assert!(matches!(
+        err.downcast_ref::<PermanentError>(),
+        Some(PermanentError::JsonHashMismatch { .. })
+    ));
+
+    // Moving onto an existing target without --overwrite fails with FileAppearedDuringDownload
+    std::fs::write(&temp_path, b"new content").unwrap();
+    let move_err = perform_atomic_move(&temp_path, &target_path, &args, &mut cache)
+        .expect_err("Atomic move without overwrite must not clobber existing file");
+    assert!(matches!(
+        move_err.downcast_ref::<PermanentError>(),
+        Some(PermanentError::FileAppearedDuringDownload(_))
+    ));
+    // Original file content is preserved
+    assert_eq!(std::fs::read(&target_path).unwrap(), b"hello world");
+
+    // With --overwrite, atomic move replaces the target
+    let mut args_ow = make_args();
+    args_ow.overwrite = true;
+    perform_atomic_move(&temp_path, &target_path, &args_ow, &mut cache)
+        .expect("Atomic move with --overwrite should succeed");
+    assert_eq!(std::fs::read(&target_path).unwrap(), b"new content");
 }
