@@ -147,6 +147,7 @@ pub enum PermanentError {
     FileAlreadyExists(PathBuf),
     TruncatedFilenameExists(PathBuf),
     FilenameTooLong,
+    IsASymlink(PathBuf),
 
     // URL/scheme/TLS builder errors
     InsecureUrl(String),
@@ -246,6 +247,9 @@ impl std::fmt::Display for PermanentError {
             }
             Self::FilenameTooLong => {
                 write!(f, "Filename too long and cannot be truncated")
+            }
+            Self::IsASymlink(path) => {
+                write!(f, "Refusing to write to symlink: '{}'", path.display())
             }
             Self::InsecureUrl(url) => {
                 write!(f, "Refusing insecure HTTP URL: {}. Use --insecure to allow.", url)
@@ -1135,6 +1139,36 @@ fn build_tls_config(args: &Args) -> Result<Option<ClientConfig>> {
     Ok(Some(client_config))
 }
 
+/// Check whether a non-empty proxy environment variable is configured for `url`'s scheme.
+/// An empty value (e.g. `HTTP_PROXY=""`) is treated as unset so it neither bypasses
+/// `resolve_safe_ip` nor triggers a false `ProxyIpPolicyConflict`.
+fn is_env_proxy_configured(url: &Url, args: &Args) -> bool {
+    if args.no_proxy {
+        return false;
+    }
+    let non_empty = |key: &str| std::env::var(key).is_ok_and(|v| !v.trim().is_empty());
+
+    let scheme_proxy = match url.scheme() {
+        "http" => non_empty("HTTP_PROXY") || non_empty("http_proxy"),
+        "https" => non_empty("HTTPS_PROXY") || non_empty("https_proxy"),
+        _ => false,
+    };
+
+    scheme_proxy || non_empty("ALL_PROXY") || non_empty("all_proxy")
+}
+
+/// Parse an RFC 9110 §14.4 `unsatisfied-range` `Content-Range` header
+/// (`bytes */<complete-length>`), returning `Some(complete_length)`.
+fn parse_unsatisfied_content_range(header_value: &str) -> Option<u64> {
+    let value = header_value.trim_matches(|c| c == ' ' || c == '\t');
+    let (unit, rest) = value.split_once(' ')?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return None;
+    }
+    let complete_length = rest.strip_prefix("*/")?;
+    parse_decimal(complete_length)
+}
+
 fn build_client(
     args: &Args,
     resolve_override: Option<(&str, SocketAddr)>,
@@ -1296,17 +1330,32 @@ fn with_sensitive_headers(
 #[derive(Debug, Clone)]
 struct CredentialScope {
     host: String,
+    port: Option<u16>,
     require_https: bool,
 }
 
 impl CredentialScope {
     fn from_url(url: &Url) -> Option<Self> {
-        url.host_str().map(|h| Self { host: h.to_string(), require_https: url.scheme() == "https" })
+        url.host_str().map(|h| Self {
+            host: h.to_string(),
+            port: url.port_or_known_default(),
+            require_https: url.scheme() == "https",
+        })
     }
 
     fn allows(&self, url: &Url) -> bool {
-        url.host_str() == Some(self.host.as_str())
-            && (!self.require_https || url.scheme() == "https")
+        if url.host_str() != Some(self.host.as_str()) {
+            return false;
+        }
+        if self.require_https && url.scheme() != "https" {
+            return false;
+        }
+        let target_port = url.port_or_known_default();
+        target_port == self.port
+            || (!self.require_https
+                && self.port == Some(80)
+                && url.scheme() == "https"
+                && target_port == Some(443))
     }
 }
 
@@ -1347,8 +1396,9 @@ fn load_key(path: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {
     rustls::pki_types::PrivateKeyDer::from_pem_file(path)
         .map_err(|e| anyhow::anyhow!("Invalid or missing private key in '{}': {}", path, e))
 }
+
 async fn resolve_final_url_and_client(
-    mut initial_url: Url,
+    initial_url: Url,
     args: &Args,
     client_cache: &mut HashMap<String, Client>,
     hsts_db: &mut HstsMap,
@@ -1369,8 +1419,7 @@ async fn resolve_final_url_and_client(
     // to HTTPS before validation, so try_hsts_upgrade runs first inside the loop.
 
     // HTTP credentials (--user/--password and credential-bearing --header values)
-    // are only ever sent to the host in `cred_scope`.
-    canonicalize_url_path(&mut initial_url);
+    // are only ever sent to the host/port in `cred_scope`.
     let mut current_url = initial_url;
     let mut redirect_count = 0;
 
@@ -1391,14 +1440,7 @@ async fn resolve_final_url_and_client(
             eprintln!("-> Requesting: {}", current_url);
         }
 
-        let client = if !args.no_proxy
-            && (std::env::var("HTTP_PROXY").is_ok()
-                || std::env::var("HTTPS_PROXY").is_ok()
-                || std::env::var("ALL_PROXY").is_ok()
-                || std::env::var("http_proxy").is_ok()
-                || std::env::var("https_proxy").is_ok()
-                || std::env::var("all_proxy").is_ok())
-        {
+        let client = if is_env_proxy_configured(&current_url, args) {
             // A proxy resolves names and connects on its own, so resolve_safe_ip
             // (and with it --no-private-ips, -4 and -6) is never consulted.
             // Fail closed instead of silently dropping the requested policy.
@@ -1450,7 +1492,7 @@ async fn resolve_final_url_and_client(
             }
         };
 
-        // Only send credentials to the host the user named, never to a host
+        // Only send credentials to the host/port the user named, never to a host
         // reached through a redirect or listed in JSON, and never after an
         // https -> http downgrade.
         let same_host = cred_scope.is_some_and(|scope| scope.allows(&current_url));
@@ -1468,6 +1510,7 @@ async fn resolve_final_url_and_client(
         }
         request = with_sensitive_headers(request, args, same_host);
 
+        let mut used_range_probe = false;
         let mut response = request.send().await.context("Failed to send HEAD request")?;
         if response.status() == StatusCode::METHOD_NOT_ALLOWED {
             if args.debug {
@@ -1487,6 +1530,7 @@ async fn resolve_final_url_and_client(
             }
             get_request = with_sensitive_headers(get_request, args, same_host);
             response = get_request.send().await.context("Failed to send GET request")?;
+            used_range_probe = true;
         }
 
         if !args.disable_hsts
@@ -1522,9 +1566,8 @@ async fn resolve_final_url_and_client(
                 return Err(PermanentError::RedirectWithoutLocation(status.as_u16()).into());
             };
             let location_str = location.to_str().context("Invalid Location header")?;
-            let mut next_url =
+            let next_url =
                 current_url.join(location_str).context("Failed to resolve redirect URL")?;
-            canonicalize_url_path(&mut next_url);
             if args.verbose {
                 eprintln!("   Redirecting to: {}", next_url);
             }
@@ -1533,28 +1576,58 @@ async fn resolve_final_url_and_client(
             continue;
         }
 
-        // For a 206 response the Content-Length header is the *remaining* byte
-        // count, and the full resource size lives in Content-Range's
-        // complete-length field. This matters for the 405->GET probe above,
-        // which sends `Range: bytes=0-0` (its Content-Length would be 1).
-        let content_length = if status == StatusCode::PARTIAL_CONTENT {
-            headers
+        // When the 405 -> GET (Range: bytes=0-0) probe hits a 0-byte resource,
+        // RFC 9110 §14.1.2 / §14.4 requires the server to reply with 416 Range Not
+        // Satisfiable and `Content-Range: bytes */0`. Recognize that as a valid
+        // 0-byte resource rather than mistaking the 416 error body's Content-Length
+        // for the file size.
+        let is_zero_byte_range_probe = used_range_probe
+            && status == StatusCode::RANGE_NOT_SATISFIABLE
+            && headers
                 .get(CONTENT_RANGE)
                 .and_then(|v| v.to_str().ok())
-                .and_then(parse_content_range_resp)
-                .and_then(|r| r.complete_length)
-        } else {
-            headers
-                .get(CONTENT_LENGTH)
+                .and_then(parse_unsatisfied_content_range)
+                == Some(0);
+
+        // Only extract resource metadata (Content-Length, Content-Disposition,
+        // Last-Modified) from successful responses (or a 0-byte 416 range probe).
+        // Error responses (4xx/5xx) carry the error page's Content-Length, which
+        // must never be treated as the target file size in download_file.
+        let (content_length, content_disposition, last_modified) = if is_zero_byte_range_probe {
+            let cd = headers
+                .get(CONTENT_DISPOSITION)
                 .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
+                .map(|s| s.to_string());
+            let lm =
+                headers.get(LAST_MODIFIED).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+            (Some(0), cd, lm)
+        } else if status.is_success() {
+            // For a 206 response the Content-Length header is the *remaining* byte
+            // count, and the full resource size lives in Content-Range's
+            // complete-length field. This matters for the 405->GET probe above,
+            // which sends `Range: bytes=0-0` (its Content-Length would be 1).
+            let cl = if status == StatusCode::PARTIAL_CONTENT {
+                headers
+                    .get(CONTENT_RANGE)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(parse_content_range_resp)
+                    .and_then(|r| r.complete_length)
+            } else {
+                headers
+                    .get(CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+            };
+            let cd = headers
+                .get(CONTENT_DISPOSITION)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            let lm =
+                headers.get(LAST_MODIFIED).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+            (cl, cd, lm)
+        } else {
+            (None, None, None)
         };
-
-        let content_disposition =
-            headers.get(CONTENT_DISPOSITION).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
-
-        let last_modified =
-            headers.get(LAST_MODIFIED).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
 
         if status.is_success() || status.is_client_error() || status.is_server_error() {
             return Ok((
@@ -1736,7 +1809,7 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
     let tls_config = build_tls_config(&args)?;
 
     for url_str in &urls {
-        let mut url = match Url::parse(url_str) {
+        let url = match Url::parse(url_str) {
             Ok(u) => u,
             Err(e) => {
                 eprintln!("Error parsing URL '{}': {}", url_str, e);
@@ -1744,7 +1817,6 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                 continue;
             }
         };
-        canonicalize_url_path(&mut url);
 
         // HTTP credentials may only go to the host of the URL the user supplied
         // (URLs listed in server-supplied JSON are not trusted with them).
@@ -1847,13 +1919,14 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
 
         // Normal (non-JSON) download mode
         let mut attempt = 0;
-        // Output path pinned by the first attempt; retries reuse it so the
-        // auto-set resume flag cannot re-route the download into a different
-        // pre-existing file (see download_file).
-        let mut resolved_output: Option<PathBuf> = None;
+        // Output path and counter state pinned by the first attempt; retries
+        // reuse it so the auto-set resume flag cannot re-route the download into
+        // a different pre-existing file (see download_file).
+        let mut resolved_output: Option<PinnedOutput> = None;
         // Set by download_file once an attempt reaches the point of opening the
         // destination (or its temp file).
         let mut dest_touched = false;
+
         loop {
             let mut current_args = args.clone();
             if attempt > 0 && dest_touched {
@@ -2556,14 +2629,283 @@ fn check_file_after_open(
 struct FileInfo {
     size: u64,
     modified: Option<SystemTime>,
+    is_regular: bool,
+}
+
+/// Output path and `used_filenames` bookkeeping pinned by the first attempt of a
+/// download so retries reuse the exact same destination and counter state.
+#[derive(Debug, Clone)]
+struct PinnedOutput {
+    output_path: PathBuf,
+    canonical_key: PathBuf,
+    next_counter: u32,
+}
+
+/// Decision returned by `evaluate_local_target` after inspecting `output_info`
+/// and `temp_info`.
+enum LocalTargetAction {
+    /// Target file (or finalized temp file) is already complete; skip download.
+    AlreadyComplete,
+    /// Proceed with the download using the returned `start_byte` and `force_truncate`.
+    Proceed { start_byte: u64, force_truncate: bool },
+}
+
+/// Inspect existing `output_info` (checked first) and `temp_info` (checked second)
+/// to decide whether the download is already complete, prohibited by conflict rules,
+/// or should proceed from `start_byte` (with or without `force_truncate`).
+fn evaluate_local_target(
+    output_path: &Path,
+    temp_path: Option<&Path>,
+    output_info: Option<&FileInfo>,
+    temp_info: Option<&FileInfo>,
+    args: &Args,
+    expected_length: Option<u64>,
+    last_modified: Option<&str>,
+    expected_sha256: Option<&str>,
+    dir_cache: &mut DirCache,
+) -> Result<LocalTargetAction> {
+    // 1. Handle -N (--newer) mode when the destination file already exists on disk.
+    let mut newer_forces_restart = false;
+    if args.newer
+        && let Some(out_info) = output_info
+    {
+        if args.no_if_modified_since {
+            // --no-if-modified-since: Use the HEAD/GET response's Last-Modified
+            if let Some(lm_str) = last_modified
+                && let Some(server_time) = parse_http_date(lm_str)
+            {
+                if let Some(local_mtime) = out_info.modified {
+                    if server_time <= local_mtime {
+                        // Check if local file size matches expected server size (if known)
+                        if let Some(total) = expected_length {
+                            if out_info.is_regular && out_info.size == total {
+                                if !args.quiet {
+                                    eprintln!(
+                                        "Server file is not newer than local file '{}', skipping.",
+                                        output_path.display()
+                                    );
+                                }
+                                if let Some(expected) = expected_sha256 {
+                                    verify_sha256_file(
+                                        output_path,
+                                        expected,
+                                        args.quiet,
+                                        dir_cache,
+                                    )?;
+                                }
+                                return Ok(LocalTargetAction::AlreadyComplete);
+                            } else {
+                                if args.verbose {
+                                    eprintln!(
+                                        "Local file size ({}) differs from server ({}), downloading entire file.",
+                                        HumanBytes(out_info.size),
+                                        HumanBytes(total)
+                                    );
+                                }
+                                newer_forces_restart = true;
+                            }
+                        } else {
+                            if !args.quiet {
+                                eprintln!(
+                                    "Server file is not newer than local file '{}', skipping.",
+                                    output_path.display()
+                                );
+                            }
+                            return Ok(LocalTargetAction::AlreadyComplete);
+                        }
+                    } else {
+                        if args.verbose {
+                            eprintln!(
+                                "Server file is newer than local file, proceeding with download."
+                            );
+                        }
+                        newer_forces_restart = true;
+                    }
+                } else {
+                    newer_forces_restart = true;
+                }
+            } else {
+                if args.debug {
+                    eprintln!(
+                        "[DEBUG] -N --no-if-modified-since: No Last-Modified from HEAD, proceeding with download"
+                    );
+                }
+                newer_forces_restart = true;
+            }
+        } else {
+            // In -N mode with If-Modified-Since, never send a partial Range header
+            // for the existing local file; if the server reports the file was
+            // modified (200 OK), we replace it from byte 0.
+            newer_forces_restart = true;
+        }
+    }
+
+    // 2. Check output_info BEFORE temp_info so an already-complete output file
+    // is detected immediately (even in --temp --continue mode).
+    if let Some(out_info) = output_info {
+        let existing_size = out_info.size;
+
+        // --continue: skip if server file is smaller than local
+        if out_info.is_regular
+            && args.resume
+            && !args.newer
+            && !args.overwrite
+            && let Some(total) = expected_length
+            && existing_size > total
+        {
+            if !args.quiet {
+                eprintln!(
+                    "Local file ({}) is larger than server file ({}), skipping.",
+                    HumanBytes(existing_size),
+                    HumanBytes(total)
+                );
+            }
+            return Ok(LocalTargetAction::AlreadyComplete);
+        }
+
+        // Check if file is already complete (when we know expected size)
+        if out_info.is_regular
+            && let Some(total) = expected_length
+            && existing_size >= total
+            && !args.newer
+            && !args.overwrite
+        {
+            if !args.quiet {
+                eprintln!("File already fully downloaded.");
+            }
+            // --json-verify-hash must still check a pre-existing file
+            if let Some(expected) = expected_sha256 {
+                verify_sha256_file(output_path, expected, args.quiet, dir_cache)?;
+            }
+            return Ok(LocalTargetAction::AlreadyComplete);
+        }
+
+        // Output file exists but is incomplete (or unknown size)
+        if !args.resume && !args.overwrite && !args.newer {
+            return Err(PermanentError::FileAlreadyExists(output_path.to_path_buf()).into());
+        }
+    }
+
+    // 3. Temp mode: check temp_info for resume or finalization
+    if let Some(tp) = temp_path {
+        if newer_forces_restart {
+            return Ok(LocalTargetAction::Proceed { start_byte: 0, force_truncate: true });
+        }
+
+        if let Some(t_info) = temp_info
+            && args.resume
+            && !args.overwrite
+            && t_info.is_regular
+        {
+            let start_byte = t_info.size;
+
+            if args.debug {
+                eprintln!(
+                    "[DEBUG] Found existing temp file. Size: {}. Resume: true. New Start Byte: {}",
+                    start_byte, start_byte
+                );
+            }
+            if let Some(total) = expected_length {
+                // --continue: skip if server file is smaller than local
+                if start_byte > total {
+                    if !args.quiet {
+                        eprintln!(
+                            "Local temp file ({}) is larger than server file ({}), skipping.",
+                            HumanBytes(start_byte),
+                            HumanBytes(total)
+                        );
+                    }
+                    return Ok(LocalTargetAction::AlreadyComplete);
+                }
+                if start_byte >= total {
+                    if !args.quiet {
+                        eprintln!(
+                            "Temp file '{}' already fully downloaded, finalizing...",
+                            tp.display()
+                        );
+                    }
+                    // Verify before finalizing: a temp file left behind by an
+                    // earlier run (e.g. after a failed verification with
+                    // --keep-temp) must not be promoted unchecked.
+                    if let Some(expected) = expected_sha256 {
+                        verify_sha256_file(tp, expected, args.quiet, dir_cache)?;
+                    }
+                    // Set mtime on the temp file BEFORE atomic rename so the
+                    // destination path is published with its final timestamp.
+                    if args.server_timestamps {
+                        apply_server_timestamp(tp, last_modified, args.debug, dir_cache);
+                    }
+                    perform_atomic_move(tp, output_path, args, dir_cache)?;
+                    return Ok(LocalTargetAction::AlreadyComplete);
+                }
+                if !args.quiet {
+                    eprintln!(
+                        "Resuming temp file '{}' from byte {} ({:.1}%)",
+                        tp.display(),
+                        start_byte,
+                        (start_byte as f64 / total as f64) * 100.0
+                    );
+                    eprintln!("Remaining to download: {}", HumanBytes(total - start_byte));
+                }
+            } else if !args.quiet {
+                eprintln!("Resuming temp file '{}' from byte {}", tp.display(), start_byte);
+            }
+            return Ok(LocalTargetAction::Proceed { start_byte, force_truncate: false });
+        } else if temp_info.is_some() && !args.resume && !args.overwrite {
+            // Temp file exists but --continue not specified
+            // We'll overwrite it since it's our temp file
+            if !args.quiet {
+                eprintln!(
+                    "Existing temp file '{}' found, starting fresh (use --continue to resume)",
+                    tp.display()
+                );
+            }
+        } else if args.debug {
+            eprintln!(
+                "[DEBUG] Temp file state: Exists={}, Resume={}, Overwrite={}. Start Byte: 0",
+                temp_info.is_some(),
+                args.resume,
+                args.overwrite
+            );
+        }
+
+        return Ok(LocalTargetAction::Proceed { start_byte: 0, force_truncate: false });
+    }
+
+    // 4. Non-temp mode: determine resume offset on output_path
+    if let Some(out_info) = output_info {
+        if newer_forces_restart {
+            // -N mode: when server is newer (or checked via If-Modified-Since),
+            // reset start_byte = 0 and force_truncate = true so -N -c replaces the file.
+            return Ok(LocalTargetAction::Proceed { start_byte: 0, force_truncate: true });
+        }
+        if args.resume && !args.overwrite && out_info.is_regular {
+            // --continue flag: resume from existing position
+            let start_byte = out_info.size;
+            if let Some(total) = expected_length {
+                if !args.quiet {
+                    eprintln!(
+                        "Resuming from byte {} ({:.1}%)",
+                        start_byte,
+                        (start_byte as f64 / total as f64) * 100.0
+                    );
+                    eprintln!("Remaining to download: {}", HumanBytes(total - start_byte));
+                }
+            } else if !args.quiet {
+                eprintln!("Resuming from byte {}", start_byte);
+            }
+            return Ok(LocalTargetAction::Proceed { start_byte, force_truncate: false });
+        }
+        // If --overwrite is set, we fall through and truncate the file
+    }
+
+    Ok(LocalTargetAction::Proceed { start_byte: 0, force_truncate: false })
 }
 
 /// Stat a file through the DirCache, using fstatat on the pinned directory fd.
+/// Rejects symlinks, directories, and block/character devices.
 /// Returns None if the file does not exist.
-fn stat_file_via_cache(
-    path: &Path,
-    cache: &mut DirCache,
-) -> Result<Option<FileInfo>, std::io::Error> {
+fn stat_file_via_cache(path: &Path, cache: &mut DirCache) -> Result<Option<FileInfo>> {
     let parent = safe_parent(path);
     let filename = path.file_name().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "Path has no filename")
@@ -2573,11 +2915,36 @@ fn stat_file_via_cache(
 
     match dir.symlink_metadata(filename) {
         Ok(metadata) => {
-            let modified = metadata.modified().ok().map(|t| t.into_std());
-            Ok(Some(FileInfo { size: metadata.len(), modified }))
+            let ft = metadata.file_type();
+            if ft.is_symlink() {
+                return Err(PermanentError::IsASymlink(path.to_path_buf()).into());
+            }
+            if ft.is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::IsADirectory,
+                    format!("Refusing to write to directory: '{}'", path.display()),
+                )
+                .into());
+            }
+            #[cfg(unix)]
+            {
+                use cap_std::fs::MetadataExt;
+                if let Some(device_type) = is_block_or_char_device(metadata.mode()) {
+                    return if device_type == "block" {
+                        Err(PermanentError::BlockDeviceNotAllowed(path.to_path_buf()).into())
+                    } else {
+                        Err(PermanentError::CharDeviceNotAllowed(path.to_path_buf()).into())
+                    };
+                }
+            }
+            let is_regular = ft.is_file();
+            let size = if is_regular { metadata.len() } else { 0 };
+            let modified =
+                if is_regular { metadata.modified().ok().map(|t| t.into_std()) } else { None };
+            Ok(Some(FileInfo { size, modified, is_regular }))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -2606,12 +2973,23 @@ fn check_path_before_open(path: &Path, cache: &mut DirCache) -> Result<bool> {
 
     // Check metadata universally to determine if the file exists
     match dir.symlink_metadata(filename_str) {
-        Ok(_metadata) => {
+        Ok(metadata) => {
+            let ft = metadata.file_type();
+            if ft.is_symlink() {
+                return Err(PermanentError::IsASymlink(path.to_path_buf()).into());
+            }
+            if ft.is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::IsADirectory,
+                    format!("Refusing to write to directory: '{}'", path.display()),
+                )
+                .into());
+            }
             // Only check for block/char devices on Unix
             #[cfg(unix)]
             {
                 use cap_std::fs::MetadataExt;
-                if let Some(device_type) = is_block_or_char_device(_metadata.mode()) {
+                if let Some(device_type) = is_block_or_char_device(metadata.mode()) {
                     return if device_type == "block" {
                         Err(PermanentError::BlockDeviceNotAllowed(path.to_path_buf()).into())
                     } else {
@@ -2690,7 +3068,7 @@ fn open_file_securely(
     })?;
     let dir = get_cached_dir(cache, parent)?;
 
-    let is_append = start_byte > 0;
+    let is_append = start_byte > 0 && !force_truncate;
     let authorized_replace = args.overwrite || args.resume || args.newer || force_truncate;
 
     // Parsed once; applied to every open attempt below.
@@ -2703,25 +3081,36 @@ fn open_file_securely(
 
     // The pre-open classification (symlink_metadata) is inherently racy: the
     // object can change between the stat and the open. It is therefore used only
-    // to *pick a strategy*; safety comes from the open flags (O_EXCL, O_NOFOLLOW,
-    // O_TRUNC) plus the post-open fstat check on the real fd. When an O_EXCL
-    // attempt loses a creation race and replacing is authorized, we re-classify
-    // and retry a bounded number of times instead of failing spuriously.
+    // to *pick a strategy*; safety comes from the open flags (O_EXCL, O_NOFOLLOW)
+    // plus the post-open fstat check on the real fd. When an O_EXCL or non-O_CREAT
+    // attempt loses a race and replacing is authorized, we re-classify and retry
+    // a bounded number of times instead of failing spuriously.
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 0..MAX_ATTEMPTS {
         // -- Classify whatever currently sits at the destination --
         let mut file_existed = false;
         let mut existing_is_regular = false;
         match dir.symlink_metadata(filename) {
-            Ok(_metadata) => {
+            Ok(metadata) => {
+                let ft = metadata.file_type();
+                if ft.is_symlink() {
+                    return Err(PermanentError::IsASymlink(path.to_path_buf()).into());
+                }
+                if ft.is_dir() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::IsADirectory,
+                        format!("Refusing to write to directory: '{}'", path.display()),
+                    )
+                    .into());
+                }
                 file_existed = true;
-                existing_is_regular = _metadata.file_type().is_file();
+                existing_is_regular = ft.is_file();
                 #[cfg(unix)]
                 {
                     use cap_std::fs::MetadataExt;
                     // Early, user-friendly rejection only; the authoritative
                     // device check is the post-open fstat on the fd below.
-                    if let Some(device_type) = is_block_or_char_device(_metadata.mode()) {
+                    if let Some(device_type) = is_block_or_char_device(metadata.mode()) {
                         return if device_type == "block" {
                             Err(PermanentError::BlockDeviceNotAllowed(path.to_path_buf()).into())
                         } else {
@@ -2769,22 +3158,21 @@ fn open_file_securely(
             }
             opts.create_new(true);
             used_excl = true;
-        } else if file_existed && existing_is_regular {
-            // Defensive: a regular file reached without an authorizing flag. The
-            // pre-download checks already reject this case with FileAlreadyExists,
-            // so reaching it means that check was bypassed or raced -- fail rather
-            // than truncate user data.
+        } else if file_existed && !authorized_replace {
+            // Defensive: an existing file or FIFO reached without an authorizing
+            // flag. Fail rather than clobber or write into an unauthorized target.
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 "Destination exists",
             )
             .into());
         } else if file_existed {
-            // Existing non-regular object (symlink, FIFO, ...): never unlink or
-            // follow it. Open with O_TRUNC (no O_EXCL); combined with O_NOFOLLOW
-            // set above this makes a symlink fail with ELOOP (preserving the
-            // anti-symlink guarantee), while a FIFO opens for writing into the pipe.
-            opts.create(true).truncate(true);
+            // Existing non-regular object (e.g. FIFO) with authorized_replace:
+            // open WITHOUT O_CREAT and WITHOUT O_TRUNC. Avoiding O_TRUNC ensures
+            // that if a regular file was raced into place between symlink_metadata
+            // and open_with, the kernel will not truncate it during openat(); the
+            // post-open fstat check below then detects the type mismatch before
+            // any bytes are written.
             opened_preexisting = true;
         } else {
             // Nothing exists yet: create a brand-new file (O_EXCL keeps it
@@ -2800,24 +3188,40 @@ fn open_file_securely(
                 // Post-open TOCTOU check whenever the fd may refer to a
                 // pre-existing object: verify on the real fd that it is not a
                 // device and, when appending (unless --insecure-owner), that it
-                // is owned by us. (No-op stub on non-unix.)
+                // is owned by us. Also verify that a non-regular open did not
+                // race against a regular file swap.
                 if opened_preexisting {
                     check_file_after_open(&std_file, path, is_append, args.insecure_owner)?;
+                    let std_meta = std_file.metadata()?;
+                    if std_meta.file_type().is_dir() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::IsADirectory,
+                            format!("Refusing to write to directory: '{}'", path.display()),
+                        )
+                        .into());
+                    }
+                    if !is_append && !existing_is_regular && std_meta.file_type().is_file() {
+                        // A regular file was swapped in where a FIFO stood during
+                        // symlink_metadata; because we did not pass O_TRUNC it is
+                        // untouched. Re-classify on the next iteration (or fail).
+                        if attempt + 1 < MAX_ATTEMPTS {
+                            continue;
+                        }
+                        return Err(
+                            PermanentError::FileAppearedDuringDownload(path.to_path_buf()).into()
+                        );
+                    }
                 }
                 return Ok((std_file, file_existed));
             }
             Err(e)
-                if used_excl
-                    && e.kind() == std::io::ErrorKind::AlreadyExists
+                if ((used_excl && e.kind() == std::io::ErrorKind::AlreadyExists)
+                    || (!used_excl && !is_append && e.kind() == std::io::ErrorKind::NotFound))
                     && authorized_replace
                     && attempt + 1 < MAX_ATTEMPTS =>
             {
-                // Lost a creation race while authorized to replace: something
-                // appeared between our stat/remove and the O_EXCL open.
-                // Re-classify and retry: a raced-in regular file is removed like
-                // the original; a raced-in symlink is routed to the
-                // O_TRUNC+O_NOFOLLOW branch and fails with ELOOP; a raced-in
-                // device is caught by the pre-open or post-open device check.
+                // Lost a creation/removal race while authorized to replace:
+                // re-classify and retry.
                 continue;
             }
             // Unauthorized creation race (plain AlreadyExists, mapped upstream to
@@ -3416,11 +3820,12 @@ fn resolve_unique_output_path(
     if args.multiple_copies {
         // Check if this filename was already used in this execution
         if let Some(counter) = used_filenames.get_mut(&canonical_key) {
-            // Already used, find the next available numbered variant
+            // Already used, find the next available numbered variant (numbering
+            // past any existing files, directories, symlinks, or devices)
             loop {
                 let numbered =
                     generate_numbered_filename(output_path, *counter, args.keep_extension);
-                if stat_file_via_cache(&numbered, dir_cache)?.is_none() {
+                if !path_exists_via_cache(&numbered, dir_cache)? {
                     *counter += 1;
                     return Ok((numbered, true));
                 }
@@ -3429,8 +3834,8 @@ fn resolve_unique_output_path(
         }
 
         // First use of this filename in this execution
-        // Check if it already exists on disk
-        if stat_file_via_cache(output_path, dir_cache)?.is_some()
+        // Check if it already exists on disk (including as a directory or symlink)
+        if path_exists_via_cache(output_path, dir_cache)?
             && !args.overwrite
             && !args.resume
             && !args.newer
@@ -3439,7 +3844,7 @@ fn resolve_unique_output_path(
             loop {
                 let numbered =
                     generate_numbered_filename(output_path, counter, args.keep_extension);
-                if stat_file_via_cache(&numbered, dir_cache)?.is_none() {
+                if !path_exists_via_cache(&numbered, dir_cache)? {
                     used_filenames.insert(canonical_key, counter + 1);
                     return Ok((numbered, true));
                 }
@@ -3457,6 +3862,25 @@ fn resolve_unique_output_path(
         }
         used_filenames.insert(canonical_key, 1);
         Ok((output_path.to_path_buf(), false))
+    }
+}
+
+/// Check whether any filesystem entry (regular file, directory, symlink, FIFO,
+/// or device node) exists at `path` through the pinned DirCache handle.
+/// Unlike `stat_file_via_cache`, this does not error on directories, symlinks,
+/// or devices so `--multiple-copies` can number past them.
+fn path_exists_via_cache(path: &Path, cache: &mut DirCache) -> std::io::Result<bool> {
+    let parent = safe_parent(path);
+    let filename = path.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "Path has no filename")
+    })?;
+
+    let dir = get_cached_dir(cache, parent)?;
+
+    match dir.symlink_metadata(filename) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
     }
 }
 
@@ -4003,7 +4427,7 @@ async fn process_json_downloads(
     let mut failed_count: usize = 0;
 
     for entry in &entries {
-        let mut url = match Url::parse(&entry.url) {
+        let url = match Url::parse(&entry.url) {
             Ok(u) => u,
             Err(e) => {
                 eprintln!("Error parsing URL '{}': {}", terminal_safe(&entry.url), e);
@@ -4011,7 +4435,6 @@ async fn process_json_downloads(
                 continue;
             }
         };
-        canonicalize_url_path(&mut url);
 
         if !args.quiet {
             eprintln!();
@@ -4081,13 +4504,14 @@ async fn process_json_downloads(
         };
 
         let mut attempt: u64 = 0;
-        // Output path pinned by the first attempt; retries reuse it so the
-        // auto-set resume flag cannot re-route the download (see download_file).
-        let mut resolved_output: Option<PathBuf> = None;
+        // Output path and counter state pinned by the first attempt; retries
+        // reuse it so the auto-set resume flag cannot re-route the download (see download_file).
+        let mut resolved_output: Option<PinnedOutput> = None;
         // Set by download_file once an attempt reaches the point of opening the
         // destination (or its temp file); a retry only auto-resumes after that,
         // so a pre-existing file under --overwrite/-N is never appended to.
         let mut dest_touched = false;
+
         let entry_failed = loop {
             let mut current_args = entry_args.clone();
             if attempt > 0 && dest_touched {
@@ -4205,7 +4629,7 @@ async fn download_file(
     used_filenames: &mut HashMap<PathBuf, u32>,
     expected_sha256: Option<&str>,
     dir_cache: &mut DirCache,
-    resolved_output: &mut Option<PathBuf>,
+    resolved_output: &mut Option<PinnedOutput>,
     dest_touched: &mut bool,
     send_auth: bool,
 ) -> Result<()> {
@@ -4263,45 +4687,22 @@ async fn download_file(
     }
 
     // Handle --multiple-copies: resolve unique output path before any file checks.
-    // On retry attempts the path pinned by the first attempt is reused:
-    // re-resolving with the auto-set resume flag would skip collision numbering
-    // and append the resumed download into an unrelated pre-existing file.
-    //
-    // Pinned-retry bookkeeping invariant: on a retry, the canonical
-    // used_filenames key is recomputed from the *current* attempt's unnumbered
-    // head_filename (plus --output/--output-dir). When the server is consistent
-    // between HEADs, this reproduces exactly the key committed by the first
-    // attempt — including the case where attempt 1 flipped to a GET
-    // Content-Disposition, because the pinned HEAD then replays the post-flip
-    // name. A server whose Content-Disposition flaps between HEADs can at most
-    // desync this informational numbering state; every actual write is still
-    // guarded against the on-disk state by resolve_unique_output_path's
-    // stat_file_via_cache checks and the O_EXCL/O_NOFOLLOW/fstat strategy in
-    // open_file_securely, so no data can be written to the wrong file.
+    // On retry attempts the path and counter state pinned by the first attempt
+    // are reused verbatim so the auto-set resume flag neither skips collision
+    // numbering nor corrupts the counter for subsequent downloads.
     let mut initial_canonical_key: Option<PathBuf> = None;
+    let mut prev_used_counter: Option<u32> = None;
     if !is_stdout {
-        if let Some(prev) = resolved_output.as_ref() {
-            output_path = prev.clone();
+        if let Some(pinned) = resolved_output.as_ref() {
+            output_path = pinned.output_path.clone();
             if let Some(fname) = output_path.file_name().and_then(|s| s.to_str()) {
                 final_filename = fname.to_string();
             }
-            // Re-record in used_filenames so that retries commit the registered output path
-            let canonical_key = if let Some(output) = &args.output {
-                PathBuf::from(output)
-            } else if let Some(ref dir_str) = args.output_dir {
-                Path::new(dir_str).join(&head_filename)
-            } else {
-                PathBuf::from(&head_filename)
-            };
-            if args.multiple_copies {
-                let entry = used_filenames.entry(canonical_key.clone()).or_insert(1);
-                *entry = (*entry).max(2);
-            } else {
-                used_filenames.insert(canonical_key.clone(), 1);
-            }
-            initial_canonical_key = Some(canonical_key);
+            used_filenames.insert(pinned.canonical_key.clone(), pinned.next_counter);
+            initial_canonical_key = Some(pinned.canonical_key.clone());
         } else {
             let unnumbered_output_path = output_path.clone();
+            prev_used_counter = used_filenames.get(&unnumbered_output_path).copied();
             let (resolved_path, was_renamed) =
                 resolve_unique_output_path(&output_path, args, used_filenames, dir_cache)?;
             if was_renamed && !args.quiet {
@@ -4316,7 +4717,12 @@ async fn download_file(
             if let Some(fname) = output_path.file_name().and_then(|s| s.to_str()) {
                 final_filename = fname.to_string();
             }
-            *resolved_output = Some(output_path.clone());
+            let next_counter = *used_filenames.get(&unnumbered_output_path).unwrap_or(&1);
+            *resolved_output = Some(PinnedOutput {
+                output_path: output_path.clone(),
+                canonical_key: unnumbered_output_path.clone(),
+                next_counter,
+            });
             initial_canonical_key = Some(unnumbered_output_path);
         }
     }
@@ -4328,59 +4734,6 @@ async fn download_file(
     // Stat output file through DirCache for size/mtime checks below
     let mut output_info =
         if !is_stdout { stat_file_via_cache(&output_path, dir_cache)? } else { None };
-
-    // Handle -N (--newer) mode: check if remote file is newer than local file
-    if args.newer
-        && !is_stdout
-        && let Some(ref out_info) = output_info
-        && args.no_if_modified_since
-    {
-        // --no-if-modified-since: Use the HEAD response's Last-Modified we already have
-        if let Some(lm_str) = head_last_modified
-            && let Some(server_time) = parse_http_date(lm_str)
-        {
-            if let Some(local_mtime) = out_info.modified {
-                if server_time <= local_mtime {
-                    // Check if local file size matches expected server size (if known)
-                    if let Some(total) = expected_length {
-                        if out_info.size == total {
-                            if !args.quiet {
-                                eprintln!(
-                                    "Server file is not newer than local file '{}', skipping.",
-                                    output_path.display()
-                                );
-                            }
-                            if let Some(expected) = expected_sha256 {
-                                verify_sha256_file(&output_path, expected, args.quiet, dir_cache)?;
-                            }
-                            return Ok(());
-                        } else if args.verbose {
-                            eprintln!(
-                                "Local file size ({}) differs from server ({}), downloading entire file.",
-                                HumanBytes(out_info.size),
-                                HumanBytes(total)
-                            );
-                        }
-                    } else {
-                        if !args.quiet {
-                            eprintln!(
-                                "Server file is not newer than local file '{}', skipping.",
-                                output_path.display()
-                            );
-                        }
-                        return Ok(());
-                    }
-                } else if args.verbose {
-                    eprintln!("Server file is newer than local file, proceeding with download.");
-                }
-            }
-        } else if args.debug {
-            eprintln!(
-                "[DEBUG] -N --no-if-modified-since: No Last-Modified from HEAD, proceeding with download"
-            );
-        }
-    }
-    // If not --no-if-modified-since, we'll add If-Modified-Since to the GET request below
 
     // Hash verification forces the temp-then-rename path: direct mode unlinks
     // and recreates the destination before writing, so a corrupt or truncated
@@ -4408,176 +4761,27 @@ async fn download_file(
         if let Some(ref tp) = temp_path { stat_file_via_cache(tp, dir_cache)? } else { None };
 
     let mut start_byte: u64 = 0;
-    // Handle existing file (NOT writing to stdout)
+    let mut force_truncate = false;
     if !is_stdout {
-        // For temp mode, check if temp file exists for resume
-        if let Some(ref tp) = temp_path {
-            if let Some(ref t_info) = temp_info
-                && args.resume
-            {
-                start_byte = t_info.size;
-
-                if args.debug {
-                    eprintln!(
-                        "[DEBUG] Found existing temp file. Size: {}. Resume: true. New Start Byte: {}",
-                        start_byte, start_byte
-                    );
-                }
-                if let Some(total) = expected_length {
-                    // --continue: skip if server file is smaller than local
-                    if start_byte > total {
-                        if !args.quiet {
-                            eprintln!(
-                                "Local temp file ({}) is larger than server file ({}), skipping.",
-                                HumanBytes(start_byte),
-                                HumanBytes(total)
-                            );
-                        }
-                        return Ok(());
-                    }
-                    if start_byte >= total {
-                        if !args.quiet {
-                            eprintln!(
-                                "Temp file '{}' already fully downloaded, finalizing...",
-                                tp.display()
-                            );
-                        }
-                        // Verify before finalizing: a temp file left behind by an
-                        // earlier run (e.g. after a failed verification with
-                        // --keep-temp) must not be promoted unchecked.
-                        if let Some(expected) = expected_sha256 {
-                            verify_sha256_file(tp, expected, args.quiet, dir_cache)?;
-                        }
-                        perform_atomic_move(tp, &output_path, args, dir_cache)?;
-                        if args.server_timestamps {
-                            apply_server_timestamp(
-                                &output_path,
-                                head_last_modified,
-                                args.debug,
-                                dir_cache,
-                            );
-                        }
-                        return Ok(());
-                    }
-                    if !args.quiet {
-                        eprintln!(
-                            "Resuming temp file '{}' from byte {} ({:.1}%)",
-                            tp.display(),
-                            start_byte,
-                            (start_byte as f64 / total as f64) * 100.0
-                        );
-                        eprintln!("Remaining to download: {}", HumanBytes(total - start_byte));
-                    }
-                } else if !args.quiet {
-                    eprintln!("Resuming temp file '{}' from byte {}", tp.display(), start_byte);
-                }
-            } else if temp_info.is_some() && !args.resume && !args.overwrite {
-                // Temp file exists but --continue not specified
-                // We'll overwrite it since it's our temp file
-                if !args.quiet {
-                    eprintln!(
-                        "Existing temp file '{}' found, starting fresh (use --continue to resume)",
-                        tp.display()
-                    );
-                }
-            } else if args.debug {
-                eprintln!(
-                    "[DEBUG] Temp file state: Exists={}, Resume={}, Overwrite={}. Start Byte: 0",
-                    temp_info.is_some(),
-                    args.resume,
-                    args.overwrite
-                );
+        match evaluate_local_target(
+            &output_path,
+            temp_path.as_deref(),
+            output_info.as_ref(),
+            temp_info.as_ref(),
+            args,
+            expected_length,
+            head_last_modified,
+            expected_sha256,
+            dir_cache,
+        )? {
+            LocalTargetAction::AlreadyComplete => return Ok(()),
+            LocalTargetAction::Proceed { start_byte: sb, force_truncate: ft } => {
+                start_byte = sb;
+                force_truncate = ft;
             }
-
-            // Also check if output file already exists (for temp mode)
-            if let Some(ref out_info) = output_info {
-                let existing_size = out_info.size;
-
-                // Check if file is already complete
-                if let Some(total) = expected_length
-                    && existing_size >= total
-                    && !args.newer
-                    && !args.overwrite
-                {
-                    if !args.quiet {
-                        eprintln!("File already fully downloaded.");
-                    }
-                    // --json-verify-hash must still check a pre-existing file
-                    if let Some(expected) = expected_sha256 {
-                        verify_sha256_file(&output_path, expected, args.quiet, dir_cache)?;
-                    }
-                    return Ok(());
-                }
-
-                // Output file exists but is incomplete
-                if !args.resume && !args.overwrite && !args.newer {
-                    return Err(PermanentError::FileAlreadyExists(output_path.to_path_buf()).into());
-                }
-                // With --resume or --overwrite or --newer, we proceed (download to temp, then rename)
-                // Note: we don't resume from the output file in temp mode, we use the temp file
-            }
-        } else if let Some(ref out_info) = output_info {
-            // Non-temp mode: check output file
-            let existing_size = out_info.size;
-
-            // --continue: skip if server file is smaller than local
-            if args.resume
-                && let Some(total) = expected_length
-                && existing_size > total
-            {
-                if !args.quiet {
-                    eprintln!(
-                        "Local file ({}) is larger than server file ({}), skipping.",
-                        HumanBytes(existing_size),
-                        HumanBytes(total)
-                    );
-                }
-                return Ok(());
-            }
-
-            // Check if file is already complete (when we know expected size)
-            if let Some(total) = expected_length
-                && existing_size >= total
-                && !args.newer
-                && !args.overwrite
-            {
-                if !args.quiet {
-                    eprintln!("File already fully downloaded.");
-                }
-                // --json-verify-hash must still check a pre-existing file
-                if let Some(expected) = expected_sha256 {
-                    verify_sha256_file(&output_path, expected, args.quiet, dir_cache)?;
-                }
-                return Ok(());
-            }
-
-            // File exists but is incomplete (or unknown size)
-            if args.resume {
-                // --continue flag: resume from existing position
-                start_byte = existing_size;
-                if let Some(total) = expected_length {
-                    if !args.quiet {
-                        eprintln!(
-                            "Resuming from byte {} ({:.1}%)",
-                            start_byte,
-                            (start_byte as f64 / total as f64) * 100.0
-                        );
-                        eprintln!("Remaining to download: {}", HumanBytes(total - start_byte));
-                    }
-                } else if !args.quiet {
-                    eprintln!("Resuming from byte {}", start_byte);
-                }
-            } else if args.newer {
-                // -N mode: we'll overwrite if server is newer (handled above or via If-Modified-Since)
-            } else if !args.overwrite {
-                // File exists, no --continue, no --overwrite: clear error
-                return Err(PermanentError::FileAlreadyExists(output_path.to_path_buf()).into());
-            }
-            // If --overwrite is set, we fall through and truncate the file
         }
     }
 
-    let mut force_truncate = false;
     let response;
     let mut content_length;
     let mut get_last_modified;
@@ -4585,7 +4789,7 @@ async fn download_file(
     let mut cd_redirect_count = 0;
 
     // Loop added to safely retry the entire request if we discover a different
-    // Content-Disposition dynamically and need to reset an active partial-resume context.
+    // Content-Disposition dynamically and need to reset or initiate a partial-resume context.
     loop {
         // True when THIS request carries a Range header. The 416 handler must
         // only interpret a 416 as "resume state says we're complete" when a
@@ -4603,10 +4807,11 @@ async fn download_file(
         // ONLY if local file size matches expected server size (if expected size is known).
         // If size differs, the local file is incomplete/corrupted, so do not send If-Modified-Since.
         let size_matches = match (expected_length, output_info.as_ref()) {
-            (Some(exp_len), Some(out_info)) => out_info.size == exp_len,
+            (Some(exp_len), Some(out_info)) => out_info.is_regular && out_info.size == exp_len,
             _ => true,
         };
 
+        let mut ims_sent = false;
         if args.newer
             && !args.no_if_modified_since
             && !is_stdout
@@ -4619,9 +4824,10 @@ async fn download_file(
                 eprintln!("Sending If-Modified-Since: {}", http_date);
             }
             request = request.header(IF_MODIFIED_SINCE, http_date);
+            ims_sent = true;
         }
 
-        // Credentials are only sent when the final URL is still on the host the
+        // Credentials are only sent when the final URL is still on the host/port the
         // user named, without an https -> http downgrade
         if send_auth && let Some(ref u) = args.user {
             request = request.basic_auth(u, args.password.as_deref());
@@ -4689,6 +4895,16 @@ async fn download_file(
                     .get(CONTENT_LENGTH)
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.parse::<u64>().ok());
+                if let (Some(max), Some(rem)) = (args.max_size, content_length)
+                    && rem > max
+                {
+                    return Err(PermanentError::FileSizeExceedsLimit {
+                        size: rem,
+                        max,
+                        url: url.to_string(),
+                    }
+                    .into());
+                }
                 response = full_response;
                 break;
             } else {
@@ -4725,21 +4941,32 @@ async fn download_file(
             if !args.quiet {
                 eprintln!("File already fully downloaded.");
             }
-            // If we were using a temp file, verify (when requested) and rename it
+            let lm_416 = current_response
+                .headers()
+                .get(LAST_MODIFIED)
+                .and_then(|v| v.to_str().ok())
+                .or(head_last_modified);
+            // If we were using a temp file, verify (when requested), apply the
+            // server timestamp on the temp file, and then atomically rename it.
             if let Some(ref tp) = temp_path
                 && temp_info.is_some()
             {
                 if let Some(expected) = expected_sha256 {
                     verify_sha256_file(tp, expected, args.quiet, dir_cache)?;
                 }
+                if args.server_timestamps {
+                    apply_server_timestamp(tp, lm_416, args.debug, dir_cache);
+                }
                 perform_atomic_move(tp, &output_path, args, dir_cache)?;
-            } else if let Some(expected) = expected_sha256 {
-                // Non-temp resume: the presumed-complete data already sits at
-                // the output path; --json-verify-hash must still check it.
-                verify_sha256_file(&output_path, expected, args.quiet, dir_cache)?;
-            }
-            if args.server_timestamps {
-                apply_server_timestamp(&output_path, head_last_modified, args.debug, dir_cache);
+            } else {
+                if let Some(expected) = expected_sha256 {
+                    // Non-temp resume: the presumed-complete data already sits at
+                    // the output path; --json-verify-hash must still check it.
+                    verify_sha256_file(&output_path, expected, args.quiet, dir_cache)?;
+                }
+                if args.server_timestamps {
+                    apply_server_timestamp(&output_path, lm_416, args.debug, dir_cache);
+                }
             }
             return Ok(());
         }
@@ -4758,6 +4985,14 @@ async fn download_file(
             } else {
                 return Err(PermanentError::HttpClientError(status.as_u16()).into());
             }
+        }
+
+        // In -N mode, when the GET response returns 2xx (instead of 304 Not Modified)
+        // for an existing local file, the server file is newer than the local file:
+        // ensure start_byte = 0 and force_truncate = true even if -c was also set.
+        if args.newer && output_info.is_some() && status.is_success() {
+            start_byte = 0;
+            force_truncate = true;
         }
 
         get_last_modified = current_response
@@ -4795,6 +5030,19 @@ async fn download_file(
             .get(CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok());
+
+        // Enforce --max-size against the GET response's Content-Length (covers
+        // servers that omit Content-Length on HEAD but provide it on GET).
+        if let (Some(max), Some(rem)) = (args.max_size, content_length)
+            && start_byte.saturating_add(rem) > max
+        {
+            return Err(PermanentError::FileSizeExceedsLimit {
+                size: start_byte.saturating_add(rem),
+                max,
+                url: url.to_string(),
+            }
+            .into());
+        }
 
         // Re-check Content-Disposition from GET response (some servers only set it on GET, not HEAD)
         // Only relevant when no explicit --output was given. Skipped when the
@@ -4845,13 +5093,19 @@ async fn download_file(
 
                 // The output path changed, so re-run the same collision/existence
                 // checks that were performed for the original name at the top of
-                // this function. Remove the old registered filename so it does
-                // not stay marked as used.
+                // this function. Restore the previous used_filenames counter for
+                // the old key so earlier downloads of that name do not lose their
+                // collision counter.
                 if let Some(old_key) = initial_canonical_key.take() {
-                    used_filenames.remove(&old_key);
+                    if let Some(prev_count) = prev_used_counter {
+                        used_filenames.insert(old_key, prev_count);
+                    } else {
+                        used_filenames.remove(&old_key);
+                    }
                 }
 
                 let unnumbered_new_path = output_path.clone();
+                prev_used_counter = used_filenames.get(&unnumbered_new_path).copied();
                 let (resolved_path, was_renamed) =
                     resolve_unique_output_path(&output_path, args, used_filenames, dir_cache)?;
                 if was_renamed && !args.quiet {
@@ -4865,7 +5119,12 @@ async fn download_file(
                 if let Some(fname) = output_path.file_name().and_then(|s| s.to_str()) {
                     final_filename = fname.to_string();
                 }
-                *resolved_output = Some(output_path.clone());
+                let next_counter = *used_filenames.get(&unnumbered_new_path).unwrap_or(&1);
+                *resolved_output = Some(PinnedOutput {
+                    output_path: output_path.clone(),
+                    canonical_key: unnumbered_new_path.clone(),
+                    next_counter,
+                });
                 initial_canonical_key = Some(unnumbered_new_path);
 
                 // Capture the old temp state BEFORE temp_path/temp_info are
@@ -4889,19 +5148,19 @@ async fn download_file(
                 check_path_before_open(&output_path, dir_cache)?;
 
                 // Refresh cached metadata for the NEW target: the restarted GET
-                // (If-Modified-Since), the post-loop -N overwrite logic and the 416
+                // (If-Modified-Since / Range), the -N overwrite logic and the 416
                 // finalize path must act on the new path's state, not the old name's.
                 output_info = stat_file_via_cache(&output_path, dir_cache)?;
                 if let Some(ref tp) = temp_path {
                     temp_info = stat_file_via_cache(tp, dir_cache)?;
                 }
 
-                // Best-effort cleanup of the now-orphaned old temp file,
-                // through the pinned directory handle. NotFound and any other
-                // error are deliberately ignored: this is housekeeping, and
-                // failing the download over it would be worse.
-                if let Some(old_tp) = old_temp.as_deref()
+                // Best-effort cleanup of the now-orphaned old temp file when we
+                // were resuming from it, through the pinned directory handle.
+                if start_byte > 0
+                    && let Some(old_tp) = old_temp.as_deref()
                     && old_temp_existed
+                    && temp_path.as_deref() != Some(old_tp)
                 {
                     let parent = safe_parent(old_tp);
                     if let Ok(dir) = get_cached_dir(dir_cache, parent)
@@ -4917,53 +5176,71 @@ async fn download_file(
                     }
                 }
 
-                // Re-evaluate the existing-output guard for the new name (mirrors
-                // the top-of-function logic). A pre-existing target must not be
-                // silently clobbered unless --continue/--overwrite/--newer is set.
-                if let Some(ref out_info) = output_info {
-                    // content_length is only the REMAINING byte count when this
-                    // is a 206 response, so compare against the full size
-                    // (start_byte + remaining), not the remainder alone.
-                    if let Some(remaining) = content_length
-                        && out_info.size >= start_byte.saturating_add(remaining)
-                        && !args.newer
-                        && !args.overwrite
-                    {
-                        if !args.quiet {
-                            eprintln!("File already fully downloaded.");
-                        }
-                        // --json-verify-hash must still check a pre-existing file
-                        if let Some(expected) = expected_sha256 {
-                            verify_sha256_file(&output_path, expected, args.quiet, dir_cache)?;
-                        }
-                        return Ok(());
-                    }
-                    if !args.resume && !args.overwrite && !args.newer {
-                        return Err(PermanentError::FileAlreadyExists(output_path.clone()).into());
-                    }
-                }
+                // Determine the full resource size known at this point.
+                let total_known = if status == StatusCode::PARTIAL_CONTENT {
+                    current_response
+                        .headers()
+                        .get(CONTENT_RANGE)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(parse_content_range_resp)
+                        .and_then(|r| r.complete_length)
+                        .or_else(|| content_length.map(|rem| start_byte.saturating_add(rem)))
+                        .or(expected_length)
+                } else if status.is_success() {
+                    content_length.or(expected_length)
+                } else {
+                    expected_length
+                };
+                let effective_lm = get_last_modified.as_deref().or(head_last_modified);
 
-                // If we were resuming with the old temp/output file, we must
-                // restart since the resume context (and the temp filename) was
-                // derived from the old output filename. Re-issue the GET without a
-                // Range header. When start_byte is 0 the current response already
-                // holds the full body, so there is no need to re-issue.
-                if start_byte > 0 {
+                // Re-evaluate existing output/temp state for the newly discovered
+                // filename (checks completion, conflicts, -N, and partial resume).
+                let (new_start_byte, new_force_truncate) = match evaluate_local_target(
+                    &output_path,
+                    temp_path.as_deref(),
+                    output_info.as_ref(),
+                    temp_info.as_ref(),
+                    args,
+                    total_known,
+                    effective_lm,
+                    expected_sha256,
+                    dir_cache,
+                )? {
+                    LocalTargetAction::AlreadyComplete => return Ok(()),
+                    LocalTargetAction::Proceed { start_byte: sb, force_truncate: ft } => (sb, ft),
+                };
+
+                // Re-issue the GET request if:
+                // - the resume offset changed (either we were resuming the old name
+                //   from start_byte > 0, or the newly discovered filename has a
+                //   partial file on disk with new_start_byte > 0 that --continue
+                //   must resume from), OR
+                // - in -N mode without --no-if-modified-since, the newly discovered
+                //   file exists on disk with an mtime and we did not send
+                //   If-Modified-Since on the initial GET.
+                let needs_ims_retry = args.newer
+                    && !args.no_if_modified_since
+                    && !ims_sent
+                    && output_info.as_ref().is_some_and(|i| i.modified.is_some());
+
+                if new_start_byte != start_byte || needs_ims_retry {
                     if cd_redirect_count >= MAX_REDIRECTS {
                         return Err(PermanentError::TooManyRedirects(MAX_REDIRECTS).into());
                     }
                     cd_redirect_count += 1;
 
-                    if !args.quiet {
+                    if !args.quiet && new_start_byte != start_byte {
                         eprintln!(
-                            "Filename changed during resume ('{}' -> '{}'), restarting download.",
-                            old_filename, new_name
+                            "Filename changed ('{}' -> '{}'), adjusting resume offset to byte {}.",
+                            old_filename, new_name, new_start_byte
                         );
                     }
-                    start_byte = 0;
-                    force_truncate = true;
+                    start_byte = new_start_byte;
+                    force_truncate = new_force_truncate;
                     continue; // RE-ISSUE GET REQUEST
                 }
+
+                force_truncate = new_force_truncate;
             }
         }
 
@@ -4984,7 +5261,16 @@ async fn download_file(
     // Calculate total size for resume logic, but for the progress bar
     // we strictly want to track the *stream* size (remaining bytes)
     // to ensure speed/ETA calculations are correct.
-    let remaining_bytes = content_length;
+    // When the GET response omits Content-Length (e.g. chunked transfer
+    // encoding), fall back to expected_length from HEAD or --json-size-field
+    // (adjusted by start_byte when resuming).
+    let remaining_bytes = content_length.or_else(|| {
+        if response.status().is_success() {
+            expected_length.and_then(|exp| exp.checked_sub(start_byte))
+        } else {
+            None
+        }
+    });
 
     // If writing to stdout, bypass file/temp logic
     if is_stdout {
@@ -5089,84 +5375,85 @@ fn open_temp_file_safely(
         }
     }
 
+    if is_append {
+        let mut append_opts = opts;
+        append_opts.append(true);
+        let cap_file = dir.open_with(filename, &append_opts)?;
+        let std_file = cap_file.into_std();
+        // Verify on the real fd that the existing temp file is not a device, is
+        // owned by us (unless --insecure-owner), and is a regular file.
+        check_file_after_open(&std_file, path, true, args.insecure_owner)?;
+        if !std_file.metadata()?.file_type().is_file() {
+            bail!("Refusing to resume non-regular temp file: '{}'", path.display());
+        }
+        return Ok(std_file);
+    }
+
+    // Non-append: always create a brand-new regular temp file via O_CREAT | O_EXCL.
+    // Never fall back to O_CREAT | O_TRUNC on an existing object.
+    let mut excl_opts = opts;
+    excl_opts.create_new(true);
+
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 0..MAX_ATTEMPTS {
-        let mut excl_opts = opts.clone();
-        let mut opened_preexisting = false;
-
-        let (cap_file, file_existed) = if is_append {
-            excl_opts.append(true);
-            opened_preexisting = true;
-            {
-                let f = dir.open_with(filename, &excl_opts)?;
-                (f, true)
-            }
-        } else {
-            // Attempt O_CREAT | O_EXCL
-            excl_opts.create_new(true);
-
-            match dir.open_with(filename, &excl_opts) {
-                Ok(f) => (f, false),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // Something already sits at the temp path. Inspect it without
-                    // following symlinks to decide how to proceed.
-                    match dir.symlink_metadata(filename) {
-                        // Stale regular temp file: delete and recreate fresh via
-                        // O_EXCL. Unlinking depends on directory write access rather
-                        // than the file's ownership, matching --overwrite semantics.
-                        Ok(meta) if meta.file_type().is_file() => {
-                            match dir.remove_file(filename) {
-                                Ok(()) => {}
-                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                                Err(e) => return Err(e.into()),
-                            }
-                            match dir.open_with(filename, &excl_opts) {
-                                Ok(f) => (f, false),
-                                Err(e)
-                                    if e.kind() == std::io::ErrorKind::AlreadyExists
-                                        && attempt + 1 < MAX_ATTEMPTS =>
-                                {
-                                    continue;
-                                }
-                                Err(e) => return Err(e.into()),
+        match dir.open_with(filename, &excl_opts) {
+            Ok(cap_file) => return Ok(cap_file.into_std()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Something already sits at the temp path. Inspect it without
+                // following symlinks: only a stale regular file may be unlinked.
+                match dir.symlink_metadata(filename) {
+                    Ok(meta) => {
+                        let ft = meta.file_type();
+                        if ft.is_symlink() {
+                            return Err(PermanentError::IsASymlink(path.to_path_buf()).into());
+                        }
+                        if ft.is_dir() {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::IsADirectory,
+                                format!("Refusing to write to directory: '{}'", path.display()),
+                            )
+                            .into());
+                        }
+                        #[cfg(unix)]
+                        {
+                            use cap_std::fs::MetadataExt;
+                            if let Some(device_type) = is_block_or_char_device(meta.mode()) {
+                                return if device_type == "block" {
+                                    Err(PermanentError::BlockDeviceNotAllowed(path.to_path_buf())
+                                        .into())
+                                } else {
+                                    Err(PermanentError::CharDeviceNotAllowed(path.to_path_buf())
+                                        .into())
+                                };
                             }
                         }
-                        // Symlink/FIFO/other: never unlink or follow it. O_TRUNC plus
-                        // O_NOFOLLOW makes a symlink fail with ELOOP; a FIFO opens for
-                        // writing into the pipe.
-                        Ok(_) => {
-                            let mut trunc_opts = opts.clone();
-                            trunc_opts.create(true).truncate(true);
-                            opened_preexisting = true;
-                            (dir.open_with(filename, &trunc_opts)?, true)
+                        if !ft.is_file() {
+                            bail!(
+                                "Refusing to overwrite non-regular file at temp path: '{}'",
+                                path.display()
+                            );
                         }
-                        // Vanished between the O_EXCL attempt and the stat: retry loop
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                            if attempt + 1 < MAX_ATTEMPTS {
-                                continue;
-                            }
-                            (dir.open_with(filename, &excl_opts)?, false)
+                        match dir.remove_file(filename) {
+                            Ok(()) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(e) => return Err(e.into()),
                         }
-                        Err(e) => return Err(e.into()),
+                        if attempt + 1 < MAX_ATTEMPTS {
+                            continue;
+                        }
+                        return Ok(dir.open_with(filename, &excl_opts)?.into_std());
                     }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        if attempt + 1 < MAX_ATTEMPTS {
+                            continue;
+                        }
+                        return Ok(dir.open_with(filename, &excl_opts)?.into_std());
+                    }
+                    Err(e) => return Err(e.into()),
                 }
-                Err(e) => return Err(e.into()),
             }
-        };
-
-        // Convert the cap-std file to a standard file
-        let std_file = cap_file.into_std();
-
-        // Post-open TOCTOU check on any pre-existing object we actually opened (an
-        // appended temp file, or a non-regular object such as a FIFO): verify on the
-        // real fd that it is not a device and (unless --insecure-owner) is owned by
-        // us. The delete-and-recreate path produced a brand-new O_EXCL file we own, so
-        // it is exempt.
-        if opened_preexisting || file_existed {
-            check_file_after_open(&std_file, path, true, args.insecure_owner)?;
+            Err(e) => return Err(e.into()),
         }
-
-        return Ok(std_file);
     }
 
     unreachable!("open_temp_file_safely: retry loop exited without returning")
@@ -5611,11 +5898,13 @@ async fn main() -> ExitCode {
     // Set global flag for signal handler
     KEEP_TEMP_ON_CANCEL.store(args.keep_temp, Ordering::SeqCst);
 
-    // Load HSTS database once at startup (skip if --no-hsts-update or --disable-hsts)
+    // Load HSTS database once at startup (skip only if --disable-hsts;
+    // --no-hsts-update still reads existing entries for upgrades, but skips
+    // updating or saving the database).
     let no_hsts_update = args.no_hsts_update || args.disable_hsts;
     let hsts_path =
         if let Some(ref p) = args.hsts_file { PathBuf::from(p) } else { get_default_hsts_path() };
-    let mut hsts_db = if no_hsts_update { HashMap::new() } else { load_hsts_db(&hsts_path) };
+    let mut hsts_db = if args.disable_hsts { HashMap::new() } else { load_hsts_db(&hsts_path) };
 
     let exit_code = tokio::select! {
         result = run_with_args(args, &mut hsts_db) => {
