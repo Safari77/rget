@@ -2676,6 +2676,7 @@ fn get_cached_dir<'a>(cache: &'a mut DirCache, parent: &Path) -> std::io::Result
     }
     Ok(cache.get(&key).unwrap())
 }
+
 fn open_file_securely(
     path: &Path,
     args: &Args,
@@ -4193,6 +4194,7 @@ async fn process_json_downloads(
         Err(PermanentError::JsonDownloadsFailed { failed: failed_count, total }.into())
     }
 }
+
 async fn download_file(
     client: &Client,
     url: &Url,
@@ -5333,7 +5335,9 @@ async fn download_direct(
                     if truncated == output_path {
                         return Err(PermanentError::FilenameTooLong.into());
                     }
-                    eprintln!("Filename too long, truncating to: {}", truncated.display());
+                    if !args.quiet {
+                        eprintln!("Filename too long, truncating to: {}", truncated.display());
+                    }
 
                     // Retry with truncated path
                     match open_file_securely(
