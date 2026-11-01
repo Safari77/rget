@@ -54,8 +54,8 @@ use data_encoding::BASE32_NOPAD;
 use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
 use regex::Regex;
 use reqwest::header::{
-    AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, COOKIE,
-    IF_MODIFIED_SINCE, LAST_MODIFIED, LOCATION, PROXY_AUTHORIZATION, RANGE,
+    AGE, AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, COOKIE,
+    IF_MODIFIED_SINCE, LAST_MODIFIED, LOCATION, PROXY_AUTHORIZATION, RANGE, RETRY_AFTER,
     STRICT_TRANSPORT_SECURITY,
 };
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -171,6 +171,7 @@ pub enum PermanentError {
 
     // HTTP errors (4xx = permanent, 5xx = transient)
     HttpClientError(u16), // any HTTP error status; 5xx and 429 are transient (see is_permanent_error)
+    HttpRateLimited { status: u16, wait: Option<Duration>, problem_detail: Option<String> },
 
     // TOCTOU: file appeared during download
     FileAppearedDuringDownload(PathBuf),
@@ -296,6 +297,16 @@ impl std::fmt::Display for PermanentError {
             }
             Self::HttpClientError(status) => {
                 write!(f, "Download failed with HTTP status: {}", status)
+            }
+            Self::HttpRateLimited { status, wait, problem_detail } => {
+                write!(f, "Download throttled with HTTP status: {}", status)?;
+                if let Some(w) = wait {
+                    write!(f, " (retry after {}s)", w.as_secs())?;
+                }
+                if let Some(detail) = problem_detail {
+                    write!(f, " [{}]", detail)?;
+                }
+                Ok(())
             }
             Self::FileAppearedDuringDownload(path) => {
                 write!(
@@ -441,6 +452,803 @@ impl std::fmt::Display for PermanentError {
 }
 
 impl std::error::Error for PermanentError {}
+
+/// Maximum sleep duration honored from RateLimit `t` or `Retry-After` headers
+/// (draft-ietf-httpapi-ratelimit-headers-11 §8.5.1 DoS mitigation: ten minutes).
+const MAX_RATELIMIT_WAIT_SECS: u64 = 600;
+
+/// Quota units registered in draft-ietf-httpapi-ratelimit-headers-11 §3.1.2 / §10.3.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum QuotaUnit {
+    Requests,
+    ContentBytes,
+    ConcurrentRequests,
+    Other(String),
+}
+
+impl QuotaUnit {
+    fn from_str_param(s: &str) -> Self {
+        if s.eq_ignore_ascii_case("requests") || s.eq_ignore_ascii_case("request") {
+            Self::Requests
+        } else if s.eq_ignore_ascii_case("content-bytes") {
+            Self::ContentBytes
+        } else if s.eq_ignore_ascii_case("concurrent-requests") {
+            Self::ConcurrentRequests
+        } else {
+            Self::Other(s.to_string())
+        }
+    }
+}
+
+/// Parsed Quota Policy Item from `RateLimit-Policy` (§3.1).
+#[derive(Debug, Clone)]
+struct QuotaPolicyItem {
+    name: String,
+    quota: u64,
+    unit: QuotaUnit,
+    window: Option<u64>,
+    partition_key: Option<String>,
+}
+
+/// Parsed Service Limit Item from `RateLimit` (§4.1).
+#[derive(Debug, Clone)]
+struct ServiceLimitItem {
+    name: String,
+    remaining: u64,
+    effective_window: Option<u64>,
+    partition_key: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+enum SfParamValue {
+    Integer(i64),
+    String(String),
+    ByteSeq(String),
+    Other,
+}
+
+#[derive(Debug, Clone)]
+struct SfItem {
+    value: String,
+    params: Vec<(String, SfParamValue)>,
+}
+
+/// Parse an RFC 9651 Structured Field List of String Items with parameters,
+/// used by `RateLimit-Policy` (§3) and `RateLimit` (§4).
+/// Returns `None` if the header value is syntactically malformed (§7:
+/// "Malformed RateLimit header fields MUST be ignored").
+fn parse_sf_string_item_list(input: &str) -> Option<Vec<SfItem>> {
+    let bytes = input.as_bytes();
+    let mut pos = 0;
+    let mut items = Vec::new();
+
+    let skip_sp = |pos: &mut usize| {
+        while *pos < bytes.len() && bytes[*pos] == b' ' {
+            *pos += 1;
+        }
+    };
+    let skip_ows = |pos: &mut usize| {
+        while *pos < bytes.len() && (bytes[*pos] == b' ' || bytes[*pos] == b'\t') {
+            *pos += 1;
+        }
+    };
+
+    skip_ows(&mut pos);
+    if pos >= bytes.len() {
+        return None;
+    }
+
+    while pos < bytes.len() {
+        // Bare item MUST be an SF String: DQUOTE *chr DQUOTE
+        if bytes[pos] != b'"' {
+            return None;
+        }
+        pos += 1;
+        let mut item_str = String::new();
+        let mut closed = false;
+        while pos < bytes.len() {
+            let b = bytes[pos];
+            if b == b'\\' {
+                pos += 1;
+                if pos >= bytes.len() {
+                    return None;
+                }
+                let esc = bytes[pos];
+                if esc != b'"' && esc != b'\\' {
+                    return None;
+                }
+                item_str.push(esc as char);
+                pos += 1;
+            } else if b == b'"' {
+                pos += 1;
+                closed = true;
+                break;
+            } else if (0x20..=0x7e).contains(&b) {
+                item_str.push(b as char);
+                pos += 1;
+            } else {
+                return None;
+            }
+        }
+        if !closed {
+            return None;
+        }
+
+        // Parse parameters: *( OWS ";" *SP param-key [ "=" param-value ] )
+        let mut params: Vec<(String, SfParamValue)> = Vec::new();
+        loop {
+            let saved = pos;
+            skip_ows(&mut pos);
+            if pos >= bytes.len() || bytes[pos] != b';' {
+                pos = saved;
+                break;
+            }
+            pos += 1; // consume ';'
+            skip_sp(&mut pos);
+
+            // key = ( lcalpha / "*" ) *( lcalpha / DIGIT / "_" / "-" / "." / "*" )
+            if pos >= bytes.len() {
+                return None;
+            }
+            let first = bytes[pos];
+            if !(first.is_ascii_lowercase() || first == b'*') {
+                return None;
+            }
+            let key_start = pos;
+            pos += 1;
+            while pos < bytes.len() {
+                let c = bytes[pos];
+                if c.is_ascii_lowercase()
+                    || c.is_ascii_digit()
+                    || matches!(c, b'_' | b'-' | b'.' | b'*')
+                {
+                    pos += 1;
+                } else {
+                    break;
+                }
+            }
+            let key = std::str::from_utf8(&bytes[key_start..pos]).ok()?.to_string();
+
+            let val = if pos < bytes.len() && bytes[pos] == b'=' {
+                pos += 1; // consume '='
+                if pos >= bytes.len() {
+                    return None;
+                }
+                match bytes[pos] {
+                    b'"' => {
+                        pos += 1;
+                        let mut s = String::new();
+                        let mut str_closed = false;
+                        while pos < bytes.len() {
+                            let b = bytes[pos];
+                            if b == b'\\' {
+                                pos += 1;
+                                if pos >= bytes.len() {
+                                    return None;
+                                }
+                                let esc = bytes[pos];
+                                if esc != b'"' && esc != b'\\' {
+                                    return None;
+                                }
+                                s.push(esc as char);
+                                pos += 1;
+                            } else if b == b'"' {
+                                pos += 1;
+                                str_closed = true;
+                                break;
+                            } else if (0x20..=0x7e).contains(&b) {
+                                s.push(b as char);
+                                pos += 1;
+                            } else {
+                                return None;
+                            }
+                        }
+                        if !str_closed {
+                            return None;
+                        }
+                        SfParamValue::String(s)
+                    }
+                    b':' => {
+                        pos += 1;
+                        let start = pos;
+                        while pos < bytes.len() && bytes[pos] != b':' {
+                            let b = bytes[pos];
+                            if !(b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=') {
+                                return None;
+                            }
+                            pos += 1;
+                        }
+                        if pos >= bytes.len() || bytes[pos] != b':' {
+                            return None;
+                        }
+                        let b64 = std::str::from_utf8(&bytes[start..pos]).ok()?.to_string();
+                        pos += 1; // consume closing ':'
+                        SfParamValue::ByteSeq(b64)
+                    }
+                    b'?' => {
+                        pos += 1;
+                        if pos >= bytes.len() || (bytes[pos] != b'0' && bytes[pos] != b'1') {
+                            return None;
+                        }
+                        pos += 1;
+                        SfParamValue::Other
+                    }
+                    b'-' | b'0'..=b'9' => {
+                        let num_start = pos;
+                        if bytes[pos] == b'-' {
+                            pos += 1;
+                        }
+                        let digits_start = pos;
+                        while pos < bytes.len() && bytes[pos].is_ascii_digit() {
+                            pos += 1;
+                        }
+                        if pos == digits_start {
+                            return None;
+                        }
+                        if pos < bytes.len() && bytes[pos] == b'.' {
+                            pos += 1;
+                            let frac_start = pos;
+                            while pos < bytes.len() && bytes[pos].is_ascii_digit() {
+                                pos += 1;
+                            }
+                            if pos == frac_start {
+                                return None;
+                            }
+                            SfParamValue::Other
+                        } else {
+                            let num_str = std::str::from_utf8(&bytes[num_start..pos]).ok()?;
+                            let n = num_str.parse::<i64>().ok()?;
+                            SfParamValue::Integer(n)
+                        }
+                    }
+                    c if c.is_ascii_alphabetic() || c == b'*' => {
+                        // SF Token
+                        pos += 1;
+                        while pos < bytes.len() {
+                            let b = bytes[pos];
+                            if b.is_ascii_alphanumeric()
+                                || matches!(
+                                    b,
+                                    b'!' | b'#'
+                                        | b'$'
+                                        | b'%'
+                                        | b'&'
+                                        | b'\''
+                                        | b'*'
+                                        | b'+'
+                                        | b'-'
+                                        | b'.'
+                                        | b'^'
+                                        | b'_'
+                                        | b'`'
+                                        | b'|'
+                                        | b'~'
+                                        | b':'
+                                        | b'/'
+                                )
+                            {
+                                pos += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        SfParamValue::Other
+                    }
+                    _ => return None,
+                }
+            } else {
+                // Boolean true parameter
+                SfParamValue::Other
+            };
+
+            // RFC 9651 §3.1.2: duplicate parameter keys overwrite earlier ones
+            if let Some(existing) = params.iter_mut().find(|(k, _)| k == &key) {
+                existing.1 = val;
+            } else {
+                params.push((key, val));
+            }
+        }
+
+        items.push(SfItem { value: item_str, params });
+
+        skip_ows(&mut pos);
+        if pos >= bytes.len() {
+            break;
+        }
+        if bytes[pos] != b',' {
+            return None;
+        }
+        pos += 1; // consume ','
+        skip_ows(&mut pos);
+        if pos >= bytes.len() {
+            return None; // trailing comma is invalid in SF List
+        }
+    }
+
+    if items.is_empty() { None } else { Some(items) }
+}
+
+/// Check whether response came from an HTTP cache (`Age > 0`).
+/// Per draft-ietf-httpapi-ratelimit-headers-11 §7.3, RateLimit header fields
+/// SHOULD be ignored on responses with a positive `current_age`.
+fn is_cached_response(headers: &HeaderMap) -> bool {
+    headers
+        .get(AGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| parse_decimal(s.trim()))
+        .is_some_and(|age| age > 0)
+}
+
+/// Parse all `RateLimit-Policy` header fields in `headers` (§3).
+/// Malformed header fields are ignored (§7).
+fn parse_ratelimit_policy_headers(headers: &HeaderMap, debug: bool) -> Vec<QuotaPolicyItem> {
+    if is_cached_response(headers) {
+        if debug {
+            eprintln!("[DEBUG] RateLimit-Policy: ignoring headers on cached response (Age > 0)");
+        }
+        return Vec::new();
+    }
+
+    let mut policies = Vec::new();
+    for val in headers.get_all("ratelimit-policy") {
+        let Ok(s) = val.to_str() else {
+            continue;
+        };
+        let Some(sf_items) = parse_sf_string_item_list(s) else {
+            if debug {
+                eprintln!(
+                    "[DEBUG] RateLimit-Policy: ignoring malformed header '{}'",
+                    terminal_safe(s)
+                );
+            }
+            continue;
+        };
+
+        for item in sf_items {
+            let mut q: Option<u64> = None;
+            let mut qu = QuotaUnit::Requests;
+            let mut w: Option<u64> = None;
+            let mut pk: Option<String> = None;
+            let mut valid = true;
+
+            for (k, v) in item.params {
+                match k.as_str() {
+                    "q" => match v {
+                        // §3.1.1: "q" MUST be a non-negative Integer
+                        SfParamValue::Integer(n) if n >= 0 => q = Some(n as u64),
+                        _ => {
+                            valid = false;
+                            break;
+                        }
+                    },
+                    "qu" => match v {
+                        // §3.1.2: "qu" MUST be a String
+                        SfParamValue::String(ref unit_str) => {
+                            qu = QuotaUnit::from_str_param(unit_str);
+                        }
+                        _ => {
+                            valid = false;
+                            break;
+                        }
+                    },
+                    "w" => match v {
+                        // §3.1.3: "w" MUST be a non-negative, non-zero Integer
+                        SfParamValue::Integer(n) if n > 0 => w = Some(n as u64),
+                        _ => {
+                            valid = false;
+                            break;
+                        }
+                    },
+                    "pk" => match v {
+                        // §3.1.4: "pk" MUST be a Byte Sequence
+                        SfParamValue::ByteSeq(b) => pk = Some(b),
+                        _ => {
+                            valid = false;
+                            break;
+                        }
+                    },
+                    _ => {} // Other/vendor parameters are allowed and ignored (§3.1)
+                }
+            }
+
+            if let (true, Some(quota)) = (valid, q) {
+                policies.push(QuotaPolicyItem {
+                    name: item.value,
+                    quota,
+                    unit: qu,
+                    window: w,
+                    partition_key: pk,
+                });
+            } else if debug {
+                eprintln!(
+                    "[DEBUG] RateLimit-Policy: ignoring invalid policy item '{}'",
+                    terminal_safe(&item.value)
+                );
+            }
+        }
+    }
+    policies
+}
+
+/// Parse all `RateLimit` header fields in `headers` (§4).
+/// If any `RateLimit` header field is malformed, it is ignored (§7).
+fn parse_ratelimit_headers(headers: &HeaderMap, debug: bool) -> Vec<ServiceLimitItem> {
+    if is_cached_response(headers) {
+        if debug {
+            eprintln!("[DEBUG] RateLimit: ignoring headers on cached response (Age > 0)");
+        }
+        return Vec::new();
+    }
+
+    let mut limits = Vec::new();
+    for val in headers.get_all("ratelimit") {
+        let Ok(s) = val.to_str() else {
+            continue;
+        };
+        let Some(sf_items) = parse_sf_string_item_list(s) else {
+            if debug {
+                eprintln!("[DEBUG] RateLimit: ignoring malformed header '{}'", terminal_safe(s));
+            }
+            continue;
+        };
+
+        let mut header_items = Vec::with_capacity(sf_items.len());
+        let mut header_valid = true;
+
+        for item in sf_items {
+            let mut r: Option<u64> = None;
+            let mut t: Option<u64> = None;
+            let mut pk: Option<String> = None;
+
+            for (k, v) in item.params {
+                match k.as_str() {
+                    "r" => match v {
+                        // §4.1.1: "r" is a REQUIRED non-negative Integer
+                        SfParamValue::Integer(n) if n >= 0 => r = Some(n as u64),
+                        _ => {
+                            header_valid = false;
+                            break;
+                        }
+                    },
+                    "t" => match v {
+                        // §4.1.2: "t" is an OPTIONAL non-negative Integer
+                        SfParamValue::Integer(n) if n >= 0 => t = Some(n as u64),
+                        _ => {
+                            header_valid = false;
+                            break;
+                        }
+                    },
+                    "pk" => match v {
+                        // §4.1.3: "pk" MUST be a Byte Sequence
+                        SfParamValue::ByteSeq(b) => pk = Some(b),
+                        _ => {
+                            header_valid = false;
+                            break;
+                        }
+                    },
+                    _ => {} // Other/vendor parameters are allowed and ignored (§4.1)
+                }
+            }
+
+            if !header_valid {
+                break;
+            }
+            let Some(remaining) = r else {
+                header_valid = false;
+                break;
+            };
+
+            header_items.push(ServiceLimitItem {
+                name: item.value,
+                remaining,
+                effective_window: t,
+                partition_key: pk,
+            });
+        }
+
+        if header_valid {
+            limits.extend(header_items);
+        } else if debug {
+            eprintln!(
+                "[DEBUG] RateLimit: ignoring malformed service limit item in '{}'",
+                terminal_safe(s)
+            );
+        }
+    }
+    limits
+}
+
+/// Parse `Retry-After` (RFC 9110 §10.2.3) as either `delay-seconds` or `HTTP-date`.
+fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let val = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
+    if let Some(secs) = parse_decimal(val) {
+        return Some(Duration::from_secs(secs.min(MAX_RATELIMIT_WAIT_SECS)));
+    }
+    if let Some(target_time) = parse_http_date(val) {
+        let now = SystemTime::now();
+        let dur = target_time.duration_since(now).unwrap_or(Duration::ZERO);
+        return Some(Duration::from_secs(dur.as_secs().min(MAX_RATELIMIT_WAIT_SECS)));
+    }
+    None
+}
+
+/// Parse an RFC 9457 Problem Details JSON body for the three problem types defined
+/// in draft-ietf-httpapi-ratelimit-headers-11 §5 (`quota-exceeded`,
+/// `temporary-reduced-capacity`, `abnormal-usage-detected`).
+fn parse_ratelimit_problem_body(headers: &HeaderMap, body: &[u8]) -> Option<String> {
+    let ct = headers.get(CONTENT_TYPE)?.to_str().ok()?;
+    let media_type = ct.split(';').next().unwrap_or("").trim();
+    if !media_type.eq_ignore_ascii_case("application/problem+json") {
+        return None;
+    }
+    let val: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let prob_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let short_type = match prob_type {
+        "https://iana.org/assignments/http-problem-types#quota-exceeded" => Some("quota-exceeded"),
+        "https://iana.org/assignments/http-problem-types#temporary-reduced-capacity" => {
+            Some("temporary-reduced-capacity")
+        }
+        "https://iana.org/assignments/http-problem-types#abnormal-usage-detected" => {
+            Some("abnormal-usage-detected")
+        }
+        _ => None,
+    };
+    let title = val.get("title").and_then(|v| v.as_str());
+    let violated: Vec<String> = val
+        .get("violated-policies")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(terminal_safe)).collect())
+        .unwrap_or_default();
+
+    if short_type.is_none() && violated.is_empty() && title.is_none() {
+        return None;
+    }
+
+    let mut summary = String::new();
+    if let Some(st) = short_type {
+        summary.push_str(st);
+    } else if !prob_type.is_empty() {
+        summary.push_str(&terminal_safe(prob_type));
+    }
+    if let Some(t) = title {
+        if !summary.is_empty() {
+            summary.push_str(": ");
+        }
+        summary.push_str(&terminal_safe(t));
+    }
+    if !violated.is_empty() {
+        if !summary.is_empty() {
+            summary.push(' ');
+        }
+        summary.push_str(&format!("(violated-policies: {})", violated.join(", ")));
+    }
+    Some(summary)
+}
+
+/// Per-origin RateLimit state tracker implementing client behavior from
+/// draft-ietf-httpapi-ratelimit-headers-11 §7.
+#[derive(Debug, Default)]
+struct RateLimitTracker {
+    /// Known quota policies keyed by `(origin_key, policy_name)`.
+    policies: HashMap<(String, String), QuotaPolicyItem>,
+    /// Earliest `Instant` at which the next request to `(origin_key, partition_key)` may be sent.
+    next_allowed_by_partition: HashMap<(String, Option<String>), Instant>,
+    /// Earliest `Instant` at which the next request to `origin_key` may be sent (any partition).
+    next_allowed_by_origin: HashMap<String, Instant>,
+}
+
+impl RateLimitTracker {
+    fn origin_key(url: &Url) -> Option<String> {
+        let host = url.host_str()?.to_ascii_lowercase();
+        let port = url.port_or_known_default().unwrap_or(443);
+        Some(format!("{}://{}:{}", url.scheme(), host, port))
+    }
+
+    /// Wait if a previous response from this origin advertised an active rate-limit window.
+    async fn wait_before_request(&mut self, url: &Url, args: &Args) {
+        let Some(origin) = Self::origin_key(url) else {
+            return;
+        };
+        let now = Instant::now();
+        let mut target: Option<Instant> = self.next_allowed_by_origin.get(&origin).copied();
+
+        for ((o, _pk), &inst) in &self.next_allowed_by_partition {
+            if o == &origin {
+                target = Some(target.map_or(inst, |cur| cur.max(inst)));
+            }
+        }
+
+        if let Some(deadline) = target
+            && deadline > now
+        {
+            let delay = deadline - now;
+            if !args.quiet {
+                eprintln!(
+                    "RateLimit: waiting {:.1}s before requesting {}",
+                    delay.as_secs_f64(),
+                    url.host_str().unwrap_or("<host>")
+                );
+            }
+            sleep(delay).await;
+        }
+    }
+
+    /// Update state from response headers and return the recommended wait `Duration`
+    /// (if `Retry-After` is present or any policy has `r == 0`).
+    ///
+    /// Implements §7:
+    /// - If both `Retry-After` and `RateLimit` are present, `Retry-After` MUST take
+    ///   precedence and `t` MAY be ignored.
+    /// - When `r == 0` and `t` is present, schedules the next request after `t` seconds
+    ///   (capped at `MAX_RATELIMIT_WAIT_SECS` per §8.5.1).
+    /// - When `r > 0` and `t > 0` for request-based quotas, spaces subsequent requests
+    ///   smoothly only when remaining quota is low relative to the policy or window.
+    fn record_response(&mut self, url: &Url, headers: &HeaderMap, args: &Args) -> Option<Duration> {
+        let origin = Self::origin_key(url)?;
+        let now = Instant::now();
+
+        let policies = parse_ratelimit_policy_headers(headers, args.debug);
+        for p in policies {
+            if args.debug {
+                eprintln!(
+                    "[DEBUG] RateLimit-Policy: '{}' q={} qu={:?} w={:?} pk={:?}",
+                    terminal_safe(&p.name),
+                    p.quota,
+                    p.unit,
+                    p.window,
+                    p.partition_key
+                );
+            }
+            self.policies.insert((origin.clone(), p.name.clone()), p);
+        }
+
+        let limits = parse_ratelimit_headers(headers, args.debug);
+        let retry_after = parse_retry_after(headers);
+
+        // §7: "If a response contains both the RateLimit and Retry-After fields,
+        // the Retry-After field MUST take precedence and the effective window MAY be ignored."
+        if let Some(ra_dur) = retry_after {
+            if args.debug {
+                eprintln!(
+                    "[DEBUG] Retry-After takes precedence over RateLimit: {}s",
+                    ra_dur.as_secs()
+                );
+            }
+            let deadline = now + ra_dur;
+            self.next_allowed_by_origin
+                .entry(origin)
+                .and_modify(|e| *e = (*e).max(deadline))
+                .or_insert(deadline);
+            return Some(ra_dur);
+        }
+
+        let mut max_zero_quota_wait: Option<Duration> = None;
+
+        for item in limits {
+            let policy = self.policies.get(&(origin.clone(), item.name.clone()));
+            let unit = policy.map(|p| &p.unit).unwrap_or(&QuotaUnit::Requests);
+            let pk =
+                item.partition_key.clone().or_else(|| policy.and_then(|p| p.partition_key.clone()));
+
+            if args.debug {
+                eprintln!(
+                    "[DEBUG] RateLimit: '{}' r={} t={:?} pk={:?} (unit={:?})",
+                    terminal_safe(&item.name),
+                    item.remaining,
+                    item.effective_window,
+                    pk,
+                    unit
+                );
+            }
+
+            let Some(raw_t) = item.effective_window else {
+                continue;
+            };
+            // §8.5.1 DoS protection: cap unreasonably large effective windows
+            let capped_t = raw_t.min(MAX_RATELIMIT_WAIT_SECS);
+            if raw_t > MAX_RATELIMIT_WAIT_SECS && args.debug {
+                eprintln!(
+                    "[DEBUG] RateLimit: capping effective window t={}s to {}s",
+                    raw_t, MAX_RATELIMIT_WAIT_SECS
+                );
+            }
+
+            if item.remaining == 0 {
+                let wait = Duration::from_secs(capped_t);
+                let deadline = now + wait;
+                self.next_allowed_by_partition
+                    .entry((origin.clone(), pk))
+                    .and_modify(|e| *e = (*e).max(deadline))
+                    .or_insert(deadline);
+                max_zero_quota_wait = Some(max_zero_quota_wait.map_or(wait, |cur| cur.max(wait)));
+            } else if *unit == QuotaUnit::Requests && capped_t > 0 {
+                // Pre-emptive pacing (§7): if remaining requests are scarce and
+                // evenly spacing them over `t` requires >= 1s per request (e.g. §B.2.2
+                // "dynamic";q=100;w=60 with r=9;t=50), pace only when policy indicates
+                // throttling or remaining <= 1.
+                let is_throttled_down = policy
+                    .and_then(|p| {
+                        let w = p.window?;
+                        // Compare available rate (r / t) against nominal policy rate (q / w)
+                        Some(
+                            (item.remaining as u128) * (w as u128)
+                                < (p.quota as u128) * (capped_t as u128),
+                        )
+                    })
+                    .unwrap_or(item.remaining == 1);
+
+                if is_throttled_down && capped_t >= item.remaining {
+                    let pace_ms = ((capped_t as u128 * 1000) / (item.remaining as u128 + 1))
+                        .min(MAX_RATELIMIT_WAIT_SECS as u128 * 1000)
+                        as u64;
+                    if pace_ms > 0 {
+                        let deadline = now + Duration::from_millis(pace_ms);
+                        self.next_allowed_by_partition
+                            .entry((origin.clone(), pk))
+                            .and_modify(|e| *e = (*e).max(deadline))
+                            .or_insert(deadline);
+                    }
+                }
+            }
+        }
+
+        max_zero_quota_wait
+    }
+}
+
+/// Build an `HttpClientError` or `HttpRateLimited` error from a non-2xx `Response`,
+/// updating `rl_tracker` and extracting any RFC 9457 rate-limit problem details (§5).
+async fn handle_error_response(
+    response: Response,
+    url: &Url,
+    args: &Args,
+    rl_tracker: &mut RateLimitTracker,
+) -> anyhow::Error {
+    let status = response.status();
+    let headers = response.headers().clone();
+    let wait = rl_tracker.record_response(url, &headers, args);
+
+    let is_problem_json = headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|ct| ct.split(';').next())
+        .is_some_and(|m| m.trim().eq_ignore_ascii_case("application/problem+json"));
+
+    let problem_detail = if is_problem_json {
+        // Read up to 16 KiB for the RFC 9457 problem details payload
+        let mut buf = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(Ok(chunk)) = stream.next().await {
+            if buf.len() + chunk.len() > 16 * 1024 {
+                break;
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        parse_ratelimit_problem_body(&headers, &buf)
+    } else {
+        None
+    };
+
+    if status == StatusCode::TOO_MANY_REQUESTS
+        || status == StatusCode::SERVICE_UNAVAILABLE
+        || wait.is_some()
+        || problem_detail.is_some()
+    {
+        PermanentError::HttpRateLimited { status: status.as_u16(), wait, problem_detail }.into()
+    } else {
+        PermanentError::HttpClientError(status.as_u16()).into()
+    }
+}
+
+/// Extract server-advertised retry wait from an error, if present.
+fn extract_ratelimit_wait(err: &anyhow::Error) -> Option<Duration> {
+    if let Some(PermanentError::HttpRateLimited { wait: Some(w), .. }) =
+        err.downcast_ref::<PermanentError>()
+    {
+        return Some(*w);
+    }
+    None
+}
 
 /// Maximum number of redirects to follow
 const MAX_REDIRECTS: usize = 20;
@@ -1404,6 +2212,7 @@ async fn resolve_final_url_and_client(
     hsts_db: &mut HstsMap,
     tls_config: &Option<ClientConfig>,
     cred_scope: Option<&CredentialScope>,
+    rl_tracker: &mut RateLimitTracker,
 ) -> Result<(Client, Url, Option<u64>, Option<String>, Option<String>, bool)> {
     // CLI policy: validate the URL the user actually supplied BEFORE any HSTS
     // rewriting. Without this, 'http://example.com' would silently succeed
@@ -1435,6 +2244,9 @@ async fn resolve_final_url_and_client(
         }
 
         validate_url(&current_url, args.insecure)?;
+
+        // Honor any active RateLimit / Retry-After window for this origin (§6, §7)
+        rl_tracker.wait_before_request(&current_url, args).await;
 
         if args.verbose {
             eprintln!("-> Requesting: {}", current_url);
@@ -1512,12 +2324,15 @@ async fn resolve_final_url_and_client(
 
         let mut used_range_probe = false;
         let mut response = request.send().await.context("Failed to send HEAD request")?;
+        rl_tracker.record_response(&current_url, response.headers(), args);
+
         if response.status() == StatusCode::METHOD_NOT_ALLOWED {
             if args.debug {
                 eprintln!(
                     "[DEBUG] HEAD status: 405 Method Not Allowed. Probing with GET (Range: bytes=0-0)..."
                 );
             }
+            rl_tracker.wait_before_request(&current_url, args).await;
             // Probe with a 1-byte ranged GET instead of a full-body GET: the
             // URL is fetched again (with the real download) right after, so
             // pulling the whole body here would double the transfer. The probe
@@ -1530,6 +2345,7 @@ async fn resolve_final_url_and_client(
             }
             get_request = with_sensitive_headers(get_request, args, same_host);
             response = get_request.send().await.context("Failed to send GET request")?;
+            rl_tracker.record_response(&current_url, response.headers(), args);
             used_range_probe = true;
         }
 
@@ -1588,6 +2404,15 @@ async fn resolve_final_url_and_client(
                 .and_then(|v| v.to_str().ok())
                 .and_then(parse_unsatisfied_content_range)
                 == Some(0);
+
+        // If HEAD/probe itself was throttled (429 / 503 with Retry-After or RateLimit r=0)
+        // and --content-on-error is not set, fail immediately so the retry loop waits
+        // before sending the GET request.
+        if (status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::SERVICE_UNAVAILABLE)
+            && !args.content_on_error
+        {
+            return Err(handle_error_response(response, &current_url, args, rl_tracker).await);
+        }
 
         // Only extract resource metadata (Content-Length, Content-Disposition,
         // Last-Modified) from successful responses (or a 0-byte 416 range probe).
@@ -1786,6 +2611,7 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
     }
 
     let mut client_cache: HashMap<String, Client> = HashMap::new();
+    let mut rl_tracker = RateLimitTracker::default();
     let mut overall_success = true;
     let max_retries = if args.retries == 0 { u64::MAX } else { args.retries };
 
@@ -1845,6 +2671,7 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                         hsts_db,
                         &tls_config,
                         cred_scope.as_ref(),
+                        &mut rl_tracker,
                     )
                     .await
                     {
@@ -1870,6 +2697,7 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                                 &tls_config,
                                 cred_scope.as_ref(),
                                 send_auth,
+                                &mut rl_tracker,
                             )
                             .await
                         }
@@ -1906,8 +2734,12 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                             }
                         );
                         attempt += 1;
-                        let delay = 1u64 << attempt.clamp(0, 6);
-                        sleep(Duration::from_secs(delay)).await;
+                        if let Some(rl_wait) = extract_ratelimit_wait(&e) {
+                            sleep(rl_wait).await;
+                        } else {
+                            let delay = 1u64 << attempt.clamp(0, 6);
+                            sleep(Duration::from_secs(delay)).await;
+                        }
                     }
                 }
             }
@@ -1944,6 +2776,7 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                     hsts_db,
                     &tls_config,
                     cred_scope.as_ref(),
+                    &mut rl_tracker,
                 )
                 .await
                 {
@@ -1982,6 +2815,7 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                             &mut resolved_output,
                             &mut dest_touched,
                             send_auth,
+                            &mut rl_tracker,
                         )
                         .await
                     }
@@ -2019,9 +2853,14 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                     );
                     attempt += 1;
 
-                    // Exponential backoff: 2^attempt (capped at 64s)
-                    let delay = 1u64 << attempt.clamp(0, 6);
-                    sleep(Duration::from_secs(delay)).await;
+                    // If the error carried a RateLimit / Retry-After wait,
+                    // rl_tracker has already recorded the exact deadline and
+                    // wait_before_request will honor it on the next iteration;
+                    // otherwise apply standard exponential backoff: 2^attempt (capped at 64s).
+                    if extract_ratelimit_wait(&e).is_none() {
+                        let delay = 1u64 << attempt.clamp(0, 6);
+                        sleep(Duration::from_secs(delay)).await;
+                    }
                 }
             }
         }
@@ -3553,13 +4392,20 @@ fn parse_decimal(s: &str) -> Option<u64> {
 fn is_permanent_error(err: &anyhow::Error) -> bool {
     // 1. Check our custom permanent errors
     if let Some(pe) = err.downcast_ref::<PermanentError>() {
-        // HttpClientError carries any HTTP error status. 5xx server errors and
-        // 429 Too Many Requests are transient and should be retried; every other
-        // 4xx is permanent. All other PermanentError variants are permanent.
-        if let PermanentError::HttpClientError(code) = pe {
-            return *code < 500 && *code != 429;
+        // HttpClientError and HttpRateLimited carry HTTP error statuses.
+        // 5xx server errors, 429 Too Many Requests, and any response with
+        // an explicit RateLimit / Retry-After wait or rate-limit problem type
+        // are transient and should be retried; other 4xx errors are permanent.
+        match pe {
+            PermanentError::HttpClientError(code) => return *code < 500 && *code != 429,
+            PermanentError::HttpRateLimited { status, wait, problem_detail } => {
+                if *status >= 500 || *status == 429 || wait.is_some() || problem_detail.is_some() {
+                    return false;
+                }
+                return true;
+            }
+            _ => return true,
         }
-        return true;
     }
 
     // 2. Walk the entire error chain to catch nested errors
@@ -4158,7 +5004,10 @@ async fn fetch_json_body(
     url: &Url,
     args: &Args,
     send_auth: bool,
+    rl_tracker: &mut RateLimitTracker,
 ) -> Result<String> {
+    rl_tracker.wait_before_request(url, args).await;
+
     let mut request = client.get(url.clone());
     if send_auth && let Some(ref u) = args.user {
         request = request.basic_auth(u, args.password.as_deref());
@@ -4170,6 +5019,7 @@ async fn fetch_json_body(
 
     // Check for redirect on GET
     if status.is_redirection() {
+        rl_tracker.record_response(url, response.headers(), args);
         if let Some(location) = response.headers().get(LOCATION) {
             let location_str = location.to_str().unwrap_or("<invalid>");
             return Err(PermanentError::RedirectOnGet {
@@ -4182,8 +5032,10 @@ async fn fetch_json_body(
     }
 
     if !status.is_success() {
-        return Err(PermanentError::HttpClientError(status.as_u16()).into());
+        return Err(handle_error_response(response, url, args, rl_tracker).await);
     }
+
+    rl_tracker.record_response(url, response.headers(), args);
 
     // Validate Content-Type: application/json
     let content_type =
@@ -4240,6 +5092,7 @@ async fn process_json_downloads(
     tls_config: &Option<ClientConfig>,
     cred_scope: Option<&CredentialScope>,
     send_auth: bool,
+    rl_tracker: &mut RateLimitTracker,
 ) -> Result<()> {
     let json_url_field = args.json_url_field.as_ref().expect("--json-url-field required");
 
@@ -4247,7 +5100,7 @@ async fn process_json_downloads(
     if args.verbose {
         eprintln!("Fetching JSON from: {}", json_url);
     }
-    let body = fetch_json_body(client, json_url, args, send_auth).await?;
+    let body = fetch_json_body(client, json_url, args, send_auth, rl_tracker).await?;
 
     if args.debug {
         eprintln!("[DEBUG] JSON response body length: {} bytes", body.len());
@@ -4528,6 +5381,7 @@ async fn process_json_downloads(
                     hsts_db,
                     tls_config,
                     cred_scope,
+                    rl_tracker,
                 )
                 .await
                 {
@@ -4569,6 +5423,7 @@ async fn process_json_downloads(
                             &mut resolved_output,
                             &mut dest_touched,
                             entry_send_auth,
+                            rl_tracker,
                         )
                         .await
                     }
@@ -4603,8 +5458,10 @@ async fn process_json_downloads(
                         }
                     );
                     attempt += 1;
-                    let delay = 1u64 << attempt.clamp(0, 6);
-                    sleep(Duration::from_secs(delay)).await;
+                    if extract_ratelimit_wait(&e).is_none() {
+                        let delay = 1u64 << attempt.clamp(0, 6);
+                        sleep(Duration::from_secs(delay)).await;
+                    }
                 }
             }
         };
@@ -4633,6 +5490,7 @@ async fn download_file(
     resolved_output: &mut Option<PinnedOutput>,
     dest_touched: &mut bool,
     send_auth: bool,
+    rl_tracker: &mut RateLimitTracker,
 ) -> Result<()> {
     // True when a previous attempt already resolved (pinned) the output path;
     // this attempt must reuse it instead of re-deriving/re-numbering it.
@@ -4792,6 +5650,9 @@ async fn download_file(
     // Loop added to safely retry the entire request if we discover a different
     // Content-Disposition dynamically and need to reset or initiate a partial-resume context.
     loop {
+        // Respect any RateLimit / Retry-After cooldown recorded during HEAD or prior GET
+        rl_tracker.wait_before_request(url, args).await;
+
         // True when THIS request carries a Range header. The 416 handler must
         // only interpret a 416 as "resume state says we're complete" when a
         // range was actually requested; a 416 on a plain GET means the server
@@ -4840,6 +5701,7 @@ async fn download_file(
 
         // Handle 304 Not Modified (from If-Modified-Since in -N mode)
         if status == StatusCode::NOT_MODIFIED {
+            rl_tracker.record_response(url, current_response.headers(), args);
             let local_size = output_info.as_ref().map(|i| i.size).unwrap_or(0);
             if let Some(exp_len) = expected_length
                 && local_size != exp_len
@@ -4853,6 +5715,7 @@ async fn download_file(
                 }
                 start_byte = 0;
                 force_truncate = true;
+                rl_tracker.wait_before_request(url, args).await;
                 let mut full_request = client.get(url.clone());
                 if send_auth && let Some(ref u) = args.user {
                     full_request = full_request.basic_auth(u, args.password.as_deref());
@@ -4862,6 +5725,7 @@ async fn download_file(
                     full_request.send().await.context("Failed to send GET request")?;
                 let full_status = full_response.status();
                 if full_status.is_redirection() {
+                    rl_tracker.record_response(url, full_response.headers(), args);
                     if let Some(location) = full_response.headers().get(LOCATION) {
                         let location_str = location.to_str().unwrap_or("<invalid>");
                         return Err(PermanentError::RedirectOnGet {
@@ -4876,6 +5740,7 @@ async fn download_file(
                 }
                 if full_status.is_client_error() || full_status.is_server_error() {
                     if args.content_on_error {
+                        rl_tracker.record_response(url, full_response.headers(), args);
                         if !args.quiet {
                             eprintln!(
                                 "Warning: HTTP {} returned. Saving error body to file due to --content-on-error.",
@@ -4883,8 +5748,12 @@ async fn download_file(
                             );
                         }
                     } else {
-                        return Err(PermanentError::HttpClientError(full_status.as_u16()).into());
+                        return Err(
+                            handle_error_response(full_response, url, args, rl_tracker).await
+                        );
                     }
+                } else {
+                    rl_tracker.record_response(url, full_response.headers(), args);
                 }
                 get_last_modified = full_response
                     .headers()
@@ -4924,6 +5793,7 @@ async fn download_file(
 
         // Check for redirect on GET (HEAD and GET may behave differently)
         if status.is_redirection() {
+            rl_tracker.record_response(url, current_response.headers(), args);
             if let Some(location) = current_response.headers().get(LOCATION) {
                 let location_str = location.to_str().unwrap_or("<invalid>");
                 return Err(PermanentError::RedirectOnGet {
@@ -4936,6 +5806,7 @@ async fn download_file(
         }
 
         if status == StatusCode::RANGE_NOT_SATISFIABLE && range_sent {
+            rl_tracker.record_response(url, current_response.headers(), args);
             // Only a 416 in response to our own Range request signals that the
             // resume state already covers the whole resource. (A 416 on a plain
             // GET falls through to the generic 4xx handling below.)
@@ -4977,6 +5848,7 @@ async fn download_file(
             // --content-on-error saves the error body, but never over data being
             // resumed.
             if args.content_on_error && !range_sent {
+                rl_tracker.record_response(url, current_response.headers(), args);
                 if !args.quiet {
                     eprintln!(
                         "Warning: HTTP {} returned. Saving error body to file due to --content-on-error.",
@@ -4984,8 +5856,10 @@ async fn download_file(
                     );
                 }
             } else {
-                return Err(PermanentError::HttpClientError(status.as_u16()).into());
+                return Err(handle_error_response(current_response, url, args, rl_tracker).await);
             }
+        } else {
+            rl_tracker.record_response(url, current_response.headers(), args);
         }
 
         // In -N mode, when the GET response returns 2xx (instead of 304 Not Modified)
