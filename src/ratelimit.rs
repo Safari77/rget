@@ -1,17 +1,21 @@
+use std::fmt::Write;
 use std::{
     collections::HashMap,
     time::{Duration, Instant, SystemTime},
 };
 
-use reqwest::{Response, StatusCode, header::*};
+use reqwest::{
+    Response, StatusCode,
+    header::{AGE, CONTENT_TYPE, HeaderMap, RETRY_AFTER},
+};
 use tokio::time::sleep;
 use tokio_stream::StreamExt;
 use url::Url;
 
 use crate::{Args, PermanentError, parse_decimal, parse_http_date, terminal_safe};
 
-/// Maximum sleep duration honored from RateLimit `t` or `Retry-After` headers
-/// (draft-ietf-httpapi-ratelimit-headers-11 §8.5.1 DoS mitigation: ten minutes).
+/// Maximum sleep duration honored from `RateLimit` `t` or `Retry-After` headers
+/// (draft-ietf-httpapi-ratelimit-headers-11 §8.5.1 `DoS` mitigation: ten minutes).
 pub const MAX_RATELIMIT_WAIT_SECS: u64 = 600;
 
 /// Quota units registered in draft-ietf-httpapi-ratelimit-headers-11 §3.1.2 / §10.3.
@@ -73,7 +77,7 @@ pub(crate) struct SfItem {
 /// Parse an RFC 9651 Structured Field List of String Items with parameters,
 /// used by `RateLimit-Policy` (§3) and `RateLimit` (§4).
 /// Returns `None` if the header value is syntactically malformed (§7:
-/// "Malformed RateLimit header fields MUST be ignored").
+/// "Malformed `RateLimit` header fields MUST be ignored").
 pub fn parse_sf_string_item_list(input: &str) -> Option<Vec<SfItem>> {
     let bytes = input.as_bytes();
     let mut pos = 0;
@@ -326,7 +330,7 @@ pub fn parse_sf_string_item_list(input: &str) -> Option<Vec<SfItem>> {
 }
 
 /// Check whether response came from an HTTP cache (`Age > 0`).
-/// Per draft-ietf-httpapi-ratelimit-headers-11 §7.3, RateLimit header fields
+/// Per draft-ietf-httpapi-ratelimit-headers-11 §7.3, `RateLimit` header fields
 /// SHOULD be ignored on responses with a positive `current_age`.
 pub fn is_cached_response(headers: &HeaderMap) -> bool {
     headers
@@ -378,16 +382,15 @@ pub fn parse_ratelimit_policy_headers(headers: &HeaderMap, debug: bool) -> Vec<Q
                             break;
                         }
                     },
-                    "qu" => match v {
+                    "qu" => {
                         // §3.1.2: "qu" MUST be a String
-                        SfParamValue::String(ref unit_str) => {
+                        if let SfParamValue::String(ref unit_str) = v {
                             qu = QuotaUnit::from_str_param(unit_str);
-                        }
-                        _ => {
+                        } else {
                             valid = false;
                             break;
                         }
-                    },
+                    }
                     "w" => match v {
                         // §3.1.3: "w" MUST be a non-negative, non-zero Integer
                         SfParamValue::Integer(n) if n > 0 => w = Some(n as u64),
@@ -396,14 +399,15 @@ pub fn parse_ratelimit_policy_headers(headers: &HeaderMap, debug: bool) -> Vec<Q
                             break;
                         }
                     },
-                    "pk" => match v {
+                    "pk" => {
                         // §3.1.4: "pk" MUST be a Byte Sequence
-                        SfParamValue::ByteSeq(b) => pk = Some(b),
-                        _ => {
+                        if let SfParamValue::ByteSeq(b) = v {
+                            pk = Some(b);
+                        } else {
                             valid = false;
                             break;
                         }
-                    },
+                    }
                     _ => {} // Other/vendor parameters are allowed and ignored (§3.1)
                 }
             }
@@ -475,14 +479,15 @@ pub fn parse_ratelimit_headers(headers: &HeaderMap, debug: bool) -> Vec<ServiceL
                             break;
                         }
                     },
-                    "pk" => match v {
+                    "pk" => {
                         // §4.1.3: "pk" MUST be a Byte Sequence
-                        SfParamValue::ByteSeq(b) => pk = Some(b),
-                        _ => {
+                        if let SfParamValue::ByteSeq(b) = v {
+                            pk = Some(b);
+                        } else {
                             header_valid = false;
                             break;
                         }
-                    },
+                    }
                     _ => {} // Other/vendor parameters are allowed and ignored (§4.1)
                 }
             }
@@ -577,12 +582,12 @@ pub fn parse_ratelimit_problem_body(headers: &HeaderMap, body: &[u8]) -> Option<
         if !summary.is_empty() {
             summary.push(' ');
         }
-        summary.push_str(&format!("(violated-policies: {})", violated.join(", ")));
+        let _ = write!(summary, "(violated-policies: {})", violated.join(", "));
     }
     Some(summary)
 }
 
-/// Per-origin RateLimit state tracker implementing client behavior from
+/// Per-origin `RateLimit` state tracker implementing client behavior from
 /// draft-ietf-httpapi-ratelimit-headers-11 §7.
 #[derive(Debug, Default)]
 pub struct RateLimitTracker {
@@ -688,7 +693,7 @@ impl RateLimitTracker {
 
         for item in limits {
             let policy = self.policies.get(&(origin.clone(), item.name.clone()));
-            let unit = policy.map(|p| &p.unit).unwrap_or(&QuotaUnit::Requests);
+            let unit = policy.map_or(&QuotaUnit::Requests, |p| &p.unit);
             let pk =
                 item.partition_key.clone().or_else(|| policy.and_then(|p| p.partition_key.clone()));
 
@@ -710,8 +715,7 @@ impl RateLimitTracker {
             let capped_t = raw_t.min(MAX_RATELIMIT_WAIT_SECS);
             if raw_t > MAX_RATELIMIT_WAIT_SECS && args.debug {
                 eprintln!(
-                    "[DEBUG] RateLimit: capping effective window t={}s to {}s",
-                    raw_t, MAX_RATELIMIT_WAIT_SECS
+                    "[DEBUG] RateLimit: capping effective window t={raw_t}s to {MAX_RATELIMIT_WAIT_SECS}s"
                 );
             }
 
@@ -733,16 +737,14 @@ impl RateLimitTracker {
                         let w = p.window?;
                         // Compare available rate (r / t) against nominal policy rate (q / w)
                         Some(
-                            (item.remaining as u128) * (w as u128)
-                                < (p.quota as u128) * (capped_t as u128),
+                            u128::from(item.remaining) * u128::from(w)
+                                < u128::from(p.quota) * u128::from(capped_t),
                         )
                     })
                     .unwrap_or(item.remaining == 1);
 
                 if is_throttled_down && capped_t >= item.remaining {
-                    let pace_ms = ((capped_t as u128 * 1000) / (item.remaining as u128 + 1))
-                        .min(MAX_RATELIMIT_WAIT_SECS as u128 * 1000)
-                        as u64;
+                    let pace_ms = (capped_t * 1000) / (item.remaining + 1);
                     if pace_ms > 0 {
                         let deadline = now + Duration::from_millis(pace_ms);
                         self.next_allowed_by_partition

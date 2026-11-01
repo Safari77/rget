@@ -52,7 +52,7 @@ impl ParsedContentDisposition {
         let clone = self.params.get("filename").cloned();
         match clone {
             Some(c) => {
-                let mut arr: Vec<&str> = c.split(".").collect();
+                let mut arr: Vec<&str> = c.split('.').collect();
                 let last = arr.pop();
                 let first = arr.join(".");
                 Some(match last {
@@ -160,7 +160,7 @@ fn parse_param_content(content: &str) -> ParamContent {
     let encodings = compute_parameter_encodings(&map, &decode_key_list);
 
     for (k, (e, strip)) in encodings {
-        let key = format!("{}*", k);
+        let key = format!("{k}*");
         // Ensure we remove the extended key whether the charset is recognized or not
         if let Some(percent_encoded_value) = map.remove(&key) {
             let encoded_value = if strip {
@@ -189,7 +189,7 @@ fn parse_param_content(content: &str) -> ParamContent {
     for unwrap_key in unwrap_key_list {
         let mut unwrapped_value = String::new();
         let mut index = 0;
-        while let Some(wrapped_value_part) = map.remove(&format!("{}*{}", unwrap_key, index)) {
+        while let Some(wrapped_value_part) = map.remove(&format!("{unwrap_key}*{index}")) {
             index += 1;
             unwrapped_value.push_str(&wrapped_value_part);
         }
@@ -207,8 +207,8 @@ fn compute_parameter_encodings(
     for decode_key in decode_key_list {
         if let Some(unwrap_key) = decode_key.strip_suffix("*0") {
             let encoding =
-                map.get(&format!("{}*", decode_key)).unwrap().split('\'').next().unwrap_or("");
-            let continuation_prefix = format!("{}*", unwrap_key);
+                map.get(&format!("{decode_key}*")).unwrap().split('\'').next().unwrap_or("");
+            let continuation_prefix = format!("{unwrap_key}*");
             for continuation_key in decode_key_list {
                 if continuation_key.starts_with(&continuation_prefix) {
                     encodings.insert(
@@ -219,7 +219,7 @@ fn compute_parameter_encodings(
             }
         } else if !encodings.contains_key(decode_key) {
             let encoding = map
-                .get(&format!("{}*", decode_key))
+                .get(&format!("{decode_key}*"))
                 .unwrap()
                 .split('\'')
                 .next()
