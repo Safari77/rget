@@ -11,10 +11,10 @@
 //! - Content-Disposition header parsing with charset support (RFC 5987, RFC 6266)
 //! - Connection reuse when downloading multiple files
 //! - Redirect handling (Location header on 3xx responses)
-//! - Atomic file writing with --temp flag, renameat2 RENAME_NOREPLACE support
+//! - Atomic file writing with --temp flag, renameat2 `RENAME_NOREPLACE` support
 //!   - Deterministic temp filenames generated with SHAKE256
 //! - Resume support with --continue flag (works with --temp too)
-//! - Safe open flags when creating files (O_EXCL O_NOFOLLOW O_NOCTTY)
+//! - Safe open flags when creating files (`O_EXCL` `O_NOFOLLOW` `O_NOCTTY`)
 //! - Windows Reserved Filename protection
 //! - Mutual TLS (mTLS) support via --cert and --key
 //! - HSTS Persistence to enforce HTTPS for known hosts
@@ -64,6 +64,7 @@ use shake::{
     Shake256,
     digest::{ExtendableOutput, Update, XofReader},
 };
+use std::fmt::Write as _;
 use tokio::io::{AsyncWrite, AsyncWriteExt, BufWriter as TokBufWriter};
 use tokio::time::{Instant, sleep};
 use tokio_stream::StreamExt;
@@ -251,58 +252,55 @@ impl std::fmt::Display for PermanentError {
                 write!(f, "Refusing to write to symlink: '{}'", path.display())
             }
             Self::InsecureUrl(url) => {
-                write!(f, "Refusing insecure HTTP URL: {}. Use --insecure to allow.", url)
+                write!(f, "Refusing insecure HTTP URL: {url}. Use --insecure to allow.")
             }
-            Self::ClientBuilderError(msg) => write!(f, "Failed to initialize HTTP client: {}", msg),
+            Self::ClientBuilderError(msg) => write!(f, "Failed to initialize HTTP client: {msg}"),
             Self::UnsupportedScheme(scheme) => {
-                write!(f, "Unsupported URL scheme: {}", scheme)
+                write!(f, "Unsupported URL scheme: {scheme}")
             }
             Self::NoSafeIpv4(host) => {
-                write!(f, "Could not resolve '{}' to a safe IPv4 address", host)
+                write!(f, "Could not resolve '{host}' to a safe IPv4 address")
             }
             Self::NoSafeIpv6(host) => {
-                write!(f, "Could not resolve '{}' to a safe IPv6 address", host)
+                write!(f, "Could not resolve '{host}' to a safe IPv6 address")
             }
             Self::NoSafePublicIp(host) => {
-                write!(f, "Could not resolve '{}' to a safe public IP", host)
+                write!(f, "Could not resolve '{host}' to a safe public IP")
             }
             Self::ProxyIpPolicyConflict(flags) => {
                 write!(
                     f,
-                    "A proxy is configured in the environment (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY), but {} cannot be enforced through a proxy because the proxy resolves names and connects on its own. Use --no-proxy to connect directly, or unset the proxy variables.",
-                    flags
+                    "A proxy is configured in the environment (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY), but {flags} cannot be enforced through a proxy because the proxy resolves names and connects on its own. Use --no-proxy to connect directly, or unset the proxy variables."
                 )
             }
             Self::TooManyRedirects(max) => {
-                write!(f, "Too many redirects (maximum: {})", max)
+                write!(f, "Too many redirects (maximum: {max})")
             }
             Self::ContentRangeMismatch { requested, received } => {
                 write!(
                     f,
-                    "Content-Range mismatch: requested byte {}, server returned byte {}. Aborting to prevent file corruption.",
-                    requested, received
+                    "Content-Range mismatch: requested byte {requested}, server returned byte {received}. Aborting to prevent file corruption."
                 )
             }
             Self::RedirectWithoutLocation(status) => {
-                write!(f, "Server returned redirect ({}) but no Location header", status)
+                write!(f, "Server returned redirect ({status}) but no Location header")
             }
             Self::RedirectOnGet { status, location } => {
                 write!(
                     f,
-                    "Server returned redirect on GET ({}) with manual-redirects disabled. Redirect target: {}",
-                    status, location
+                    "Server returned redirect on GET ({status}) with manual-redirects disabled. Redirect target: {location}"
                 )
             }
             Self::HttpClientError(status) => {
-                write!(f, "Download failed with HTTP status: {}", status)
+                write!(f, "Download failed with HTTP status: {status}")
             }
             Self::HttpRateLimited { status, wait, problem_detail } => {
-                write!(f, "Download throttled with HTTP status: {}", status)?;
+                write!(f, "Download throttled with HTTP status: {status}")?;
                 if let Some(w) = wait {
                     write!(f, " (retry after {}s)", w.as_secs())?;
                 }
                 if let Some(detail) = problem_detail {
-                    write!(f, " [{}]", detail)?;
+                    write!(f, " [{detail}]")?;
                 }
                 Ok(())
             }
@@ -314,7 +312,7 @@ impl std::fmt::Display for PermanentError {
                 )
             }
             Self::InvalidArguments(msg) => {
-                write!(f, "{}", msg)
+                write!(f, "{msg}")
             }
             Self::BlockDeviceNotAllowed(path) => {
                 write!(f, "Refusing to write to block device: '{}'", path.display())
@@ -332,14 +330,13 @@ impl std::fmt::Display for PermanentError {
                 )
             }
             Self::ClientCertError(msg) => {
-                write!(f, "Client certificate/key error: {}", msg)
+                write!(f, "Client certificate/key error: {msg}")
             }
             Self::BinaryToTerminal(ct) => {
                 if let Some(ct) = ct {
                     write!(
                         f,
-                        "Refusing to write binary data (Content-Type: {}) to terminal. Use shell redirection (>) or --output.",
-                        ct
+                        "Refusing to write binary data (Content-Type: {ct}) to terminal. Use shell redirection (>) or --output."
                     )
                 } else {
                     write!(
@@ -365,17 +362,13 @@ impl std::fmt::Display for PermanentError {
                 write!(f, "Output path '{}' is not a directory", path.display())
             }
             Self::JsonContentTypeExpected(actual) => {
-                write!(
-                    f,
-                    "--json-parse requires Content-Type: application/json but got: {}",
-                    actual
-                )
+                write!(f, "--json-parse requires Content-Type: application/json but got: {actual}")
             }
             Self::JsonParseError(msg) => {
-                write!(f, "Failed to parse JSON response: {}", msg)
+                write!(f, "Failed to parse JSON response: {msg}")
             }
             Self::JsonPathError(msg) => {
-                write!(f, "JSON path expression error: {}", msg)
+                write!(f, "JSON path expression error: {msg}")
             }
             Self::JsonNoUrlsExtracted => {
                 write!(f, "No download URLs were extracted from JSON (after filtering)")
@@ -383,22 +376,19 @@ impl std::fmt::Display for PermanentError {
             Self::JsonUrlHashCountMismatch { urls, hashes } => {
                 write!(
                     f,
-                    "--json-url-field extracted {} URLs but --json-hash-field extracted {} hashes (must be equal)",
-                    urls, hashes
+                    "--json-url-field extracted {urls} URLs but --json-hash-field extracted {hashes} hashes (must be equal)"
                 )
             }
             Self::JsonUrlNameCountMismatch { urls, names } => {
                 write!(
                     f,
-                    "--json-url-field extracted {} URLs but --json-name-field extracted {} names (must be equal)",
-                    urls, names
+                    "--json-url-field extracted {urls} URLs but --json-name-field extracted {names} names (must be equal)"
                 )
             }
             Self::JsonUrlSizeCountMismatch { urls, sizes } => {
                 write!(
                     f,
-                    "--json-url-field extracted {} URLs but --json-size-field extracted {} sizes (must be equal)",
-                    urls, sizes
+                    "--json-url-field extracted {urls} URLs but --json-size-field extracted {sizes} sizes (must be equal)"
                 )
             }
             Self::JsonHashMissing(file) => {
@@ -413,8 +403,7 @@ impl std::fmt::Display for PermanentError {
             Self::JsonHashMismatch { file, expected, actual } => {
                 write!(
                     f,
-                    "SHA256 verification FAILED for '{}': expected {} got {}",
-                    file, expected, actual
+                    "SHA256 verification FAILED for '{file}': expected {expected} got {actual}"
                 )
             }
             Self::JsonHashUnsupportedAlgo(algo) => {
@@ -441,8 +430,7 @@ impl std::fmt::Display for PermanentError {
             Self::JsonDownloadsFailed { failed, total } => {
                 write!(
                     f,
-                    "JSON download mode: {} of {} downloads failed (per-entry retries already exhausted)",
-                    failed, total
+                    "JSON download mode: {failed} of {total} downloads failed (per-entry retries already exhausted)"
                 )
             }
         }
@@ -469,7 +457,7 @@ const MAX_JSON_BODY_BYTES: u64 = 64 * 1024 * 1024;
 /// Default personalization string if config file doesn't exist
 const DEFAULT_PERSONALIZATION: &str = "rget-default-key-v1";
 
-/// Maximum filename length in bytes (POSIX NAME_MAX is typically 255)
+/// Maximum filename length in bytes (POSIX `NAME_MAX` is typically 255)
 const MAX_FILENAME_BYTES: usize = 255;
 
 /// Longest suffix (including the leading dot) still treated as an extension
@@ -483,15 +471,15 @@ const MAX_EXTENSION_BYTES: usize = 20;
 /// - Windows: C:\Users\<User>\AppData\Roaming\rget\resumekey.conf
 const RESUME_KEY_FILENAME: &str = "resumekey.conf";
 
-/// Check if io::Error is ENAMETOOLONG or equivalent
+/// Check if `io::Error` is ENAMETOOLONG or equivalent
 fn is_name_too_long(err: &std::io::Error) -> bool {
     err.kind() == std::io::ErrorKind::InvalidFilename
 }
 
-/// Check if a sync_all() error can be safely ignored.
+/// Check if a `sync_all()` error can be safely ignored.
 /// This handles filesystems / targets that don't support fsync:
 /// - Unix: EINVAL and ENOTSUP (e.g. /dev/null, some pseudo-fs)
-/// - Windows: ERROR_INVALID_FUNCTION (1) and ERROR_NOT_SUPPORTED (50)
+/// - Windows: `ERROR_INVALID_FUNCTION` (1) and `ERROR_NOT_SUPPORTED` (50)
 fn is_sync_ignorable(e: &std::io::Error) -> bool {
     let Some(code) = e.raw_os_error() else {
         return false;
@@ -747,7 +735,7 @@ struct Args {
     json_parse: bool,
 
     /// JSON path expression to extract download URLs (required with --json-parse)
-    /// Uses jq-like dot notation: .assets[].browser_download_url
+    /// Uses jq-like dot notation: .assets[].`browser_download_url`
     #[arg(
         long = "json-url-field",
         help = "JSON path to download URL field (e.g. .assets[].browser_download_url)"
@@ -796,16 +784,14 @@ struct HstsEntry {
 type HstsMap = HashMap<String, HstsEntry>;
 
 fn get_default_hsts_path() -> PathBuf {
-    dirs::config_dir()
-        .map(|d| d.join(env!("CARGO_PKG_NAME")).join(HSTS_DB_FILENAME))
-        .unwrap_or_else(|| PathBuf::from(HSTS_DB_FILENAME))
+    dirs::config_dir().map_or_else(
+        || PathBuf::from(HSTS_DB_FILENAME),
+        |d| d.join(env!("CARGO_PKG_NAME")).join(HSTS_DB_FILENAME),
+    )
 }
 
 fn load_hsts_db(path: &Path) -> HstsMap {
-    let file = match File::open(path) {
-        Ok(f) => f,
-        Err(_) => return HashMap::new(),
-    };
+    let Ok(file) = File::open(path) else { return HashMap::new() };
     let reader = BufReader::new(file);
 
     // Parse JSON
@@ -839,7 +825,7 @@ fn try_hsts_upgrade(url: &mut Url, hsts_db: &HstsMap, args: &Args) -> Result<boo
         && check_hsts(hsts_db, host)
     {
         if args.verbose {
-            eprintln!("HSTS: Upgrading insecure request to {}", host);
+            eprintln!("HSTS: Upgrading insecure request to {host}");
         }
         // RFC 6797 §8.3: when upgrading to https, an explicit port of 80
         // MUST be converted to 443; any other explicit port is preserved;
@@ -849,11 +835,10 @@ fn try_hsts_upgrade(url: &mut Url, hsts_db: &HstsMap, args: &Args) -> Result<boo
         // silently must NOT leave the request on http://, so error out.
         if url.port() == Some(80) {
             url.set_port(Some(443))
-                .map_err(|_| anyhow::anyhow!("HSTS upgrade: cannot set port 443 on '{}'", url))?;
+                .map_err(|()| anyhow::anyhow!("HSTS upgrade: cannot set port 443 on '{url}'"))?;
         }
-        url.set_scheme("https").map_err(|_| {
-            anyhow::anyhow!("HSTS upgrade: cannot set scheme to https on '{}'", url)
-        })?;
+        url.set_scheme("https")
+            .map_err(|()| anyhow::anyhow!("HSTS upgrade: cannot set scheme to https on '{url}'"))?;
         return Ok(true);
     }
     Ok(false)
@@ -891,11 +876,11 @@ fn save_hsts_db(path: &Path, map: &HstsMap) {
     {
         let mut writer = BufWriter::new(tmp.as_file_mut());
         if let Err(e) = serde_json::to_writer_pretty(&mut writer, &valid_entries) {
-            eprintln!("Failed to serialize HSTS DB to '{}': {}", tmp_path_display, e);
+            eprintln!("Failed to serialize HSTS DB to '{tmp_path_display}': {e}");
             return;
         }
         if let Err(e) = writer.flush() {
-            eprintln!("Failed to flush HSTS DB to '{}': {}", tmp_path_display, e);
+            eprintln!("Failed to flush HSTS DB to '{tmp_path_display}': {e}");
             return;
         }
     }
@@ -903,7 +888,7 @@ fn save_hsts_db(path: &Path, map: &HstsMap) {
     // Make the bytes durable on disk before the atomic rename, so a crash
     // cannot leave an empty or truncated HSTS DB behind.
     if let Err(e) = tmp.as_file().sync_all() {
-        eprintln!("Failed to sync HSTS DB '{}': {}", tmp_path_display, e);
+        eprintln!("Failed to sync HSTS DB '{tmp_path_display}': {e}");
         return;
     }
 
@@ -1027,14 +1012,13 @@ fn update_hsts(map: &mut HstsMap, url: &Url, headers: &HeaderMap, debug: bool) {
                 // max-age-value = 1*DIGIT (RFC 6797 §6.1.1). Parse strictly:
                 // u64::from_str would also accept a leading '+', which is not
                 // 1*DIGIT, so use the strict decimal parser instead.
-                match parse_decimal(v) {
-                    Some(age) => max_age = Some(age),
-                    None => {
-                        if debug {
-                            eprintln!("[DEBUG] HSTS: malformed max-age '{}', ignoring header", val);
-                        }
-                        return;
+                if let Some(age) = parse_decimal(v) {
+                    max_age = Some(age);
+                } else {
+                    if debug {
+                        eprintln!("[DEBUG] HSTS: malformed max-age '{val}', ignoring header");
                     }
+                    return;
                 }
             }
             // Unknown directive with a value: RFC §6.1 rule 5 says ignore
@@ -1057,7 +1041,7 @@ fn update_hsts(map: &mut HstsMap, url: &Url, headers: &HeaderMap, debug: bool) {
     // directive is explicitly ignored in this case (RFC §6.1.1 NOTE).
     if age == 0 {
         if map.remove(host).is_some() && debug {
-            eprintln!("[DEBUG] HSTS: removed entry for '{}' (max-age=0)", host);
+            eprintln!("[DEBUG] HSTS: removed entry for '{host}' (max-age=0)");
         }
         return;
     }
@@ -1086,8 +1070,7 @@ fn update_hsts(map: &mut HstsMap, url: &Url, headers: &HeaderMap, debug: bool) {
 
     if debug {
         eprintln!(
-            "[DEBUG] HSTS: Added/Updated entry for '{}' (max-age={}, includeSubDomains={})",
-            host, age, include_subdomains
+            "[DEBUG] HSTS: Added/Updated entry for '{host}' (max-age={age}, includeSubDomains={include_subdomains})"
         );
     }
 }
@@ -1099,7 +1082,7 @@ fn safe_parent(path: &Path) -> &Path {
     if parent.as_os_str().is_empty() { Path::new(".") } else { parent }
 }
 
-/// Build the TLS ClientConfig once per invocation.
+/// Build the TLS `ClientConfig` once per invocation.
 /// Returns None in --insecure mode (no rustls config needed).
 fn build_tls_config(args: &Args) -> Result<Option<ClientConfig>> {
     if args.insecure {
@@ -1116,8 +1099,7 @@ fn build_tls_config(args: &Args) -> Result<Option<ClientConfig>> {
         Err(e) => {
             if args.debug || args.verbose {
                 eprintln!(
-                    "Warning: Platform verifier unavailable ({}). Falling back to WebPKI roots.",
-                    e
+                    "Warning: Platform verifier unavailable ({e}). Falling back to WebPKI roots."
                 );
             }
             let mut root_store = rustls::RootCertStore::empty();
@@ -1140,7 +1122,7 @@ fn build_tls_config(args: &Args) -> Result<Option<ClientConfig>> {
 
     let client_config = if let (Some(cert_path), Some(key_path)) = (&args.cert, &args.key) {
         if args.debug {
-            eprintln!("[DEBUG] Loading client certificate (platform-verifier): {}", cert_path);
+            eprintln!("[DEBUG] Loading client certificate (platform-verifier): {cert_path}");
         }
         let certs = load_certs(cert_path)?;
         let key = load_key(key_path)?;
@@ -1219,20 +1201,18 @@ fn build_client(
 
         if let (Some(cert_path), Some(key_path)) = (&args.cert, &args.key) {
             if args.debug {
-                eprintln!("[DEBUG] Loading client certificate (insecure mode): {}", cert_path);
+                eprintln!("[DEBUG] Loading client certificate (insecure mode): {cert_path}");
             }
 
             let cert_pem = fs::read(cert_path).map_err(|e| {
                 PermanentError::ClientCertError(format!(
-                    "Failed to read certificate file '{}': {}",
-                    cert_path, e
+                    "Failed to read certificate file '{cert_path}': {e}"
                 ))
             })?;
 
             let key_pem = fs::read(key_path).map_err(|e| {
                 PermanentError::ClientCertError(format!(
-                    "Failed to read key file '{}': {}",
-                    key_path, e
+                    "Failed to read key file '{key_path}': {e}"
                 ))
             })?;
 
@@ -1267,7 +1247,7 @@ fn build_client(
     // JSON-listed host). They are attached per request instead, only when the
     // target is the host the user named (see with_sensitive_headers).
     let (custom_headers, _) = parse_custom_headers(args, true);
-    for (name, value) in custom_headers.iter() {
+    for (name, value) in &custom_headers {
         headers.insert(name.clone(), value.clone());
     }
     if !headers.is_empty() {
@@ -1281,7 +1261,7 @@ fn build_client(
 
     builder
         .build()
-        .map_err(|e| PermanentError::ClientBuilderError(format!("TLS/Builder error: {}", e)).into())
+        .map_err(|e| PermanentError::ClientBuilderError(format!("TLS/Builder error: {e}")).into())
 }
 
 /// Header names that carry credentials. The same set curl strips on a
@@ -1307,10 +1287,10 @@ fn parse_custom_headers(args: &Args, warn: bool) -> (HeaderMap, HeaderMap) {
                     plain.insert(k_name, v_val);
                 }
             } else if warn {
-                eprintln!("Warning: Invalid header ignored: {}", h);
+                eprintln!("Warning: Invalid header ignored: {h}");
             }
         } else if warn {
-            eprintln!("Warning: Invalid header format (missing colon): {}", h);
+            eprintln!("Warning: Invalid header format (missing colon): {h}");
         }
     }
     (plain, sensitive)
@@ -1318,7 +1298,7 @@ fn parse_custom_headers(args: &Args, warn: bool) -> (HeaderMap, HeaderMap) {
 
 /// Attach the user's credential-bearing --header values (Authorization, Cookie,
 /// Proxy-Authorization) to one request, but only when `allowed` (the target is
-/// the host the user named, see CredentialScope).
+/// the host the user named, see `CredentialScope`).
 fn with_sensitive_headers(
     request: reqwest::RequestBuilder,
     args: &Args,
@@ -1400,15 +1380,15 @@ fn is_bidi_control(c: char) -> bool {
 fn load_certs(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
     use rustls::pki_types::pem::PemObject;
     rustls::pki_types::CertificateDer::pem_file_iter(path)
-        .map_err(|e| anyhow::anyhow!("Failed to open cert file '{}': {}", path, e))?
+        .map_err(|e| anyhow::anyhow!("Failed to open cert file '{path}': {e}"))?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| anyhow::anyhow!("Invalid certificate in '{}': {}", path, e))
+        .map_err(|e| anyhow::anyhow!("Invalid certificate in '{path}': {e}"))
 }
 
 fn load_key(path: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {
     use rustls::pki_types::pem::PemObject;
     rustls::pki_types::PrivateKeyDer::from_pem_file(path)
-        .map_err(|e| anyhow::anyhow!("Invalid or missing private key in '{}': {}", path, e))
+        .map_err(|e| anyhow::anyhow!("Invalid or missing private key in '{path}': {e}"))
 }
 
 async fn resolve_final_url_and_client(
@@ -1455,7 +1435,7 @@ async fn resolve_final_url_and_client(
         rl_tracker.wait_before_request(&current_url, args).await;
 
         if args.verbose {
-            eprintln!("-> Requesting: {}", current_url);
+            eprintln!("-> Requesting: {current_url}");
         }
 
         let client = if is_env_proxy_configured(&current_url, args) {
@@ -1492,11 +1472,11 @@ async fn resolve_final_url_and_client(
 
             // Include port in cache key to separate HTTP (80) and HTTPS (443) clients
             let port = current_url.port_or_known_default().unwrap_or(443);
-            let cache_key = format!("{}:{}", host, port);
+            let cache_key = format!("{host}:{port}");
 
             if let Some(cached_client) = client_cache.get(&cache_key) {
                 if args.verbose {
-                    eprintln!("   Reusing connection for {}", host);
+                    eprintln!("   Reusing connection for {host}");
                 }
                 cached_client.clone()
             } else {
@@ -1570,8 +1550,8 @@ async fn resolve_final_url_and_client(
             eprintln!("[DEBUG] HTTP version: {:#?} {}", response.version(), response.status());
             eprintln!("[DEBUG] All headers:");
             // Sometimes Google CDN sends 'age: "0"' and no content-length or etag
-            for (name, value) in response.headers().iter() {
-                eprintln!("[DEBUG]   {}: {:?}", name, value);
+            for (name, value) in response.headers() {
+                eprintln!("[DEBUG]   {name}: {value:?}");
             }
             if response.headers().contains_key("transfer-encoding") {
                 eprintln!(
@@ -1591,7 +1571,7 @@ async fn resolve_final_url_and_client(
             let next_url =
                 current_url.join(location_str).context("Failed to resolve redirect URL")?;
             if args.verbose {
-                eprintln!("   Redirecting to: {}", next_url);
+                eprintln!("   Redirecting to: {next_url}");
             }
             current_url = next_url;
             redirect_count += 1;
@@ -1628,9 +1608,11 @@ async fn resolve_final_url_and_client(
             let cd = headers
                 .get(CONTENT_DISPOSITION)
                 .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string());
-            let lm =
-                headers.get(LAST_MODIFIED).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+                .map(std::string::ToString::to_string);
+            let lm = headers
+                .get(LAST_MODIFIED)
+                .and_then(|v| v.to_str().ok())
+                .map(std::string::ToString::to_string);
             (Some(0), cd, lm)
         } else if status.is_success() {
             // For a 206 response the Content-Length header is the *remaining* byte
@@ -1652,9 +1634,11 @@ async fn resolve_final_url_and_client(
             let cd = headers
                 .get(CONTENT_DISPOSITION)
                 .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string());
-            let lm =
-                headers.get(LAST_MODIFIED).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+                .map(std::string::ToString::to_string);
+            let lm = headers
+                .get(LAST_MODIFIED)
+                .and_then(|v| v.to_str().ok())
+                .map(std::string::ToString::to_string);
             (cl, cd, lm)
         } else {
             (None, None, None)
@@ -1671,7 +1655,7 @@ async fn resolve_final_url_and_client(
             ));
         }
 
-        bail!("Unexpected status code: {}", status);
+        bail!("Unexpected status code: {status}");
     }
 }
 
@@ -1734,8 +1718,7 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
             Ok(m) if m <= 0o7777 => {}
             _ => {
                 return Err(PermanentError::InvalidArguments(format!(
-                    "Invalid file mode: '{}' (expect octal digits 0-7, value <= 7777)",
-                    mode_str
+                    "Invalid file mode: '{mode_str}' (expect octal digits 0-7, value <= 7777)"
                 ))
                 .into());
             }
@@ -1773,7 +1756,7 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
     }
 
     if let Err(e) = apply_security_sandbox() {
-        eprintln!("Failed to apply seccomp filter: {}", e);
+        eprintln!("Failed to apply seccomp filter: {e}");
         std::process::exit(1);
     }
 
@@ -1844,7 +1827,7 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
         let url = match Url::parse(url_str) {
             Ok(u) => u,
             Err(e) => {
-                eprintln!("Error parsing URL '{}': {}", url_str, e);
+                eprintln!("Error parsing URL '{url_str}': {e}");
                 overall_success = false;
                 continue;
             }
@@ -1855,7 +1838,7 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
         let cred_scope = CredentialScope::from_url(&url);
 
         if !args.quiet {
-            eprintln!("Starting download: {}", url);
+            eprintln!("Starting download: {url}");
         }
 
         // JSON parse mode: fetch JSON, extract URLs, download them
@@ -1890,7 +1873,7 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                             send_auth,
                         )) => {
                             if current_args.verbose && final_url != url {
-                                eprintln!("Final URL: {}", final_url);
+                                eprintln!("Final URL: {final_url}");
                             }
                             process_json_downloads(
                                 &client,
@@ -1920,12 +1903,12 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                     }
                     Err(e) => {
                         if is_permanent_error(&e) {
-                            eprintln!("Failed: {:#}", e);
+                            eprintln!("Failed: {e:#}");
                             overall_success = false;
                             break;
                         }
                         if attempt >= max_retries {
-                            eprintln!("Failed: {:#}", e);
+                            eprintln!("Failed: {e:#}");
                             overall_success = false;
                             break;
                         }
@@ -1995,7 +1978,7 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                         send_auth,
                     )) => {
                         if current_args.verbose && final_url != url {
-                            eprintln!("Final URL: {}", final_url);
+                            eprintln!("Final URL: {final_url}");
                         }
 
                         if let (Some(max), Some(size)) = (current_args.max_size, content_length)
@@ -2038,12 +2021,12 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                 }
                 Err(e) => {
                     if is_permanent_error(&e) {
-                        eprintln!("Failed to download {}: {:#}", url, e);
+                        eprintln!("Failed to download {url}: {e:#}");
                         overall_success = false;
                         break;
                     }
                     if attempt >= max_retries {
-                        eprintln!("Failed to download {}: {:#}", url, e);
+                        eprintln!("Failed to download {url}: {e:#}");
                         overall_success = false;
                         break;
                     }
@@ -2114,7 +2097,7 @@ fn split_filename_ext(filename: &str) -> (&str, &str) {
     }
 }
 
-/// Truncate a filename to fit within MAX_FILENAME_BYTES, preserving extension if possible.
+/// Truncate a filename to fit within `MAX_FILENAME_BYTES`, preserving extension if possible.
 fn truncate_filename_to_limit(filename: &str) -> String {
     if filename.len() <= MAX_FILENAME_BYTES {
         return filename.to_string();
@@ -2131,7 +2114,7 @@ fn truncate_filename_to_limit(filename: &str) -> String {
     }
 
     let truncated_base = truncate_str_to_byte_limit(base, max_base_bytes);
-    format!("{}{}", truncated_base, ext)
+    format!("{truncated_base}{ext}")
 }
 
 fn resolve_output_path(original_path: &Path) -> Result<PathBuf> {
@@ -2175,8 +2158,7 @@ fn is_private_ip(ip: &IpAddr) -> bool {
                 // IPv4-mapped IPv6: ::ffff:x.x.x.x
                 || ipv6
                     .to_ipv4_mapped()
-                    .map(|v4| is_private_ip(&IpAddr::V4(v4)))
-                    .unwrap_or(false)
+                    .is_some_and(|v4| is_private_ip(&IpAddr::V4(v4)))
                 // IPv4-compatible IPv6 (deprecated RFC 4291 §2.5.5.1): ::x.x.x.x
                 || (IPV4_COMPAT_IPV6_NET.contains(ipv6)
                     && !ipv6.is_unspecified()
@@ -2191,7 +2173,7 @@ fn is_private_ip(ip: &IpAddr) -> bool {
     }
 }
 
-/// Check if a 6to4 address (2002::/16) embeds a private IPv4 address
+/// Check if a 6to4 address (`2002::/16`) embeds a private IPv4 address
 fn is_6to4_private(ipv6: &Ipv6Addr) -> bool {
     if !IPV6_6TO4_NET.contains(ipv6) {
         return false;
@@ -2210,8 +2192,8 @@ fn is_6to4_private(ipv6: &Ipv6Addr) -> bool {
 }
 
 /// Check if a NAT64 address maps to private address space.
-/// Covers the well-known prefix 64:ff9b::/96 (RFC 6052), which embeds an IPv4
-/// address in the last 32 bits, and the local-use prefix 64:ff9b:1::/48
+/// Covers the well-known prefix `64:ff9b::/96` (RFC 6052), which embeds an IPv4
+/// address in the last 32 bits, and the local-use prefix `64:ff9b:1::/48`
 /// (RFC 8215), which is reserved for operator-internal translation.
 fn is_nat64_private(ipv6: &Ipv6Addr) -> bool {
     // 64:ff9b:1::/48 is local-use; treat the whole prefix as private.
@@ -2299,7 +2281,7 @@ async fn resolve_safe_ip(url: &Url, args: &Args) -> Result<SocketAddr> {
 
 /// Parse Content-Disposition header and extract filename if valid.
 /// Returns None for invalid headers (per RFC 6266, invalid headers should be ignored).
-/// The content_disposition crate handles RFC 6266 and RFC 5987 properly, including:
+/// The `content_disposition` crate handles RFC 6266 and RFC 5987 properly, including:
 /// - Validating disposition type exists and is valid
 /// - Prioritizing filename* over filename
 /// - Proper charset decoding for extended parameters
@@ -2462,7 +2444,7 @@ fn canonicalize_url_path(url: &mut Url) {
 /// This allows `--temp --continue` to work by generating the same temp filename
 /// for the same download across multiple runs.
 ///
-/// Format: .{base32hash}.{pkg_name}.tmp (e.g., .oibepluzpwwjsyvf.rget.tmp)
+/// Format: .{`base32hash}.{pkg_name}.tmp` (e.g., .oibepluzpwwjsyvf.rget.tmp)
 fn generate_deterministic_temp_filename(
     url: &Url,
     actual_filename: &str,
@@ -2489,10 +2471,10 @@ fn generate_deterministic_temp_filename(
             env!("CARGO_PKG_NAME"),
             domain_version
         );
-        eprintln!("[DEBUG]   personalization_key: {:?}", personalization_key);
-        eprintln!("[DEBUG]   target length: {}", temp_name_len);
+        eprintln!("[DEBUG]   personalization_key: {personalization_key:?}");
+        eprintln!("[DEBUG]   target length: {temp_name_len}");
         eprintln!("[DEBUG]   url: {:?}", canonical_url.as_str());
-        eprintln!("[DEBUG]   filename: {:?}", actual_filename);
+        eprintln!("[DEBUG]   filename: {actual_filename:?}");
     }
 
     let mut hasher = Shake256::default();
@@ -2523,13 +2505,14 @@ fn generate_deterministic_temp_filename(
     let filename = format!(".{}.{}.tmp", final_hash, env!("CARGO_PKG_NAME"));
 
     if debug {
-        eprintln!(
-            "[DEBUG]   output hash (hex): {}",
-            output.iter().map(|b| format!("{:02x}", b)).collect::<String>()
-        );
-        eprintln!("[DEBUG]   temp filename: {}", filename);
+        use std::fmt::Write as _;
+        let hex_hash = output.iter().fold(String::with_capacity(output.len() * 2), |mut acc, b| {
+            let _ = write!(acc, "{b:02x}");
+            acc
+        });
+        eprintln!("[DEBUG]   output hash (hex): {hex_hash}");
+        eprintln!("[DEBUG]   temp filename: {filename}");
     }
-
     parent_dir.join(filename)
 }
 
@@ -2602,14 +2585,14 @@ fn determine_filename(args: &Args, url: &Url, content_disposition: Option<&str>)
         && let Some(filename) = parse_content_disposition_header(cd)
     {
         if args.debug {
-            eprintln!("[DEBUG] Filename source: Content-Disposition ('{}')", filename);
+            eprintln!("[DEBUG] Filename source: Content-Disposition ('{filename}')");
         }
         return filename;
     }
 
     let url_name = filename_from_url(url);
     if args.debug {
-        eprintln!("[DEBUG] Filename source: URL path ('{}')", url_name);
+        eprintln!("[DEBUG] Filename source: URL path ('{url_name}')");
     }
     url_name
 }
@@ -2630,10 +2613,10 @@ fn is_block_or_char_device(mode: u32) -> Option<&'static str> {
     }
 }
 
-/// Post-open check: fstat() the open file descriptor for TOCTOU protection.
+/// Post-open check: `fstat()` the open file descriptor for TOCTOU protection.
 /// Verifies the file is not a block/char device after opening.
 /// When appending, also verifies the file owner matches the current process UID
-/// (unless insecure_owner is true).
+/// (unless `insecure_owner` is true).
 #[cfg(unix)]
 fn check_file_after_open(
     file: &File,
@@ -2670,7 +2653,7 @@ fn check_file_after_open(
     Ok(())
 }
 
-/// File metadata obtained through the DirCache (avoids AT_FDCWD stat calls).
+/// File metadata obtained through the `DirCache` (avoids `AT_FDCWD` stat calls).
 struct FileInfo {
     size: u64,
     modified: Option<SystemTime>,
@@ -2694,6 +2677,11 @@ enum LocalTargetAction {
     AlreadyComplete,
     /// Proceed with the download using the returned `start_byte` and `force_truncate`.
     Proceed { start_byte: u64, force_truncate: bool },
+}
+
+#[expect(clippy::cast_precision_loss, reason = "52-bit mantissa is plenty for display percentage")]
+fn percent_f64(part: u64, total: u64) -> f64 {
+    (part as f64 / total as f64) * 100.0
 }
 
 /// Inspect existing `output_info` (checked first) and `temp_info` (checked second)
@@ -2740,16 +2728,15 @@ fn evaluate_local_target(
                                     )?;
                                 }
                                 return Ok(LocalTargetAction::AlreadyComplete);
-                            } else {
-                                if args.verbose {
-                                    eprintln!(
-                                        "Local file size ({}) differs from server ({}), downloading entire file.",
-                                        HumanBytes(out_info.size),
-                                        HumanBytes(total)
-                                    );
-                                }
-                                newer_forces_restart = true;
                             }
+                            if args.verbose {
+                                eprintln!(
+                                    "Local file size ({}) differs from server ({}), downloading entire file.",
+                                    HumanBytes(out_info.size),
+                                    HumanBytes(total)
+                                );
+                            }
+                            newer_forces_restart = true;
                         } else {
                             if !args.quiet {
                                 eprintln!(
@@ -2847,8 +2834,7 @@ fn evaluate_local_target(
 
             if args.debug {
                 eprintln!(
-                    "[DEBUG] Found existing temp file. Size: {}. Resume: true. New Start Byte: {}",
-                    start_byte, start_byte
+                    "[DEBUG] Found existing temp file. Size: {start_byte}. Resume: true. New Start Byte: {start_byte}"
                 );
             }
             if let Some(total) = expected_length {
@@ -2931,14 +2917,13 @@ fn evaluate_local_target(
             if let Some(total) = expected_length {
                 if !args.quiet {
                     eprintln!(
-                        "Resuming from byte {} ({:.1}%)",
-                        start_byte,
-                        (start_byte as f64 / total as f64) * 100.0
+                        "Resuming from byte {start_byte} ({:.1}%)",
+                        percent_f64(start_byte, total)
                     );
                     eprintln!("Remaining to download: {}", HumanBytes(total - start_byte));
                 }
             } else if !args.quiet {
-                eprintln!("Resuming from byte {}", start_byte);
+                eprintln!("Resuming from byte {start_byte}");
             }
             return Ok(LocalTargetAction::Proceed { start_byte, force_truncate: false });
         }
@@ -2948,7 +2933,7 @@ fn evaluate_local_target(
     Ok(LocalTargetAction::Proceed { start_byte: 0, force_truncate: false })
 }
 
-/// Stat a file through the DirCache, using fstatat on the pinned directory fd.
+/// Stat a file through the `DirCache`, using fstatat on the pinned directory fd.
 /// Rejects symlinks, directories, and block/character devices.
 /// Returns None if the file does not exist.
 fn stat_file_via_cache(path: &Path, cache: &mut DirCache) -> Result<Option<FileInfo>> {
@@ -2985,8 +2970,11 @@ fn stat_file_via_cache(path: &Path, cache: &mut DirCache) -> Result<Option<FileI
             }
             let is_regular = ft.is_file();
             let size = if is_regular { metadata.len() } else { 0 };
-            let modified =
-                if is_regular { metadata.modified().ok().map(|t| t.into_std()) } else { None };
+            let modified = if is_regular {
+                metadata.modified().ok().map(cap_std::time::SystemTime::into_std)
+            } else {
+                None
+            };
             Ok(Some(FileInfo { size, modified, is_regular }))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -3090,7 +3078,7 @@ fn normalize_path_lexically(path: &Path) -> PathBuf {
 
 /// Get (or open and cache) the Dir handle for `parent`, keyed by its lexical
 /// normalization so "./a", "a/./" and "a//" all map to one cache entry. Paths
-/// containing `..` are keyed verbatim (see normalize_path_lexically: `..` is not
+/// containing `..` are keyed verbatim (see `normalize_path_lexically`: `..` is not
 /// folded because it must be resolved by the OS, symlinks included).
 fn get_cached_dir<'a>(cache: &'a mut DirCache, parent: &Path) -> std::io::Result<&'a Dir> {
     let key = normalize_path_lexically(parent);
@@ -3108,10 +3096,12 @@ fn open_file_securely(
     force_truncate: bool,
     cache: &mut DirCache,
 ) -> Result<(std::fs::File, bool)> {
+    use std::io::{Error, ErrorKind};
+
     let parent = safe_parent(path);
-    let filename = path.file_name().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "Path has no filename")
-    })?;
+    let filename = path
+        .file_name()
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "Path has no filename"))?;
     let dir = get_cached_dir(cache, parent)?;
 
     let is_append = start_byte > 0 && !force_truncate;
@@ -3119,57 +3109,54 @@ fn open_file_securely(
 
     // Parsed once; applied to every open attempt below.
     #[cfg(unix)]
-    let file_mode: Option<u32> = if let Some(ref mode_str) = args.filemode {
-        u32::from_str_radix(mode_str, 8).ok()
-    } else {
-        None
-    };
+    let file_mode = args.filemode.as_deref().and_then(|s| u32::from_str_radix(s, 8).ok());
 
-    // The pre-open classification (symlink_metadata) is inherently racy: the
-    // object can change between the stat and the open. It is therefore used only
-    // to *pick a strategy*; safety comes from the open flags (O_EXCL, O_NOFOLLOW)
-    // plus the post-open fstat check on the real fd. When an O_EXCL or non-O_CREAT
-    // attempt loses a race and replacing is authorized, we re-classify and retry
-    // a bounded number of times instead of failing spuriously.
     const MAX_ATTEMPTS: u32 = 3;
-    for attempt in 0..MAX_ATTEMPTS {
-        // -- Classify whatever currently sits at the destination --
-        let mut file_existed = false;
-        let mut existing_is_regular = false;
-        match dir.symlink_metadata(filename) {
+
+    // Using an unbounded range `1..` guarantees to the compiler that the loop
+    // only exits via `return`, eliminating the need for `unreachable!()` at the end.
+    for attempt in 1.. {
+        let can_retry = attempt < MAX_ATTEMPTS;
+
+        // -- 1. Classify whatever currently sits at the destination --
+        let (file_existed, existing_is_regular) = match dir.symlink_metadata(filename) {
             Ok(metadata) => {
                 let ft = metadata.file_type();
                 if ft.is_symlink() {
                     return Err(PermanentError::IsASymlink(path.to_path_buf()).into());
                 }
                 if ft.is_dir() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::IsADirectory,
+                    return Err(Error::new(
+                        ErrorKind::IsADirectory,
                         format!("Refusing to write to directory: '{}'", path.display()),
                     )
                     .into());
                 }
-                file_existed = true;
-                existing_is_regular = ft.is_file();
                 #[cfg(unix)]
                 {
                     use cap_std::fs::MetadataExt;
-                    // Early, user-friendly rejection only; the authoritative
-                    // device check is the post-open fstat on the fd below.
-                    if let Some(device_type) = is_block_or_char_device(metadata.mode()) {
-                        return if device_type == "block" {
-                            Err(PermanentError::BlockDeviceNotAllowed(path.to_path_buf()).into())
-                        } else {
-                            Err(PermanentError::CharDeviceNotAllowed(path.to_path_buf()).into())
-                        };
+                    // Early, user-friendly rejection only; authoritative check is post-open.
+                    match is_block_or_char_device(metadata.mode()) {
+                        Some("block") => {
+                            return Err(
+                                PermanentError::BlockDeviceNotAllowed(path.to_path_buf()).into()
+                            );
+                        }
+                        Some(_) => {
+                            return Err(
+                                PermanentError::CharDeviceNotAllowed(path.to_path_buf()).into()
+                            );
+                        }
+                        None => {}
                     }
                 }
+                (true, ft.is_file())
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => (false, false),
             Err(e) => return Err(e.into()),
-        }
+        };
 
-        // -- Pick the open strategy --
+        // -- 2. Pick the open strategy --
         let mut opts = OpenOptions::new();
         opts.write(true);
         #[cfg(unix)]
@@ -3180,110 +3167,91 @@ fn open_file_securely(
                 opts.mode(m);
             }
         }
-        // True when the resulting fd may refer to a pre-existing object and must
-        // therefore be fstat-verified after the open. The O_EXCL branches always
-        // yield a brand-new file we just created, so they are exempt.
-        let mut opened_preexisting = false;
-        // True when this attempt uses O_EXCL and can lose a creation race.
-        let mut used_excl = false;
 
-        if is_append {
-            opts.append(true);
-            opened_preexisting = true;
-        } else if file_existed && existing_is_regular && authorized_replace {
-            // Existing regular file that we are authorized to replace (--overwrite,
-            // -N, --continue resuming from 0 bytes, or a forced restart). Delete and
-            // recreate it fresh via O_EXCL rather than truncating in place, so the
-            // replacement works regardless of the file's ownership (unlinking needs
-            // write access to the parent directory, not ownership of the file) and
-            // never writes through the old, possibly hard-linked, inode.
-            match dir.remove_file(filename) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
-            }
-            opts.create_new(true);
-            used_excl = true;
-        } else if file_existed && !authorized_replace {
-            // Defensive: an existing file or FIFO reached without an authorizing
-            // flag. Fail rather than clobber or write into an unauthorized target.
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "Destination exists",
-            )
-            .into());
-        } else if file_existed {
-            // Existing non-regular object (e.g. FIFO) with authorized_replace:
-            // open WITHOUT O_CREAT and WITHOUT O_TRUNC. Avoiding O_TRUNC ensures
-            // that if a regular file was raced into place between symlink_metadata
-            // and open_with, the kernel will not truncate it during openat(); the
-            // post-open fstat check below then detects the type mismatch before
-            // any bytes are written.
-            opened_preexisting = true;
-        } else {
-            // Nothing exists yet: create a brand-new file (O_EXCL keeps it
-            // TOCTOU-safe against a file appearing between the stat and the open).
-            opts.create_new(true);
-            used_excl = true;
-        }
-
-        // -- Open and verify --
-        match dir.open_with(filename, &opts) {
-            Ok(cap_file) => {
-                let std_file = cap_file.into_std();
-                // Post-open TOCTOU check whenever the fd may refer to a
-                // pre-existing object: verify on the real fd that it is not a
-                // device and, when appending (unless --insecure-owner), that it
-                // is owned by us. Also verify that a non-regular open did not
-                // race against a regular file swap.
-                if opened_preexisting {
-                    check_file_after_open(&std_file, path, is_append, args.insecure_owner)?;
-                    let std_meta = std_file.metadata()?;
-                    if std_meta.file_type().is_dir() {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::IsADirectory,
-                            format!("Refusing to write to directory: '{}'", path.display()),
-                        )
-                        .into());
-                    }
-                    if !is_append && !existing_is_regular && std_meta.file_type().is_file() {
-                        // A regular file was swapped in where a FIFO stood during
-                        // symlink_metadata; because we did not pass O_TRUNC it is
-                        // untouched. Re-classify on the next iteration (or fail).
-                        if attempt + 1 < MAX_ATTEMPTS {
-                            continue;
-                        }
-                        return Err(
-                            PermanentError::FileAppearedDuringDownload(path.to_path_buf()).into()
-                        );
-                    }
+        // State machine returning: (opened_preexisting, used_excl)
+        let (opened_preexisting, used_excl) =
+            match (is_append, file_existed, existing_is_regular, authorized_replace) {
+                // Appending to an existing file.
+                (true, _, _, _) => {
+                    opts.append(true);
+                    (true, false)
                 }
-                return Ok((std_file, file_existed));
+                // Unauthorized to clobber existing target.
+                (false, true, _, false) => {
+                    return Err(Error::new(ErrorKind::AlreadyExists, "Destination exists").into());
+                }
+                // Authorized to replace an existing regular file: unlink and recreate via O_EXCL
+                // to avoid writing through old/hard-linked inodes or failing on ownership.
+                (false, true, true, true) => {
+                    if let Err(e) = dir.remove_file(filename)
+                        && e.kind() != ErrorKind::NotFound {
+                            return Err(e.into());
+                        }
+                    opts.create_new(true);
+                    (false, true)
+                }
+                // Authorized to write to existing non-regular file (e.g. FIFO): open without
+                // O_CREAT or O_TRUNC so a raced regular file isn't truncated before fstat check.
+                (false, true, false, true) => (true, false),
+
+                // Nothing exists yet: create brand-new file safely with O_EXCL.
+                (false, false, _, _) => {
+                    opts.create_new(true);
+                    (false, true)
+                }
+            };
+
+        // -- 3. Open and handle creation/removal races --
+        let cap_file = match dir.open_with(filename, &opts) {
+            Ok(file) => file,
+            Err(e) => {
+                let is_recoverable_race = matches!(
+                    (used_excl, is_append, e.kind()),
+                    (true, _, ErrorKind::AlreadyExists) | (false, false, ErrorKind::NotFound)
+                );
+
+                if is_recoverable_race && authorized_replace && can_retry {
+                    continue; // Lost a race while authorized to replace: re-classify and retry.
+                }
+                return Err(e.into()); // Fail closed on unauthorized races, ELOOP, etc.
             }
-            Err(e)
-                if ((used_excl && e.kind() == std::io::ErrorKind::AlreadyExists)
-                    || (!used_excl && !is_append && e.kind() == std::io::ErrorKind::NotFound))
-                    && authorized_replace
-                    && attempt + 1 < MAX_ATTEMPTS =>
-            {
-                // Lost a creation/removal race while authorized to replace:
-                // re-classify and retry.
+        };
+
+        let std_file = cap_file.into_std();
+
+        // -- 4. Post-open TOCTOU verification on the real file descriptor --
+        if opened_preexisting {
+            check_file_after_open(&std_file, path, is_append, args.insecure_owner)?;
+
+            let ft = std_file.metadata()?.file_type();
+            if ft.is_dir() {
+                return Err(Error::new(
+                    ErrorKind::IsADirectory,
+                    format!("Refusing to write to directory: '{}'", path.display()),
+                )
+                .into());
+            }
+
+            // Verify that a non-regular open (e.g., FIFO) did not race against a regular file swap.
+            if !is_append && !existing_is_regular && ft.is_file() {
+                if !can_retry {
+                    return Err(
+                        PermanentError::FileAppearedDuringDownload(path.to_path_buf()).into()
+                    );
+                }
                 continue;
             }
-            // Unauthorized creation race (plain AlreadyExists, mapped upstream to
-            // FileAppearedDuringDownload), ELOOP from O_NOFOLLOW, and everything
-            // else: fail closed.
-            Err(e) => return Err(e.into()),
         }
+
+        return Ok((std_file, file_existed));
     }
-    // Every iteration either returns or retries, and the last iteration cannot
-    // retry, so the loop cannot fall through.
-    unreachable!("open_file_securely: retry loop exited without returning")
+
+    unreachable!() // Note: Only needed if Rust version < 1.78, otherwise `for attempt in 1..` diverges automatically, or use `loop` with a counter.
 }
 
-/// Because cap-std does not expose Linux's renameat2 (with RENAME_NOREPLACE), we use a hybrid
+/// Because cap-std does not expose Linux's renameat2 (with `RENAME_NOREPLACE`), we use a hybrid
 /// approach here. We extract the raw file descriptors from our cap-std handles to pass to rustix
-/// on Linux. For macOS and Windows, we use cap-std's sandboxed .hard_link() and .rename().
+/// on Linux. For macOS and Windows, we use cap-std's sandboxed .`hard_link()` and .`rename()`.
 fn perform_atomic_move(
     temp_path: &Path,
     target_path: &Path,
@@ -3335,7 +3303,7 @@ fn perform_atomic_move(
             );
 
             match noreplace_result {
-                Ok(_) => return Ok(()),
+                Ok(()) => return Ok(()),
 
                 // Target exists: if overwrite is allowed, retry with plain rename
                 Err(rustix::io::Errno::EXIST) if overwrite_or_resume => {
@@ -3346,7 +3314,7 @@ fn perform_atomic_move(
                         file_to,
                         RenameFlags::empty(),
                     ) {
-                        Ok(_) => return Ok(()),
+                        Ok(()) => return Ok(()),
                         Err(e) => return Err(std::io::Error::from(e)),
                     }
                 }
@@ -3356,11 +3324,9 @@ fn perform_atomic_move(
                     return Err(std::io::Error::from(rustix::io::Errno::EXIST));
                 }
 
-                // Cross-device link: fall through to cap-std which handles EXDEV
-                Err(rustix::io::Errno::XDEV) => {}
-
-                // Syscall genuinely unsupported: fall through to cap-std fallback
-                Err(
+                // Fall through to cap-std
+                Err(rustix::io::Errno::XDEV)
+                | Err(
                     rustix::io::Errno::NOSYS | rustix::io::Errno::NOTSUP | rustix::io::Errno::INVAL,
                 ) => {}
 
@@ -3467,7 +3433,7 @@ fn perform_atomic_move(
 
     // ─── RETRY / ERROR HANDLING WRAPPER ────────────────────────────────────
     match try_move(temp_path, target_path, cache) {
-        Ok(_) => Ok(target_path.to_path_buf()),
+        Ok(()) => Ok(target_path.to_path_buf()),
 
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             if args.overwrite || args.resume {
@@ -3491,7 +3457,7 @@ fn perform_atomic_move(
             }
 
             match try_move(temp_path, &truncated, cache) {
-                Ok(_) => Ok(truncated),
+                Ok(()) => Ok(truncated),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     Err(PermanentError::TruncatedFilenameExists(truncated).into())
                 }
@@ -3685,26 +3651,26 @@ fn is_permanent_error(err: &anyhow::Error) -> bool {
     false
 }
 
-/// Parse an HTTP-date string into a SystemTime.
+/// Parse an HTTP-date string into a `SystemTime`.
 /// Supports the three formats listed in RFC 9110 §5.6.7:
 /// - IMF-fixdate (RFC 1123): "Sun, 06 Nov 1994 08:49:37 GMT"
 /// - RFC 850: "Sunday, 06-Nov-94 08:49:37 GMT"
-/// - asctime(): "Sun Nov  6 08:49:37 1994"
+/// - `asctime()`: "Sun Nov  6 08:49:37 1994"
 fn parse_http_date(s: &str) -> Option<SystemTime> {
     httpdate::parse_http_date(s.trim()).ok()
 }
 
-/// Format a SystemTime as an HTTP-date string (RFC 1123).
-fn format_http_date(time: SystemTime) -> Option<String> {
-    Some(httpdate::fmt_http_date(time))
+/// Format a `SystemTime` as an HTTP-date string (RFC 1123).
+fn format_http_date(time: SystemTime) -> String {
+    httpdate::fmt_http_date(time)
 }
 
 /// Apply server timestamp (Last-Modified) to a local file.
 /// Silently does nothing if the header is missing or unparseable.
 ///
-/// On Unix: uses utimensat on the pinned DirCache fd with AT_SYMLINK_NOFOLLOW.
+/// On Unix: uses utimensat on the pinned `DirCache` fd with `AT_SYMLINK_NOFOLLOW`.
 ///   No file reopen — operates directly on the directory fd + filename.
-/// On Windows: reopens the file via std and uses FileTimes.
+/// On Windows: reopens the file via std and uses `FileTimes`.
 fn apply_server_timestamp(
     path: &Path,
     last_modified: Option<&str>,
@@ -3720,7 +3686,7 @@ fn apply_server_timestamp(
 
     let Some(server_time) = parse_http_date(lm_str) else {
         if debug {
-            eprintln!("[DEBUG] Could not parse Last-Modified header: {:?}", lm_str);
+            eprintln!("[DEBUG] Could not parse Last-Modified header: {lm_str:?}");
         }
         return;
     };
@@ -3728,18 +3694,18 @@ fn apply_server_timestamp(
     match set_file_mtime(path, server_time, cache) {
         Ok(()) => {
             if debug {
-                eprintln!("[DEBUG] Set file modification time to: {}", lm_str);
+                eprintln!("[DEBUG] Set file modification time to: {lm_str}");
             }
         }
         Err(e) => {
             if debug {
-                eprintln!("[DEBUG] Failed to set file timestamp: {}", e);
+                eprintln!("[DEBUG] Failed to set file timestamp: {e}");
             }
         }
     }
 }
 
-/// Set file mtime via utimensat using the DirCache dir handle + AT_SYMLINK_NOFOLLOW.
+/// Set file mtime via utimensat using the `DirCache` dir handle + `AT_SYMLINK_NOFOLLOW`.
 /// No file descriptor is opened for the file itself — purely metadata operation.
 #[cfg(unix)]
 fn set_file_mtime(path: &Path, server_time: SystemTime, cache: &mut DirCache) -> Result<()> {
@@ -3752,7 +3718,7 @@ fn set_file_mtime(path: &Path, server_time: SystemTime, cache: &mut DirCache) ->
         last_access: Timespec { tv_sec: 0, tv_nsec: rustix::fs::UTIME_OMIT as _ },
         last_modification: Timespec {
             tv_sec: dur.as_secs() as _,
-            tv_nsec: dur.subsec_nanos() as _,
+            tv_nsec: dur.subsec_nanos().into(),
         },
     };
 
@@ -3799,9 +3765,9 @@ fn set_mtime_on_fd(file: &std::fs::File, mtime: SystemTime) -> Result<()> {
 }
 
 /// Generate a numbered filename to avoid collisions.
-/// With keep_extension=false: file.ext -> file.ext.1
-/// With keep_extension=true: file.ext -> file.1.ext
-/// The result never exceeds MAX_FILENAME_BYTES: when appending the number would
+/// With `keep_extension=false`: file.ext -> file.ext.1
+/// With `keep_extension=true`: file.ext -> file.1.ext
+/// The result never exceeds `MAX_FILENAME_BYTES`: when appending the number would
 /// push it over (the name was already truncated to the limit), the base is
 /// shortened to make room. The number itself is always preserved, otherwise the
 /// numbered variants would collide with each other.
@@ -3816,12 +3782,12 @@ fn generate_numbered_filename(path: &Path, number: u32, keep_extension: bool) ->
         {
             let base = &filename[..dot_pos];
             let ext = &filename[dot_pos..]; // includes the dot
-            format!("{}.{}{}", base, number, ext)
+            format!("{base}.{number}{ext}")
         } else {
-            format!("{}.{}", filename, number)
+            format!("{filename}.{number}")
         }
     } else {
-        format!("{}.{}", filename, number)
+        format!("{filename}.{number}")
     };
 
     let new_name = if new_name.len() > MAX_FILENAME_BYTES {
@@ -3833,7 +3799,7 @@ fn generate_numbered_filename(path: &Path, number: u32, keep_extension: bool) ->
     parent.join(new_name)
 }
 
-/// Shorten `filename` so that it still fits within MAX_FILENAME_BYTES once the
+/// Shorten `filename` so that it still fits within `MAX_FILENAME_BYTES` once the
 /// --multiple-copies number is appended. Only the base is shortened; the number
 /// and (when it stays at the end) the extension are preserved.
 fn truncate_numbered_filename(filename: &str, number: u32, keep_extension: bool) -> String {
@@ -3842,16 +3808,16 @@ fn truncate_numbered_filename(filename: &str, number: u32, keep_extension: bool)
     // Everything that must survive: the ".N" and the extension, in whichever
     // order this mode places them.
     let suffix = if keep_extension {
-        format!(".{}{}", number, ext) // file.1.ext
+        format!(".{number}{ext}") // file.1.ext
     } else {
-        format!("{}.{}", ext, number) // file.ext.1
+        format!("{ext}.{number}") // file.ext.1
     };
 
     if suffix.len() >= MAX_FILENAME_BYTES {
         // No room left for any of the base: drop the extension and truncate the
         // whole name, keeping only the number (which is at most 10 digits, so
         // this always fits).
-        let num = format!(".{}", number);
+        let num = format!(".{number}");
         let max_base_bytes = MAX_FILENAME_BYTES.saturating_sub(num.len());
         return format!("{}{}", truncate_str_to_byte_limit(filename, max_base_bytes), num);
     }
@@ -3919,7 +3885,7 @@ fn resolve_unique_output_path(
 }
 
 /// Check whether any filesystem entry (regular file, directory, symlink, FIFO,
-/// or device node) exists at `path` through the pinned DirCache handle.
+/// or device node) exists at `path` through the pinned `DirCache` handle.
 /// Unlike `stat_file_via_cache`, this does not error on directories, symlinks,
 /// or devices so `--multiple-copies` can number past them.
 fn path_exists_via_cache(path: &Path, cache: &mut DirCache) -> std::io::Result<bool> {
@@ -3937,7 +3903,7 @@ fn path_exists_via_cache(path: &Path, cache: &mut DirCache) -> std::io::Result<b
     }
 }
 
-/// Evaluate a simplified jq-like path expression against a serde_json::Value.
+/// Evaluate a simplified jq-like path expression against a `serde_json::Value`.
 /// Supports: .field, .field[], .field[].subfield, .field[N], chained paths.
 /// Returns a list of matching leaf values as strings.
 fn json_path_extract(value: &serde_json::Value, path: &str) -> Result<Vec<String>> {
@@ -3965,7 +3931,7 @@ enum JqSegment {
 
 /// Parse a jq-like path into segments.
 /// Examples:
-///   ".assets[].browser_download_url" -> [Field("assets"), ArrayIter, Field("browser_download_url")]
+///   ".assets[].`browser_download_url`" -> [Field("assets"), `ArrayIter`, `Field("browser_download_url`")]
 ///   ".digest" -> [Field("digest")]
 ///   ".data[0].url" -> [Field("data"), ArrayIndex(0), Field("url")]
 fn parse_jq_path(path: &str) -> Result<Vec<JqSegment>> {
@@ -4004,8 +3970,7 @@ fn parse_jq_path(path: &str) -> Result<Vec<JqSegment>> {
                 }
                 if !closed {
                     return Err(PermanentError::JsonPathError(format!(
-                        "Unclosed bracket in path expression: [{}]",
-                        bracket_content
+                        "Unclosed bracket in path expression: [{bracket_content}]"
                     ))
                     .into());
                 }
@@ -4015,8 +3980,7 @@ fn parse_jq_path(path: &str) -> Result<Vec<JqSegment>> {
                     segments.push(JqSegment::ArrayIndex(idx));
                 } else {
                     return Err(PermanentError::JsonPathError(format!(
-                        "Invalid array index: [{}]",
-                        bracket_content
+                        "Invalid array index: [{bracket_content}]"
                     ))
                     .into());
                 }
@@ -4106,7 +4070,7 @@ fn collect_values(value: &serde_json::Value, segments: &[JqSegment], results: &m
     }
 }
 
-/// Parse a digest field like "sha256:3f79a2a5..." into (algorithm, hex_hash).
+/// Parse a digest field like "sha256:3f79a2a5..." into (algorithm, `hex_hash`).
 fn parse_digest_field(digest: &str) -> Option<(&str, &str)> {
     let digest = digest.trim();
     if let Some(colon_pos) = digest.find(':') {
@@ -4124,7 +4088,7 @@ fn parse_digest_field(digest: &str) -> Option<(&str, &str)> {
 }
 
 /// Compute SHA256 hex digest of a file.
-/// Uses DirCache for TOCTOU-safe reopening on Linux.
+/// Uses `DirCache` for TOCTOU-safe reopening on Linux.
 fn sha256_file(path: &Path, cache: &mut DirCache) -> Result<String> {
     let mut file =
         open_for_read(path, cache).context("Failed to open file for hash verification")?;
@@ -4138,10 +4102,13 @@ fn sha256_file(path: &Path, cache: &mut DirCache) -> Result<String> {
         sha2::Digest::update(&mut hasher, &buf[..n]);
     }
     let hash = hasher.finalize();
-    Ok(hash.iter().map(|b| format!("{:02x}", b)).collect::<String>())
+    Ok(hash.iter().fold(String::with_capacity(64), |mut out, b| {
+        let _ = write!(out, "{b:02x}");
+        out
+    }))
 }
 
-/// Open a file read-only using the DirCache for TOCTOU safety.
+/// Open a file read-only using the `DirCache` for TOCTOU safety.
 /// Unified across all operating systems using cap-std.
 fn open_for_read(path: &Path, cache: &mut DirCache) -> std::io::Result<std::fs::File> {
     let parent = safe_parent(path);
@@ -4169,7 +4136,7 @@ fn open_for_read(path: &Path, cache: &mut DirCache) -> std::io::Result<std::fs::
 }
 
 /// Verify SHA256 of a file against an expected hex hash.
-/// Returns Ok(()) on match, PermanentError::JsonHashMismatch on mismatch.
+/// Returns Ok(()) on match, `PermanentError::JsonHashMismatch` on mismatch.
 fn verify_sha256_file(
     path: &Path,
     expected_hex: &str,
@@ -4281,7 +4248,7 @@ async fn fetch_json_body(
     // retries, so a transient classification would only burn --retries.
     // (map_err the value, then `?` — that coerces PermanentError into anyhow::Error.)
     let body = String::from_utf8(body_bytes).map_err(|e| {
-        PermanentError::JsonParseError(format!("Response body is not valid UTF-8 ({})", e))
+        PermanentError::JsonParseError(format!("Response body is not valid UTF-8 ({e})"))
     })?;
     Ok(body)
 }
@@ -4304,7 +4271,7 @@ async fn process_json_downloads(
 
     // 1. Fetch JSON body
     if args.verbose {
-        eprintln!("Fetching JSON from: {}", json_url);
+        eprintln!("Fetching JSON from: {json_url}");
     }
     let body = fetch_json_body(client, json_url, args, send_auth, rl_tracker).await?;
 
@@ -4423,8 +4390,7 @@ async fn process_json_downloads(
     if let Some(ref filter_pattern) = args.json_filter {
         let re = Regex::new(filter_pattern).map_err(|e| {
             PermanentError::InvalidArguments(format!(
-                "Invalid --json-filter regex '{}': {}",
-                filter_pattern, e
+                "Invalid --json-filter regex '{filter_pattern}': {e}"
             ))
         })?;
 
@@ -4498,7 +4464,7 @@ async fn process_json_downloads(
 
         if !args.quiet {
             eprintln!();
-            eprintln!("Starting download: {}", url);
+            eprintln!("Starting download: {url}");
         }
 
         // Build per-entry args: set --output if json-name-field was provided
@@ -4600,7 +4566,7 @@ async fn process_json_downloads(
                         entry_send_auth,
                     )) => {
                         if current_args.verbose && final_url != url {
-                            eprintln!("Final URL: {}", final_url);
+                            eprintln!("Final URL: {final_url}");
                         }
 
                         let effective_content_length = content_length.or(entry.size);
@@ -4646,11 +4612,11 @@ async fn process_json_downloads(
                 }
                 Err(e) => {
                     if is_permanent_error(&e) {
-                        eprintln!("Failed to download {}: {:#}", url, e);
+                        eprintln!("Failed to download {url}: {e:#}");
                         break true;
                     }
                     if attempt >= max_retries {
-                        eprintln!("Failed to download {}: {:#}", url, e);
+                        eprintln!("Failed to download {url}: {e:#}");
                         break true;
                     }
                     eprintln!(
@@ -4798,7 +4764,7 @@ async fn download_file(
 
     // Stat output file through DirCache for size/mtime checks below
     let mut output_info =
-        if !is_stdout { stat_file_via_cache(&output_path, dir_cache)? } else { None };
+        if is_stdout { None } else { stat_file_via_cache(&output_path, dir_cache)? };
 
     // Hash verification forces the temp-then-rename path: direct mode unlinks
     // and recreates the destination before writing, so a corrupt or truncated
@@ -4868,7 +4834,7 @@ async fn download_file(
 
         let mut request = client.get(url.clone());
         if range_sent {
-            request = request.header(RANGE, format!("bytes={}-", start_byte));
+            request = request.header(RANGE, format!("bytes={start_byte}-"));
         }
 
         // -N mode without --no-if-modified-since: add If-Modified-Since header
@@ -4886,10 +4852,10 @@ async fn download_file(
             && size_matches
             && let Some(ref out_info) = output_info
             && let Some(local_mtime) = out_info.modified
-            && let Some(http_date) = format_http_date(local_mtime)
+            && let http_date = format_http_date(local_mtime)
         {
             if args.verbose {
-                eprintln!("Sending If-Modified-Since: {}", http_date);
+                eprintln!("Sending If-Modified-Since: {http_date}");
             }
             request = request.header(IF_MODIFIED_SINCE, http_date);
             ims_sent = true;
@@ -4908,7 +4874,7 @@ async fn download_file(
         // Handle 304 Not Modified (from If-Modified-Since in -N mode)
         if status == StatusCode::NOT_MODIFIED {
             rl_tracker.record_response(url, current_response.headers(), args);
-            let local_size = output_info.as_ref().map(|i| i.size).unwrap_or(0);
+            let local_size = output_info.as_ref().map_or(0, |i| i.size);
             if let Some(exp_len) = expected_length
                 && local_size != exp_len
             {
@@ -4949,8 +4915,7 @@ async fn download_file(
                         rl_tracker.record_response(url, full_response.headers(), args);
                         if !args.quiet {
                             eprintln!(
-                                "Warning: HTTP {} returned. Saving error body to file due to --content-on-error.",
-                                full_status
+                                "Warning: HTTP {full_status} returned. Saving error body to file due to --content-on-error."
                             );
                         }
                     } else {
@@ -4965,7 +4930,7 @@ async fn download_file(
                     .headers()
                     .get(LAST_MODIFIED)
                     .and_then(|v| v.to_str().ok())
-                    .map(|s| s.to_string());
+                    .map(std::string::ToString::to_string);
                 content_length = full_response
                     .headers()
                     .get(CONTENT_LENGTH)
@@ -4983,18 +4948,17 @@ async fn download_file(
                 }
                 response = full_response;
                 break;
-            } else {
-                if !args.quiet {
-                    eprintln!(
-                        "Server file is not newer than local file '{}', skipping.",
-                        output_path.display()
-                    );
-                }
-                if let Some(expected) = expected_sha256 {
-                    verify_sha256_file(&output_path, expected, args.quiet, dir_cache)?;
-                }
-                return Ok(());
             }
+            if !args.quiet {
+                eprintln!(
+                    "Server file is not newer than local file '{}', skipping.",
+                    output_path.display()
+                );
+            }
+            if let Some(expected) = expected_sha256 {
+                verify_sha256_file(&output_path, expected, args.quiet, dir_cache)?;
+            }
+            return Ok(());
         }
 
         // Check for redirect on GET (HEAD and GET may behave differently)
@@ -5057,8 +5021,7 @@ async fn download_file(
                 rl_tracker.record_response(url, current_response.headers(), args);
                 if !args.quiet {
                     eprintln!(
-                        "Warning: HTTP {} returned. Saving error body to file due to --content-on-error.",
-                        status
+                        "Warning: HTTP {status} returned. Saving error body to file due to --content-on-error."
                     );
                 }
             } else {
@@ -5080,17 +5043,11 @@ async fn download_file(
             .headers()
             .get(LAST_MODIFIED)
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+            .map(std::string::ToString::to_string);
 
         // Validate Content-Range when resuming
         if args.resume && start_byte > 0 {
-            if status != StatusCode::PARTIAL_CONTENT {
-                if !args.quiet {
-                    eprintln!("Server doesn't support resume, restarting from scratch.");
-                }
-                start_byte = 0;
-                force_truncate = true;
-            } else {
+            if status == StatusCode::PARTIAL_CONTENT {
                 // Validate Content-Range header matches our request
                 if let Some(content_range) = current_response.headers().get(CONTENT_RANGE)
                     && let Ok(range_str) = content_range.to_str()
@@ -5103,6 +5060,12 @@ async fn download_file(
                     }
                     .into());
                 }
+            } else {
+                if !args.quiet {
+                    eprintln!("Server doesn't support resume, restarting from scratch.");
+                }
+                start_byte = 0;
+                force_truncate = true;
             }
         }
 
@@ -5141,14 +5104,13 @@ async fn download_file(
             {
                 if args.debug {
                     eprintln!(
-                        "[DEBUG] Content-Disposition changed on GET: '{}' -> '{}'",
-                        head_filename, new_name
+                        "[DEBUG] Content-Disposition changed on GET: '{head_filename}' -> '{new_name}'"
                     );
                 }
 
                 let old_filename = head_filename.clone();
-                head_filename = new_name.clone();
-                final_filename = new_name.clone();
+                head_filename.clone_from(new_name);
+                final_filename.clone_from(new_name);
                 output_path = if let Some(ref dir_str) = args.output_dir {
                     Path::new(dir_str).join(&final_filename)
                 } else {
@@ -5312,8 +5274,7 @@ async fn download_file(
 
                     if !args.quiet && new_start_byte != start_byte {
                         eprintln!(
-                            "Filename changed ('{}' -> '{}'), adjusting resume offset to byte {}.",
-                            old_filename, new_name, new_start_byte
+                            "Filename changed ('{old_filename}' -> '{new_name}'), adjusting resume offset to byte {new_start_byte}."
                         );
                     }
                     start_byte = new_start_byte;
@@ -5361,7 +5322,7 @@ async fn download_file(
                 response.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok());
             if !is_text_content_type(get_content_type) {
                 return Err(PermanentError::BinaryToTerminal(
-                    get_content_type.map(|s| s.to_string()),
+                    get_content_type.map(std::string::ToString::to_string),
                 )
                 .into());
             }
@@ -5564,8 +5525,9 @@ async fn download_to_temp(
     // Store the pinned parent directory handle and temp path for potential
     // cleanup on signal (the handler unlinks through the handle, not the ambient path)
     {
-        let pinned_dir =
-            get_cached_dir(dir_cache, safe_parent(&temp_path)).and_then(|d| d.try_clone()).ok();
+        let pinned_dir = get_cached_dir(dir_cache, safe_parent(&temp_path))
+            .and_then(cap_std::fs::Dir::try_clone)
+            .ok();
         let mut guard = CURRENT_TEMP_PATH.lock().unwrap();
         *guard = pinned_dir.map(|d| (d, temp_path.clone()));
     }
@@ -5605,10 +5567,10 @@ async fn download_to_temp(
     .await?;
 
     match async_file.sync_all().await {
-        Ok(_) => {}
+        Ok(()) => {}
         Err(e) if is_sync_ignorable(&e) => {}
         Err(e) => return Err(e.into()),
-    };
+    }
 
     // Apply server timestamp on the temp file via futimens BEFORE close and rename.
     // The mtime is set on the temp file's fd — rename preserves inode metadata,
@@ -5617,7 +5579,7 @@ async fn download_to_temp(
         let std_file = async_file.into_std().await;
         if let Err(e) = set_mtime_on_fd(&std_file, mtime) {
             if args.debug {
-                eprintln!("[DEBUG] futimens on temp file failed: {}", e);
+                eprintln!("[DEBUG] futimens on temp file failed: {e}");
             }
         } else if args.debug {
             eprintln!("[DEBUG] Set temp file mtime via futimens before rename");
@@ -5735,10 +5697,10 @@ async fn download_direct(
     )
     .await?;
     match file.sync_all().await {
-        Ok(_) => {}
+        Ok(()) => {}
         Err(e) if is_sync_ignorable(&e) => {}
         Err(e) => return Err(e.into()),
-    };
+    }
 
     // Apply server timestamp via futimens on the still-open fd, after fsync.
     // This avoids reopening the file and is TOCTOU-safe.
@@ -5746,7 +5708,7 @@ async fn download_direct(
         let std_file = file.into_std().await;
         if let Err(e) = set_mtime_on_fd(&std_file, mtime) {
             if args.debug {
-                eprintln!("[DEBUG] futimens on output file failed: {}", e);
+                eprintln!("[DEBUG] futimens on output file failed: {e}");
             }
         } else if args.debug {
             eprintln!("[DEBUG] Set output file mtime via futimens");
@@ -5832,7 +5794,7 @@ async fn write_response_to_file<W: AsyncWrite + Unpin>(
     loop {
         let chunk_result = tokio::select! {
             res = stream.next() => res,
-            _ = &mut sleep_timer => {
+            () = &mut sleep_timer => {
                 bail!("Timed out waiting for data ({}s)", args.timeout);
             }
         };
@@ -5897,9 +5859,7 @@ async fn write_response_to_file<W: AsyncWrite + Unpin>(
             pb.finish_with_message("Incomplete");
         }
         bail!(
-            "Stream ended after {} of {} expected bytes; download truncated",
-            bytes_written,
-            expected
+            "Stream ended after {bytes_written} of {expected} expected bytes; download truncated"
         );
     }
 
@@ -5933,11 +5893,7 @@ pub fn apply_security_sandbox() -> Result<(), Box<dyn std::error::Error>> {
     // Block specific socket families.
     // NOTE: glibc's getaddrinfo() opens an AF_NETLINK socket (__check_pf) to
     // enumerate local addresses and may try AF_UNIX to reach nscd or
-    // systemd-resolved. Blocking these relies on glibc's fallback paths: on
-    // socket() failure it assumes both address families are configured and
-    // falls back to plain DNS via resolv.conf. musl is unaffected. If name
-    // resolution ever breaks under this filter, these families are the first
-    // suspects.
+    // systemd-resolved.
     let blocked_families =
         [libc::AF_UNIX, libc::AF_NETLINK, libc::AF_PACKET, libc::AF_BLUETOOTH, libc::AF_VSOCK];
 
@@ -5992,12 +5948,12 @@ async fn main() -> ExitCode {
             match result {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
-                    eprintln!("Error: {:#}", e);
+                    eprintln!("Error: {e:#}");
                     ExitCode::FAILURE
                 }
             }
         },
-        _ = shutdown_signal() => {
+        () = shutdown_signal() => {
             let keep_temp = KEEP_TEMP_ON_CANCEL.load(Ordering::SeqCst);
             let temp_path = CURRENT_TEMP_PATH.lock().unwrap().take();
 
@@ -6054,8 +6010,8 @@ async fn shutdown_signal() {
     let terminate = std::future::pending::<()>(); // Wait forever on Windows/other
 
     tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
+        () = ctrl_c => {},
+        () = terminate => {},
     }
 }
 
