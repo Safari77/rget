@@ -279,7 +279,7 @@ mod hsts_tests {
         match err.downcast_ref::<PermanentError>() {
             Some(PermanentError::InsecureUrl(u)) => {
                 assert_eq!(u, "http://example.com/archive.zip");
-            }
+            },
             _ => panic!("Expected PermanentError::InsecureUrl"),
         }
     }

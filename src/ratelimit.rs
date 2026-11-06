@@ -1,6 +1,6 @@
-use std::fmt::Write;
 use std::{
     collections::HashMap,
+    fmt::Write,
     time::{Duration, Instant, SystemTime},
 };
 
@@ -124,7 +124,7 @@ pub fn parse_sf_string_item_list(input: &str) -> Option<Vec<SfItem>> {
                 pos += 1;
                 closed = true;
                 break;
-            } else if (0x20..=0x7e).contains(&b) {
+            } else if (0x20..=0x7E).contains(&b) {
                 item_str.push(b as char);
                 pos += 1;
             } else {
@@ -197,7 +197,7 @@ pub fn parse_sf_string_item_list(input: &str) -> Option<Vec<SfItem>> {
                                 pos += 1;
                                 str_closed = true;
                                 break;
-                            } else if (0x20..=0x7e).contains(&b) {
+                            } else if (0x20..=0x7E).contains(&b) {
                                 s.push(b as char);
                                 pos += 1;
                             } else {
@@ -208,7 +208,7 @@ pub fn parse_sf_string_item_list(input: &str) -> Option<Vec<SfItem>> {
                             return None;
                         }
                         SfParamValue::String(s)
-                    }
+                    },
                     b':' => {
                         pos += 1;
                         let start = pos;
@@ -225,7 +225,7 @@ pub fn parse_sf_string_item_list(input: &str) -> Option<Vec<SfItem>> {
                         let b64 = std::str::from_utf8(&bytes[start..pos]).ok()?.to_string();
                         pos += 1; // consume closing ':'
                         SfParamValue::ByteSeq(b64)
-                    }
+                    },
                     b'?' => {
                         pos += 1;
                         if pos >= bytes.len() || (bytes[pos] != b'0' && bytes[pos] != b'1') {
@@ -233,7 +233,7 @@ pub fn parse_sf_string_item_list(input: &str) -> Option<Vec<SfItem>> {
                         }
                         pos += 1;
                         SfParamValue::Other
-                    }
+                    },
                     b'-' | b'0'..=b'9' => {
                         let num_start = pos;
                         if bytes[pos] == b'-' {
@@ -261,7 +261,7 @@ pub fn parse_sf_string_item_list(input: &str) -> Option<Vec<SfItem>> {
                             let n = num_str.parse::<i64>().ok()?;
                             SfParamValue::Integer(n)
                         }
-                    }
+                    },
                     c if c.is_ascii_alphabetic() || c == b'*' => {
                         // SF Token
                         pos += 1;
@@ -294,7 +294,7 @@ pub fn parse_sf_string_item_list(input: &str) -> Option<Vec<SfItem>> {
                             }
                         }
                         SfParamValue::Other
-                    }
+                    },
                     _ => return None,
                 }
             } else {
@@ -380,7 +380,7 @@ pub fn parse_ratelimit_policy_headers(headers: &HeaderMap, debug: bool) -> Vec<Q
                         _ => {
                             valid = false;
                             break;
-                        }
+                        },
                     },
                     "qu" => {
                         // §3.1.2: "qu" MUST be a String
@@ -390,14 +390,14 @@ pub fn parse_ratelimit_policy_headers(headers: &HeaderMap, debug: bool) -> Vec<Q
                             valid = false;
                             break;
                         }
-                    }
+                    },
                     "w" => match v {
                         // §3.1.3: "w" MUST be a non-negative, non-zero Integer
                         SfParamValue::Integer(n) if n > 0 => w = Some(n as u64),
                         _ => {
                             valid = false;
                             break;
-                        }
+                        },
                     },
                     "pk" => {
                         // §3.1.4: "pk" MUST be a Byte Sequence
@@ -407,8 +407,8 @@ pub fn parse_ratelimit_policy_headers(headers: &HeaderMap, debug: bool) -> Vec<Q
                             valid = false;
                             break;
                         }
-                    }
-                    _ => {} // Other/vendor parameters are allowed and ignored (§3.1)
+                    },
+                    _ => {}, // Other/vendor parameters are allowed and ignored (§3.1)
                 }
             }
 
@@ -469,7 +469,7 @@ pub fn parse_ratelimit_headers(headers: &HeaderMap, debug: bool) -> Vec<ServiceL
                         _ => {
                             header_valid = false;
                             break;
-                        }
+                        },
                     },
                     "t" => match v {
                         // §4.1.2: "t" is an OPTIONAL non-negative Integer
@@ -477,7 +477,7 @@ pub fn parse_ratelimit_headers(headers: &HeaderMap, debug: bool) -> Vec<ServiceL
                         _ => {
                             header_valid = false;
                             break;
-                        }
+                        },
                     },
                     "pk" => {
                         // §4.1.3: "pk" MUST be a Byte Sequence
@@ -487,8 +487,8 @@ pub fn parse_ratelimit_headers(headers: &HeaderMap, debug: bool) -> Vec<ServiceL
                             header_valid = false;
                             break;
                         }
-                    }
-                    _ => {} // Other/vendor parameters are allowed and ignored (§4.1)
+                    },
+                    _ => {}, // Other/vendor parameters are allowed and ignored (§4.1)
                 }
             }
 
@@ -549,10 +549,10 @@ pub fn parse_ratelimit_problem_body(headers: &HeaderMap, body: &[u8]) -> Option<
         "https://iana.org/assignments/http-problem-types#quota-exceeded" => Some("quota-exceeded"),
         "https://iana.org/assignments/http-problem-types#temporary-reduced-capacity" => {
             Some("temporary-reduced-capacity")
-        }
+        },
         "https://iana.org/assignments/http-problem-types#abnormal-usage-detected" => {
             Some("abnormal-usage-detected")
-        }
+        },
         _ => None,
     };
     let title = val.get("title").and_then(|v| v.as_str());

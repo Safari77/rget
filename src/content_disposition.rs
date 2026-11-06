@@ -8,8 +8,9 @@
 //
 // Adapted for local use to fix RFC 6266 precedence issues.
 
-use charset::Charset;
 use std::collections::{BTreeMap, HashMap};
+
+use charset::Charset;
 
 /// The possible disposition types in a Content-Disposition header.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -59,7 +60,7 @@ impl ParsedContentDisposition {
                     Some(l) => (first, Some(l.to_owned())),
                     None => (first, None),
                 })
-            }
+            },
             None => None,
         }
     }
@@ -123,8 +124,8 @@ fn split_semicolon_aware(content: &str) -> Vec<&str> {
             ';' if !in_quotes => {
                 parts.push(&content[start..i]);
                 start = i + 1;
-            }
-            _ => {}
+            },
+            _ => {},
         }
     }
     // Don't forget the last segment
@@ -250,7 +251,7 @@ fn percent_decode(encoded: &str) -> Vec<u8> {
                 decoded.push(b);
                 next = n;
                 continue;
-            }
+            },
         };
         let bottom = match bytes.next() {
             Some(n) if n.is_ascii_hexdigit() => n,
@@ -259,7 +260,7 @@ fn percent_decode(encoded: &str) -> Vec<u8> {
                 decoded.push(top);
                 next = n;
                 continue;
-            }
+            },
         };
         let decoded_byte = (hex_to_nybble(top) << 4) | hex_to_nybble(bottom);
         decoded.push(decoded_byte);

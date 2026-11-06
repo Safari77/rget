@@ -5,8 +5,9 @@
 
 #![cfg(test)]
 
-use super::*;
 use serde_json::json;
+
+use super::*;
 
 // ---- Direct collect_values / json_path_extract behavior -----------------
 
