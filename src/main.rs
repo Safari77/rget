@@ -32,31 +32,35 @@
 
 //     You should have received a copy of the GNU General Public License along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-use crate::ratelimit::extract_ratelimit_wait;
-use crate::ratelimit::{RateLimitTracker, handle_error_response};
-use ipnet::{Ipv4Net, Ipv6Net};
-use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader, BufWriter, ErrorKind, IsTerminal, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::path::{Component, Path, PathBuf};
-use std::process::ExitCode;
-use std::sync::LazyLock;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Write as _,
+    fs::{self, File},
+    io::{BufRead, BufReader, BufWriter, ErrorKind, IsTerminal, Read, Write},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    path::{Component, Path, PathBuf},
+    process::ExitCode,
+    sync::{
+        LazyLock,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
-use cap_std::ambient_authority;
-use cap_std::fs::{Dir, OpenOptions};
-
-use crate::content_disposition::{DispositionType, parse_content_disposition};
 use anyhow::{Context, Result, bail};
-use clap::Parser;
-use clap::builder::TypedValueParser;
+use cap_std::{
+    ambient_authority,
+    fs::{Dir, OpenOptions},
+};
+use clap::{Parser, builder::TypedValueParser};
 use data_encoding::BASE32_NOPAD;
 use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
+use ipnet::{Ipv4Net, Ipv6Net};
 use regex::Regex;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-use reqwest::{Client, Identity, Response, StatusCode};
+use reqwest::{
+    Client, Identity, Response, StatusCode,
+    header::{HeaderMap, HeaderName, HeaderValue},
+};
 use rustls::ClientConfig;
 use rustls_platform_verifier::BuilderVerifierExt;
 use sha2::{Digest as Sha2Digest, Sha256};
@@ -64,11 +68,17 @@ use shake::{
     Shake256,
     digest::{ExtendableOutput, Update, XofReader},
 };
-use std::fmt::Write as _;
-use tokio::io::{AsyncWrite, AsyncWriteExt, BufWriter as TokBufWriter};
-use tokio::time::{Instant, sleep};
+use tokio::{
+    io::{AsyncWrite, AsyncWriteExt, BufWriter as TokBufWriter},
+    time::{Instant, sleep},
+};
 use tokio_stream::StreamExt;
 use url::Url;
+
+use crate::{
+    content_disposition::{DispositionType, parse_content_disposition},
+    ratelimit::{RateLimitTracker, extract_ratelimit_wait, handle_error_response},
+};
 
 mod content_disposition;
 mod ratelimit;
@@ -169,7 +179,7 @@ pub enum PermanentError {
     RedirectOnGet { status: u16, location: String },
 
     // HTTP errors (4xx = permanent, 5xx = transient)
-    HttpClientError(u16), // any HTTP error status; 5xx and 429 are transient (see is_permanent_error)
+    HttpClientError(u16), /* any HTTP error status; 5xx and 429 are transient (see is_permanent_error) */
     HttpRateLimited { status: u16, wait: Option<Duration>, problem_detail: Option<String> },
 
     // TOCTOU: file appeared during download
@@ -227,73 +237,73 @@ impl std::fmt::Display for PermanentError {
                     HumanBytes(*max),
                     url
                 )
-            }
+            },
             Self::DownloadExceedsLimit { max } => {
                 write!(f, "Download exceeded maximum allowed size ({})", HumanBytes(*max))
-            }
+            },
             Self::FileAlreadyExists(path) => {
                 write!(
                     f,
                     "File '{}' already exists. Use --continue to resume or --overwrite to replace, --newer to download if newer, or --multiple-copies (possibly with --keep-extension) to download into different files.",
                     path.display()
                 )
-            }
+            },
             Self::TruncatedFilenameExists(path) => {
                 write!(
                     f,
                     "Truncated filename '{}' already exists. Use --overwrite to replace or --multiple-copies to save with a different name.",
                     path.display()
                 )
-            }
+            },
             Self::FilenameTooLong => {
                 write!(f, "Filename too long and cannot be truncated")
-            }
+            },
             Self::IsASymlink(path) => {
                 write!(f, "Refusing to write to symlink: '{}'", path.display())
-            }
+            },
             Self::InsecureUrl(url) => {
                 write!(f, "Refusing insecure HTTP URL: {url}. Use --insecure to allow.")
-            }
+            },
             Self::ClientBuilderError(msg) => write!(f, "Failed to initialize HTTP client: {msg}"),
             Self::UnsupportedScheme(scheme) => {
                 write!(f, "Unsupported URL scheme: {scheme}")
-            }
+            },
             Self::NoSafeIpv4(host) => {
                 write!(f, "Could not resolve '{host}' to a safe IPv4 address")
-            }
+            },
             Self::NoSafeIpv6(host) => {
                 write!(f, "Could not resolve '{host}' to a safe IPv6 address")
-            }
+            },
             Self::NoSafePublicIp(host) => {
                 write!(f, "Could not resolve '{host}' to a safe public IP")
-            }
+            },
             Self::ProxyIpPolicyConflict(flags) => {
                 write!(
                     f,
                     "A proxy is configured in the environment (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY), but {flags} cannot be enforced through a proxy because the proxy resolves names and connects on its own. Use --no-proxy to connect directly, or unset the proxy variables."
                 )
-            }
+            },
             Self::TooManyRedirects(max) => {
                 write!(f, "Too many redirects (maximum: {max})")
-            }
+            },
             Self::ContentRangeMismatch { requested, received } => {
                 write!(
                     f,
                     "Content-Range mismatch: requested byte {requested}, server returned byte {received}. Aborting to prevent file corruption."
                 )
-            }
+            },
             Self::RedirectWithoutLocation(status) => {
                 write!(f, "Server returned redirect ({status}) but no Location header")
-            }
+            },
             Self::RedirectOnGet { status, location } => {
                 write!(
                     f,
                     "Server returned redirect on GET ({status}) with manual-redirects disabled. Redirect target: {location}"
                 )
-            }
+            },
             Self::HttpClientError(status) => {
                 write!(f, "Download failed with HTTP status: {status}")
-            }
+            },
             Self::HttpRateLimited { status, wait, problem_detail } => {
                 write!(f, "Download throttled with HTTP status: {status}")?;
                 if let Some(w) = wait {
@@ -303,23 +313,23 @@ impl std::fmt::Display for PermanentError {
                     write!(f, " [{detail}]")?;
                 }
                 Ok(())
-            }
+            },
             Self::FileAppearedDuringDownload(path) => {
                 write!(
                     f,
                     "File '{}' appeared during download (TOCTOU race). Use --overwrite to replace or --multiple-copies to save with a different name.",
                     path.display()
                 )
-            }
+            },
             Self::InvalidArguments(msg) => {
                 write!(f, "{msg}")
-            }
+            },
             Self::BlockDeviceNotAllowed(path) => {
                 write!(f, "Refusing to write to block device: '{}'", path.display())
-            }
+            },
             Self::CharDeviceNotAllowed(path) => {
                 write!(f, "Refusing to write to character device: '{}'", path.display())
-            }
+            },
             Self::FileOwnerMismatch { path, expected_uid, actual_uid } => {
                 write!(
                     f,
@@ -328,10 +338,10 @@ impl std::fmt::Display for PermanentError {
                     expected_uid,
                     actual_uid
                 )
-            }
+            },
             Self::ClientCertError(msg) => {
                 write!(f, "Client certificate/key error: {msg}")
-            }
+            },
             Self::BinaryToTerminal(ct) => {
                 if let Some(ct) = ct {
                     write!(
@@ -344,53 +354,53 @@ impl std::fmt::Display for PermanentError {
                         "Refusing to write data (Content-Type: unknown) to terminal. Use shell redirection (>) or --output."
                     )
                 }
-            }
+            },
             Self::NoIfModifiedSinceWithoutNewer => {
                 write!(f, "--no-if-modified-since can only be used with -N (--newer)")
-            }
+            },
             Self::KeepExtensionWithoutMultipleCopies => {
                 write!(f, "--keep-extension can only be used with --multiple-copies")
-            }
+            },
             Self::OutputDirNotFound(path) => {
                 write!(
                     f,
                     "Output directory '{}' does not exist (will not create it automatically)",
                     path.display()
                 )
-            }
+            },
             Self::OutputDirNotADirectory(path) => {
                 write!(f, "Output path '{}' is not a directory", path.display())
-            }
+            },
             Self::JsonContentTypeExpected(actual) => {
                 write!(f, "--json-parse requires Content-Type: application/json but got: {actual}")
-            }
+            },
             Self::JsonParseError(msg) => {
                 write!(f, "Failed to parse JSON response: {msg}")
-            }
+            },
             Self::JsonPathError(msg) => {
                 write!(f, "JSON path expression error: {msg}")
-            }
+            },
             Self::JsonNoUrlsExtracted => {
                 write!(f, "No download URLs were extracted from JSON (after filtering)")
-            }
+            },
             Self::JsonUrlHashCountMismatch { urls, hashes } => {
                 write!(
                     f,
                     "--json-url-field extracted {urls} URLs but --json-hash-field extracted {hashes} hashes (must be equal)"
                 )
-            }
+            },
             Self::JsonUrlNameCountMismatch { urls, names } => {
                 write!(
                     f,
                     "--json-url-field extracted {urls} URLs but --json-name-field extracted {names} names (must be equal)"
                 )
-            }
+            },
             Self::JsonUrlSizeCountMismatch { urls, sizes } => {
                 write!(
                     f,
                     "--json-url-field extracted {urls} URLs but --json-size-field extracted {sizes} sizes (must be equal)"
                 )
-            }
+            },
             Self::JsonHashMissing(file) => {
                 // 'file' is a URL taken from server-supplied JSON: neutralize
                 // terminal escape sequences before printing it.
@@ -399,26 +409,26 @@ impl std::fmt::Display for PermanentError {
                     "--json-verify-hash: no hash found in JSON for file '{}'",
                     terminal_safe(file)
                 )
-            }
+            },
             Self::JsonHashMismatch { file, expected, actual } => {
                 write!(
                     f,
                     "SHA256 verification FAILED for '{file}': expected {expected} got {actual}"
                 )
-            }
+            },
             Self::JsonHashUnsupportedAlgo(algo) => {
                 write!(
                     f,
                     "Unsupported hash algorithm in JSON digest field: '{}' (only sha256 supported)",
                     terminal_safe(algo)
                 )
-            }
+            },
             Self::JsonVerifyHashWithoutHashField => {
                 write!(f, "--json-verify-hash requires --json-hash-field")
-            }
+            },
             Self::JsonUrlFieldRequired => {
                 write!(f, "--json-parse requires --json-url-field")
-            }
+            },
             Self::JsonHashInvalidFormat { url, digest } => {
                 write!(
                     f,
@@ -426,13 +436,13 @@ impl std::fmt::Display for PermanentError {
                     digest,
                     terminal_safe(url)
                 )
-            }
+            },
             Self::JsonDownloadsFailed { failed, total } => {
                 write!(
                     f,
                     "JSON download mode: {failed} of {total} downloads failed (per-entry retries already exhausted)"
                 )
-            }
+            },
         }
     }
 }
@@ -801,7 +811,7 @@ fn load_hsts_db(path: &Path) -> HstsMap {
             let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
             map.retain(|_, entry| entry.expiry > now);
             map
-        }
+        },
         Err(e) => {
             eprintln!(
                 "Warning: Failed to parse HSTS cache '{}', starting fresh. Error: {}",
@@ -809,7 +819,7 @@ fn load_hsts_db(path: &Path) -> HstsMap {
                 e
             );
             HashMap::new()
-        }
+        },
     }
 }
 
@@ -869,7 +879,7 @@ fn save_hsts_db(path: &Path, map: &HstsMap) {
         Err(e) => {
             eprintln!("Failed to create temp file for HSTS DB in '{}': {}", parent.display(), e);
             return;
-        }
+        },
     };
     let tmp_path_display = tmp.path().display().to_string();
 
@@ -958,7 +968,7 @@ fn update_hsts(map: &mut HstsMap, url: &Url, headers: &HeaderMap, debug: bool) {
                 eprintln!("[DEBUG] HSTS: ignoring STS header for IP-literal host");
             }
             return;
-        }
+        },
         None => return,
     };
 
@@ -1105,7 +1115,7 @@ fn build_tls_config(args: &Args) -> Result<Option<ClientConfig>> {
             let mut root_store = rustls::RootCertStore::empty();
             root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
             ClientConfig::builder().with_root_certificates(root_store)
-        }
+        },
     };
 
     #[cfg(target_os = "android")]
@@ -1715,13 +1725,13 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
     // Validate --filemode
     if let Some(ref mode_str) = args.filemode {
         match u32::from_str_radix(mode_str, 8) {
-            Ok(m) if m <= 0o7777 => {}
+            Ok(m) if m <= 0o7777 => {},
             _ => {
                 return Err(PermanentError::InvalidArguments(format!(
                     "Invalid file mode: '{mode_str}' (expect octal digits 0-7, value <= 7777)"
                 ))
                 .into());
-            }
+            },
         }
     }
 
@@ -1770,17 +1780,17 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                         PermanentError::OutputDirNotADirectory(dir_path.to_path_buf()).into()
                     );
                 }
-            }
+            },
             Err(e) if e.kind() == ErrorKind::NotFound => {
                 return Err(PermanentError::OutputDirNotFound(dir_path.to_path_buf()).into());
-            }
+            },
             Err(e) => {
                 return Err(anyhow::anyhow!(
                     "Cannot access output directory '{}': {}",
                     dir_path.display(),
                     e
                 ));
-            }
+            },
         }
     }
 
@@ -1830,7 +1840,7 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                 eprintln!("Error parsing URL '{url_str}': {e}");
                 overall_success = false;
                 continue;
-            }
+            },
         };
 
         // HTTP credentials may only go to the host of the URL the user supplied
@@ -1889,7 +1899,7 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                                 &mut rl_tracker,
                             )
                             .await
-                        }
+                        },
                         Err(e) => Err(e),
                     }
                 }
@@ -1900,7 +1910,7 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                         // Commit the cache only on full success
                         used_filenames = attempt_used_filenames;
                         break;
-                    }
+                    },
                     Err(e) => {
                         if is_permanent_error(&e) {
                             eprintln!("Failed: {e:#}");
@@ -1929,7 +1939,7 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                             let delay = 1u64 << attempt.clamp(0, 6);
                             sleep(Duration::from_secs(delay)).await;
                         }
-                    }
+                    },
                 }
             }
             if !args.quiet && urls.len() > 1 {
@@ -2007,7 +2017,7 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                             &mut rl_tracker,
                         )
                         .await
-                    }
+                    },
                     Err(e) => Err(e),
                 }
             }
@@ -2018,7 +2028,7 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                     // 3. Commit the cache ONLY if the download was successful
                     used_filenames = attempt_used_filenames;
                     break;
-                }
+                },
                 Err(e) => {
                     if is_permanent_error(&e) {
                         eprintln!("Failed to download {url}: {e:#}");
@@ -2050,7 +2060,7 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                         let delay = 1u64 << attempt.clamp(0, 6);
                         sleep(Duration::from_secs(delay)).await;
                     }
-                }
+                },
             }
         }
         if !args.quiet && urls.len() > 1 {
@@ -2144,7 +2154,7 @@ fn is_private_ip(ip: &IpAddr) -> bool {
                 // Multicast (RFC 5771): 224.0.0.0/4
                 || ipv4.is_multicast()
                 || BLOCKED_IPV4_NETS.iter().any(|net| net.contains(ipv4))
-        }
+        },
         IpAddr::V6(ipv6) => {
             ipv6.is_loopback()
                 || ipv6.is_unspecified()
@@ -2169,7 +2179,7 @@ fn is_private_ip(ip: &IpAddr) -> bool {
                         (ipv6.segments()[7] >> 8) as u8,
                         (ipv6.segments()[7] & 0xff) as u8,
                     ))))
-        }
+        },
     }
 }
 
@@ -2184,9 +2194,9 @@ fn is_6to4_private(ipv6: &Ipv6Addr) -> bool {
     let seg2 = ipv6.segments()[2];
     let ipv4 = Ipv4Addr::new(
         (seg1 >> 8) as u8,
-        (seg1 & 0xff) as u8,
+        (seg1 & 0xFF) as u8,
         (seg2 >> 8) as u8,
-        (seg2 & 0xff) as u8,
+        (seg2 & 0xFF) as u8,
     );
     is_private_ip(&IpAddr::V4(ipv4))
 }
@@ -2205,9 +2215,9 @@ fn is_nat64_private(ipv6: &Ipv6Addr) -> bool {
         let s = ipv6.segments();
         let ipv4 = Ipv4Addr::new(
             (s[6] >> 8) as u8,
-            (s[6] & 0xff) as u8,
+            (s[6] & 0xFF) as u8,
             (s[7] >> 8) as u8,
-            (s[7] & 0xff) as u8,
+            (s[7] & 0xFF) as u8,
         );
         return is_private_ip(&IpAddr::V4(ipv4));
     }
@@ -2261,19 +2271,19 @@ async fn resolve_safe_ip(url: &Url, args: &Args) -> Result<SocketAddr> {
                 }
             }
             Err(make_error(host_str))
-        }
+        },
 
         // 2. Handle IPv4 Literals directly (No DNS)
         Some(url::Host::Ipv4(addr)) => {
             let sa = SocketAddr::new(std::net::IpAddr::V4(addr), port);
             if is_ip_allowed(&sa, args) { Ok(sa) } else { Err(make_error(&addr.to_string())) }
-        }
+        },
 
         // 3. Handle IPv6 Literals directly
         Some(url::Host::Ipv6(addr)) => {
             let sa = SocketAddr::new(std::net::IpAddr::V6(addr), port);
             if is_ip_allowed(&sa, args) { Ok(sa) } else { Err(make_error(&addr.to_string())) }
-        }
+        },
 
         None => Err(anyhow::anyhow!("URL has no host")),
     }
@@ -2290,7 +2300,7 @@ fn parse_content_disposition_header(header_value: &str) -> Option<String> {
 
     // 1. Validate Type
     match data.disposition {
-        DispositionType::Attachment | DispositionType::Inline => {}
+        DispositionType::Attachment | DispositionType::Inline => {},
         _ => return None,
     }
 
@@ -2404,7 +2414,7 @@ fn read_personalization_key() -> String {
             } else {
                 trimmed.to_string()
             }
-        }
+        },
         Err(_) => DEFAULT_PERSONALIZATION.to_string(),
     }
 }
@@ -2569,7 +2579,7 @@ fn validate_url(url: &Url, insecure: bool) -> Result<()> {
             } else {
                 Err(PermanentError::InsecureUrl(url.to_string()).into())
             }
-        }
+        },
         scheme => Err(PermanentError::UnsupportedScheme(scheme.to_string()).into()),
     }
 }
@@ -2976,7 +2986,7 @@ fn stat_file_via_cache(path: &Path, cache: &mut DirCache) -> Result<Option<FileI
                 None
             };
             Ok(Some(FileInfo { size, modified, is_regular }))
-        }
+        },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
@@ -3032,7 +3042,7 @@ fn check_path_before_open(path: &Path, cache: &mut DirCache) -> Result<bool> {
                 }
             }
             Ok(true) // File exists and is safe
-        }
+        },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         // Propagate other errors (permission denied, EIO, etc.) instead of pretending the file
         // doesn't exist — masking them led to confusing downstream "already exists" diagnostics.
@@ -3059,8 +3069,8 @@ fn normalize_path_lexically(path: &Path) -> PathBuf {
         match component {
             Component::Prefix(..) | Component::RootDir | Component::Normal(..) => {
                 normalized.push(component);
-            }
-            Component::CurDir => {} // Ignore `.`
+            },
+            Component::CurDir => {}, // Ignore `.`
             Component::ParentDir => {
                 // Directly after the root, `..` can only resolve to the root itself
                 // ("/.." is "/"), so drop it. Anywhere else keep the `..` as is:
@@ -3068,7 +3078,7 @@ fn normalize_path_lexically(path: &Path) -> PathBuf {
                 if !matches!(normalized.components().next_back(), Some(Component::RootDir)) {
                     normalized.push(component);
                 }
-            }
+            },
         }
     }
 
@@ -3141,17 +3151,17 @@ fn open_file_securely(
                             return Err(
                                 PermanentError::BlockDeviceNotAllowed(path.to_path_buf()).into()
                             );
-                        }
+                        },
                         Some(_) => {
                             return Err(
                                 PermanentError::CharDeviceNotAllowed(path.to_path_buf()).into()
                             );
-                        }
-                        None => {}
+                        },
+                        None => {},
                     }
                 }
                 (true, ft.is_file())
-            }
+            },
             Err(e) if e.kind() == ErrorKind::NotFound => (false, false),
             Err(e) => return Err(e.into()),
         };
@@ -3175,21 +3185,22 @@ fn open_file_securely(
                 (true, _, _, _) => {
                     opts.append(true);
                     (true, false)
-                }
+                },
                 // Unauthorized to clobber existing target.
                 (false, true, _, false) => {
                     return Err(Error::new(ErrorKind::AlreadyExists, "Destination exists").into());
-                }
+                },
                 // Authorized to replace an existing regular file: unlink and recreate via O_EXCL
                 // to avoid writing through old/hard-linked inodes or failing on ownership.
                 (false, true, true, true) => {
                     if let Err(e) = dir.remove_file(filename)
-                        && e.kind() != ErrorKind::NotFound {
-                            return Err(e.into());
-                        }
+                        && e.kind() != ErrorKind::NotFound
+                    {
+                        return Err(e.into());
+                    }
                     opts.create_new(true);
                     (false, true)
-                }
+                },
                 // Authorized to write to existing non-regular file (e.g. FIFO): open without
                 // O_CREAT or O_TRUNC so a raced regular file isn't truncated before fstat check.
                 (false, true, false, true) => (true, false),
@@ -3198,7 +3209,7 @@ fn open_file_securely(
                 (false, false, _, _) => {
                     opts.create_new(true);
                     (false, true)
-                }
+                },
             };
 
         // -- 3. Open and handle creation/removal races --
@@ -3214,7 +3225,7 @@ fn open_file_securely(
                     continue; // Lost a race while authorized to replace: re-classify and retry.
                 }
                 return Err(e.into()); // Fail closed on unauthorized races, ELOOP, etc.
-            }
+            },
         };
 
         let std_file = cap_file.into_std();
@@ -3288,8 +3299,9 @@ fn perform_atomic_move(
         // make renameat2 behavior inconsistent and hard_link unreliable.
         #[cfg(all(target_os = "linux", not(target_os = "android")))]
         {
-            use rustix::fs::RenameFlags;
             use std::os::fd::AsFd;
+
+            use rustix::fs::RenameFlags;
 
             // Always attempt NOREPLACE first — it's the only truly atomic
             // no-clobber primitive. Even when overwriting, trying NOREPLACE
@@ -3317,18 +3329,18 @@ fn perform_atomic_move(
                         Ok(()) => return Ok(()),
                         Err(e) => return Err(std::io::Error::from(e)),
                     }
-                }
+                },
 
                 // Target exists but overwrite not allowed → propagate AlreadyExists
                 Err(rustix::io::Errno::EXIST) => {
                     return Err(std::io::Error::from(rustix::io::Errno::EXIST));
-                }
+                },
 
                 // Fall through to cap-std
                 Err(rustix::io::Errno::XDEV)
                 | Err(
                     rustix::io::Errno::NOSYS | rustix::io::Errno::NOTSUP | rustix::io::Errno::INVAL,
-                ) => {}
+                ) => {},
 
                 // ALL OTHER ERRORS (EACCES, EPERM, EIO, ENOSPC, etc.)
                 // MUST propagate immediately. Never swallow these.
@@ -3343,8 +3355,9 @@ fn perform_atomic_move(
         // hard_link).
         #[cfg(target_os = "android")]
         {
-            use rustix::fs::RenameFlags;
             use std::os::fd::AsFd;
+
+            use rustix::fs::RenameFlags;
 
             // Try NOREPLACE first — strace confirms this works on Termux FUSE
             let noreplace_result = rustix::fs::renameat_with(
@@ -3370,21 +3383,21 @@ fn perform_atomic_move(
                         Ok(_) => return Ok(()),
                         Err(e) => return Err(std::io::Error::from(e)),
                     }
-                }
+                },
 
                 // Target exists, no overwrite
                 Err(rustix::io::Errno::EXIST) => {
                     return Err(std::io::Error::from(rustix::io::Errno::EXIST));
-                }
+                },
 
                 // renameat2 entirely unsupported on this Android build/kernel:
                 // fall through to cap-std rename below (NOT hard_link)
                 Err(
                     rustix::io::Errno::NOSYS | rustix::io::Errno::NOTSUP | rustix::io::Errno::INVAL,
-                ) => {}
+                ) => {},
 
                 // Cross-device: fall through to cap-std
-                Err(rustix::io::Errno::XDEV) => {}
+                Err(rustix::io::Errno::XDEV) => {},
 
                 // Real errors propagate immediately
                 Err(e) => return Err(std::io::Error::from(e)),
@@ -3422,7 +3435,7 @@ fn perform_atomic_move(
                 Ok(()) => {
                     let _ = dir_from.remove_file(file_from);
                     Ok(())
-                }
+                },
                 // AlreadyExists preserves the no-replace guarantee.
                 // EXDEV or unsupported hard_link must NOT fall back to
                 // check-then-rename (TOCTOU vulnerability).
@@ -3443,7 +3456,7 @@ fn perform_atomic_move(
                 // rename time means the file appeared during download (TOCTOU).
                 Err(PermanentError::FileAppearedDuringDownload(target_path.to_path_buf()).into())
             }
-        }
+        },
 
         Err(e) if is_name_too_long(&e) => {
             let truncated = resolve_output_path(target_path)?;
@@ -3460,10 +3473,10 @@ fn perform_atomic_move(
                 Ok(()) => Ok(truncated),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     Err(PermanentError::TruncatedFilenameExists(truncated).into())
-                }
+                },
                 Err(e) => Err(e).context("Failed to rename to truncated path"),
             }
-        }
+        },
 
         Err(e) => Err(e).context("Failed to rename temp file"),
     }
@@ -3575,7 +3588,7 @@ fn is_permanent_error(err: &anyhow::Error) -> bool {
                     return false;
                 }
                 return true;
-            }
+            },
             _ => return true,
         }
     }
@@ -3641,7 +3654,7 @@ fn is_permanent_error(err: &anyhow::Error) -> bool {
                     // download_file, so if it still surfaces (e.g. filesystem
                     // NAME_MAX < MAX_FILENAME_BYTES) retrying cannot help
                     | ErrorKind::InvalidFilename
-                    | ErrorKind::QuotaExceeded // | ErrorKind::FilesystemLoop // https://github.com/rust-lang/rust/issues/86442
+                    | ErrorKind::QuotaExceeded /* | ErrorKind::FilesystemLoop // https://github.com/rust-lang/rust/issues/86442 */
             ) {
                 return true;
             }
@@ -3696,12 +3709,12 @@ fn apply_server_timestamp(
             if debug {
                 eprintln!("[DEBUG] Set file modification time to: {lm_str}");
             }
-        }
+        },
         Err(e) => {
             if debug {
                 eprintln!("[DEBUG] Failed to set file timestamp: {e}");
             }
-        }
+        },
     }
 }
 
@@ -3709,8 +3722,9 @@ fn apply_server_timestamp(
 /// No file descriptor is opened for the file itself — purely metadata operation.
 #[cfg(unix)]
 fn set_file_mtime(path: &Path, server_time: SystemTime, cache: &mut DirCache) -> Result<()> {
-    use rustix::fs::{AtFlags, Timespec, Timestamps};
     use std::os::fd::AsFd;
+
+    use rustix::fs::{AtFlags, Timespec, Timestamps};
 
     let dur =
         server_time.duration_since(UNIX_EPOCH).context("Server timestamp is before Unix epoch")?;
@@ -3949,7 +3963,7 @@ fn parse_jq_path(path: &str) -> Result<Vec<JqSegment>> {
                     current_field.clear();
                 }
                 chars.next();
-            }
+            },
             '[' => {
                 // Flush current field
                 if !current_field.is_empty() {
@@ -3984,7 +3998,7 @@ fn parse_jq_path(path: &str) -> Result<Vec<JqSegment>> {
                     ))
                     .into());
                 }
-            }
+            },
             '|' => {
                 // Pipe operator: treat as segment separator (skip whitespace around it)
                 if !current_field.is_empty() {
@@ -4004,14 +4018,14 @@ fn parse_jq_path(path: &str) -> Result<Vec<JqSegment>> {
                 if let Some(&'.') = chars.peek() {
                     chars.next();
                 }
-            }
+            },
             c if c.is_whitespace() => {
                 chars.next(); // skip whitespace
-            }
+            },
             c => {
                 current_field.push(c);
                 chars.next();
-            }
+            },
         }
     }
 
@@ -4058,7 +4072,7 @@ fn collect_values(value: &serde_json::Value, segments: &[JqSegment], results: &m
                     collect_values(item, &segments[1..], results);
                 }
             }
-        }
+        },
         JqSegment::ArrayIndex(idx) => {
             if let serde_json::Value::Array(arr) = value {
                 match arr.get(*idx) {
@@ -4066,7 +4080,7 @@ fn collect_values(value: &serde_json::Value, segments: &[JqSegment], results: &m
                     None => results.push(String::new()),
                 }
             }
-        }
+        },
     }
 }
 
@@ -4459,7 +4473,7 @@ async fn process_json_downloads(
                 eprintln!("Error parsing URL '{}': {}", terminal_safe(&entry.url), e);
                 failed_count += 1;
                 continue;
-            }
+            },
         };
 
         if !args.quiet {
@@ -4598,7 +4612,7 @@ async fn process_json_downloads(
                             rl_tracker,
                         )
                         .await
-                    }
+                    },
                     Err(e) => Err(e),
                 }
             }
@@ -4609,7 +4623,7 @@ async fn process_json_downloads(
                     // Commit the cache
                     *used_filenames = attempt_used_filenames;
                     break false;
-                }
+                },
                 Err(e) => {
                     if is_permanent_error(&e) {
                         eprintln!("Failed to download {url}: {e:#}");
@@ -4634,7 +4648,7 @@ async fn process_json_downloads(
                         let delay = 1u64 << attempt.clamp(0, 6);
                         sleep(Duration::from_secs(delay)).await;
                     }
-                }
+                },
             }
         };
         if entry_failed {
@@ -4809,7 +4823,7 @@ async fn download_file(
             LocalTargetAction::Proceed { start_byte: sb, force_truncate: ft } => {
                 start_byte = sb;
                 force_truncate = ft;
-            }
+            },
         }
     }
 
@@ -5476,24 +5490,24 @@ fn open_temp_file_safely(
                             );
                         }
                         match dir.remove_file(filename) {
-                            Ok(()) => {}
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            Ok(()) => {},
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
                             Err(e) => return Err(e.into()),
                         }
                         if attempt + 1 < MAX_ATTEMPTS {
                             continue;
                         }
                         return Ok(dir.open_with(filename, &excl_opts)?.into_std());
-                    }
+                    },
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         if attempt + 1 < MAX_ATTEMPTS {
                             continue;
                         }
                         return Ok(dir.open_with(filename, &excl_opts)?.into_std());
-                    }
+                    },
                     Err(e) => return Err(e.into()),
                 }
-            }
+            },
             Err(e) => return Err(e.into()),
         }
     }
@@ -5567,8 +5581,8 @@ async fn download_to_temp(
     .await?;
 
     match async_file.sync_all().await {
-        Ok(()) => {}
-        Err(e) if is_sync_ignorable(&e) => {}
+        Ok(()) => {},
+        Err(e) if is_sync_ignorable(&e) => {},
         Err(e) => return Err(e.into()),
     }
 
@@ -5628,14 +5642,14 @@ async fn download_to_temp(
                 }
             }
             Ok(path)
-        }
+        },
         Err(e) => {
             // FAILURE: Clean up the temp file (unless --keep-temp is set)
             if !args.keep_temp {
                 remove_temp_via_cache(&temp_path, dir_cache);
             }
             Err(e)
-        }
+        },
     }
 }
 
@@ -5683,7 +5697,7 @@ async fn download_direct(
                 } else {
                     return Err(e);
                 }
-            }
+            },
         };
 
     let mut file = tokio::fs::File::from_std(std_file);
@@ -5697,8 +5711,8 @@ async fn download_direct(
     )
     .await?;
     match file.sync_all().await {
-        Ok(()) => {}
-        Err(e) if is_sync_ignorable(&e) => {}
+        Ok(()) => {},
+        Err(e) if is_sync_ignorable(&e) => {},
         Err(e) => return Err(e.into()),
     }
 
@@ -5833,7 +5847,7 @@ async fn write_response_to_file<W: AsyncWrite + Unpin>(
                     accumulated_bytes = 0;
                     last_update = Instant::now();
                 }
-            }
+            },
             Some(Err(e)) => return Err(e.into()),
             None => break,
         }
@@ -6015,9 +6029,6 @@ async fn shutdown_signal() {
     }
 }
 
-#[cfg(test)]
-mod tests;
-#[cfg(test)]
-mod tests_hsts;
-#[cfg(test)]
-mod tests_json_alignment;
+#[cfg(test)] mod tests;
+#[cfg(test)] mod tests_hsts;
+#[cfg(test)] mod tests_json_alignment;

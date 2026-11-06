@@ -297,7 +297,7 @@ async fn test_resolve_safe_ip_ipv6_literal() {
     match url.host() {
         Some(url::Host::Ipv6(addr)) => {
             assert_eq!(addr.to_string(), "::1"); // No brackets in the Addr object
-        }
+        },
         _ => panic!("Should be parsed as Ipv6 host"),
     }
 }
@@ -449,12 +449,12 @@ fn test_content_disposition_invalid_headers() {
     assert_eq!(parse_content_disposition_header(cd), None);
 
     // Invalid token characters in unquoted filename
-    //let cd = "attachment; filename=foo[1](2).html";
-    //assert_eq!(parse_content_disposition_header(cd), None);
+    // let cd = "attachment; filename=foo[1](2).html";
+    // assert_eq!(parse_content_disposition_header(cd), None);
 
     // RFC 2047 encoded word (invalid in HTTP)
-    //let cd = "attachment; filename==?ISO-8859-1?Q?foo-=E4.html?=";
-    //assert_eq!(parse_content_disposition_header(cd), None);
+    // let cd = "attachment; filename==?ISO-8859-1?Q?foo-=E4.html?=";
+    // assert_eq!(parse_content_disposition_header(cd), None);
 }
 
 #[test]
@@ -1454,7 +1454,7 @@ fn test_permanent_error_filesystem_variants() {
         libc::EROFS,  // Read-only filesystem
         libc::EACCES, // Permission denied
         libc::EPERM,  // Operation not permitted
-        //libc::ELOOP,  // Too many symbolic links
+        // libc::ELOOP,  // Too many symbolic links
         libc::EEXIST, // File exists (with O_EXCL)
     ];
 
