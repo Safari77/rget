@@ -1870,7 +1870,7 @@ fn test_is_text_content_type() {
 fn test_http_date_roundtrip() {
     let date_str = "Sun, 06 Nov 1994 08:49:37 GMT";
     let parsed = parse_http_date(date_str).expect("Should parse RFC 1123 date");
-    let formatted = format_http_date(parsed).expect("Should format SystemTime");
+    let formatted = format_http_date(parsed);
     assert_eq!(formatted, date_str);
 
     // RFC 850 and asctime formats
