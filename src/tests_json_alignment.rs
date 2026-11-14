@@ -298,6 +298,14 @@ fn test_parse_jq_path_valid() {
     assert!(matches!(&segs_pipe[1], JqSegment::Field(f) if f == "assets"));
     assert!(matches!(&segs_pipe[2], JqSegment::ArrayIter));
     assert!(matches!(&segs_pipe[3], JqSegment::Field(f) if f == "url"));
+
+    // Quoted keys with dots, spaces, and escaped quotes (both ."..." and ["..."] syntax)
+    let segs_quoted = parse_jq_path(r#"."my.field"["space key"][]."a\"b""#).unwrap();
+    assert_eq!(segs_quoted.len(), 4);
+    assert!(matches!(&segs_quoted[0], JqSegment::Field(f) if f == "my.field"));
+    assert!(matches!(&segs_quoted[1], JqSegment::Field(f) if f == "space key"));
+    assert!(matches!(&segs_quoted[2], JqSegment::ArrayIter));
+    assert!(matches!(&segs_quoted[3], JqSegment::Field(f) if f == "a\"b"));
 }
 
 #[test]
@@ -318,6 +326,15 @@ fn test_parse_jq_path_errors() {
     match err_empty.downcast_ref::<PermanentError>().unwrap() {
         PermanentError::JsonPathError(msg) => assert!(msg.contains("Empty path expression")),
         other => panic!("Unexpected error: {:?}", other),
+    }
+
+    // Trailing dot, trailing pipe, unclosed quote, and unquoted whitespace in field name
+    for bad_path in [".assets.", ".assets | ", r#"."unterminated"#, ".field with space"] {
+        let err = parse_jq_path(bad_path).unwrap_err();
+        assert!(
+            matches!(err.downcast_ref::<PermanentError>(), Some(PermanentError::JsonPathError(_))),
+            "Expected JsonPathError for '{bad_path}', got: {err:#}"
+        );
     }
 }
 
