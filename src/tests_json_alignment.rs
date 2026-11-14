@@ -407,6 +407,7 @@ fn test_json_argument_validation_scenarios() {
         no_proxy: false,
         ipv4_only: false,
         ipv6_only: false,
+        doh: false,
         overwrite: false,
         temp: false,
         tempnamelen: 16,

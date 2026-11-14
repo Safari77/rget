@@ -11,6 +11,7 @@ fn make_args() -> Args {
         no_proxy: false,
         ipv4_only: false,
         ipv6_only: false,
+        doh: false,
         overwrite: false,
         temp: false,
         resume: false,
@@ -1960,6 +1961,54 @@ fn test_is_permanent_error_http_status_classification() {
 }
 
 #[test]
+fn test_perform_atomic_move_and_sha256_verification() {
+    let dir = tempfile::tempdir().unwrap();
+    let temp_path = dir.path().join(".test.rget.tmp");
+    let target_path = dir.path().join("final.txt");
+    let mut cache = DirCache::default();
+    let args = make_args();
+
+    std::fs::write(&temp_path, b"hello world").unwrap();
+
+    // Move to non-existent target succeeds
+    let final_p = perform_atomic_move(&temp_path, &target_path, &args, &mut cache).unwrap();
+    assert_eq!(final_p, target_path);
+    assert!(!temp_path.exists());
+    assert_eq!(std::fs::read(&target_path).unwrap(), b"hello world");
+
+    // Verify SHA256 of "hello world"
+    let expected_sha = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+    verify_sha256_file(&target_path, expected_sha, true, &mut cache)
+        .expect("Valid SHA256 should succeed");
+
+    let bad_sha = "0".repeat(64);
+    let err = verify_sha256_file(&target_path, &bad_sha, true, &mut cache)
+        .expect_err("Mismatched SHA256 must fail");
+    assert!(matches!(
+        err.downcast_ref::<PermanentError>(),
+        Some(PermanentError::JsonHashMismatch { .. })
+    ));
+
+    // Moving onto an existing target without --overwrite fails with FileAppearedDuringDownload
+    std::fs::write(&temp_path, b"new content").unwrap();
+    let move_err = perform_atomic_move(&temp_path, &target_path, &args, &mut cache)
+        .expect_err("Atomic move without overwrite must not clobber existing file");
+    assert!(matches!(
+        move_err.downcast_ref::<PermanentError>(),
+        Some(PermanentError::FileAppearedDuringDownload(_))
+    ));
+    // Original file content is preserved
+    assert_eq!(std::fs::read(&target_path).unwrap(), b"hello world");
+
+    // With --overwrite, atomic move replaces the target
+    let mut args_ow = make_args();
+    args_ow.overwrite = true;
+    perform_atomic_move(&temp_path, &target_path, &args_ow, &mut cache)
+        .expect("Atomic move with --overwrite should succeed");
+    assert_eq!(std::fs::read(&target_path).unwrap(), b"new content");
+}
+
+#[test]
 fn test_evaluate_local_target_decisions() {
     let dir = tempfile::tempdir().unwrap();
     let out_path = dir.path().join("out.bin");
@@ -2021,7 +2070,7 @@ fn test_evaluate_local_target_decisions() {
     .unwrap();
     assert!(matches!(res, LocalTargetAction::Proceed { start_byte: 100, force_truncate: false }));
 
-    // 4. --overwrite even when local size == expected_length -> Proceed from 0
+    // 4. --overwrite alone even when local size == expected_length -> Proceed from 0
     let mut args_ow = make_args();
     args_ow.overwrite = true;
     let res = evaluate_local_target(
@@ -2037,52 +2086,333 @@ fn test_evaluate_local_target_decisions() {
     )
     .unwrap();
     assert!(matches!(res, LocalTargetAction::Proceed { start_byte: 0, force_truncate: false }));
+
+    // 5. --continue when local file is larger than server file -> AlreadyComplete
+    let res = evaluate_local_target(
+        &out_path,
+        None,
+        Some(&out_info),
+        None,
+        &args_resume,
+        Some(50),
+        None,
+        None,
+        &mut cache,
+    )
+    .unwrap();
+    assert!(matches!(res, LocalTargetAction::AlreadyComplete));
 }
 
 #[test]
-fn test_perform_atomic_move_and_sha256_verification() {
+fn test_evaluate_local_target_overwrite_with_newer_and_continue() {
     let dir = tempfile::tempdir().unwrap();
-    let temp_path = dir.path().join(".test.rget.tmp");
-    let target_path = dir.path().join("final.txt");
+    let out_path = dir.path().join("target.bin");
+    let temp_path = dir.path().join(".target.rget.tmp");
+    let mut cache = DirCache::default();
+
+    // Local file mtime: Wed, 11 Nov 2026 20:59:07 GMT
+    let server_lm_same = "Wed, 11 Nov 2026 20:59:07 GMT";
+    let server_lm_older = "Tue, 10 Nov 2026 20:59:07 GMT";
+    let server_lm_newer = "Thu, 12 Nov 2026 20:59:07 GMT";
+    let local_mtime = parse_http_date(server_lm_same).unwrap();
+
+    let complete_info = FileInfo { size: 833, modified: Some(local_mtime), is_regular: true };
+    let partial_info = FileInfo { size: 400, modified: Some(local_mtime), is_regular: true };
+
+    // --- Case 1: --overwrite -N (without -c) ---
+    let mut args_ow_n = make_args();
+    args_ow_n.overwrite = true;
+    args_ow_n.newer = true;
+
+    // 1a. Server file has same or older Last-Modified and matching size -> AlreadyComplete (-N beats --overwrite)
+    for lm in [server_lm_same, server_lm_older] {
+        let res = evaluate_local_target(
+            &out_path,
+            Some(&temp_path),
+            Some(&complete_info),
+            None,
+            &args_ow_n,
+            Some(833),
+            Some(lm),
+            None,
+            &mut cache,
+        )
+        .unwrap();
+        assert!(
+            matches!(res, LocalTargetAction::AlreadyComplete),
+            "--overwrite -N must skip when server Last-Modified ({lm}) <= local mtime and size matches"
+        );
+    }
+
+    // 1b. Server file is newer -> Proceed from byte 0 with force_truncate: true
+    let res = evaluate_local_target(
+        &out_path,
+        Some(&temp_path),
+        Some(&complete_info),
+        None,
+        &args_ow_n,
+        Some(833),
+        Some(server_lm_newer),
+        None,
+        &mut cache,
+    )
+    .unwrap();
+    assert!(matches!(res, LocalTargetAction::Proceed { start_byte: 0, force_truncate: true }));
+
+    // 1c. Server file has same mtime, but local size differs (and -c is NOT set) -> restart from 0
+    let res = evaluate_local_target(
+        &out_path,
+        Some(&temp_path),
+        Some(&partial_info),
+        None,
+        &args_ow_n,
+        Some(833),
+        Some(server_lm_same),
+        None,
+        &mut cache,
+    )
+    .unwrap();
+    assert!(matches!(res, LocalTargetAction::Proceed { start_byte: 0, force_truncate: true }));
+
+    // 1d. HEAD did not provide Last-Modified -> Proceed from 0 with force_truncate: true (GET will send If-Modified-Since)
+    let res = evaluate_local_target(
+        &out_path,
+        Some(&temp_path),
+        Some(&complete_info),
+        None,
+        &args_ow_n,
+        Some(833),
+        None,
+        None,
+        &mut cache,
+    )
+    .unwrap();
+    assert!(matches!(res, LocalTargetAction::Proceed { start_byte: 0, force_truncate: true }));
+
+    // 1e. --overwrite -N --no-if-modified-since without Content-Length trusts mtime alone
+    let mut args_no_ims = args_ow_n.clone();
+    args_no_ims.no_if_modified_since = true;
+    let res = evaluate_local_target(
+        &out_path,
+        None,
+        Some(&complete_info),
+        None,
+        &args_no_ims,
+        None,
+        Some(server_lm_same),
+        None,
+        &mut cache,
+    )
+    .unwrap();
+    assert!(matches!(res, LocalTargetAction::AlreadyComplete));
+
+    // --- Case 2: --overwrite -N -c (--continue) ---
+    let mut args_ow_n_c = args_ow_n.clone();
+    args_ow_n_c.resume = true;
+
+    // 2a. Exact bug scenario: --temp --continue --overwrite -N when file is already complete and not newer
+    let res = evaluate_local_target(
+        &out_path,
+        Some(&temp_path),
+        Some(&complete_info),
+        None,
+        &args_ow_n_c,
+        Some(833),
+        Some(server_lm_same),
+        None,
+        &mut cache,
+    )
+    .unwrap();
+    assert!(
+        matches!(res, LocalTargetAction::AlreadyComplete),
+        "--temp --continue --overwrite -N must skip when file is already complete and not newer"
+    );
+
+    // 2b. Partial output file (direct mode, no temp) with --overwrite -N -c -> resumes from byte 400
+    let res = evaluate_local_target(
+        &out_path,
+        None,
+        Some(&partial_info),
+        None,
+        &args_ow_n_c,
+        Some(833),
+        Some(server_lm_same),
+        None,
+        &mut cache,
+    )
+    .unwrap();
+    assert!(
+        matches!(res, LocalTargetAction::Proceed { start_byte: 400, force_truncate: false }),
+        "--overwrite -N -c should resume partial output file from byte 400"
+    );
+
+    // 2c. Partial temp file with --temp --overwrite -N -c -> resumes temp file from byte 400
+    let res = evaluate_local_target(
+        &out_path,
+        Some(&temp_path),
+        None,
+        Some(&partial_info),
+        &args_ow_n_c,
+        Some(833),
+        Some(server_lm_same),
+        None,
+        &mut cache,
+    )
+    .unwrap();
+    assert!(
+        matches!(res, LocalTargetAction::Proceed { start_byte: 400, force_truncate: false }),
+        "--temp --overwrite -N -c should resume partial temp file from byte 400"
+    );
+
+    // 2d. Complete file on disk, but server has a newer Last-Modified -> restart from byte 0
+    let res = evaluate_local_target(
+        &out_path,
+        Some(&temp_path),
+        Some(&complete_info),
+        None,
+        &args_ow_n_c,
+        Some(833),
+        Some(server_lm_newer),
+        None,
+        &mut cache,
+    )
+    .unwrap();
+    assert!(
+        matches!(res, LocalTargetAction::Proceed { start_byte: 0, force_truncate: true }),
+        "--overwrite -N -c must re-download from byte 0 when server file is newer than complete local file"
+    );
+
+    // 2e. Complete temp file on disk with --temp --overwrite -N -c -> finalizes temp into output_path
+    let payload = b"completed temp payload";
+    std::fs::write(&temp_path, payload).unwrap();
+    let full_temp_info =
+        FileInfo { size: payload.len() as u64, modified: Some(local_mtime), is_regular: true };
+    let mut args_temp_finalize = args_ow_n_c.clone();
+    args_temp_finalize.temp = true;
+    args_temp_finalize.server_timestamps = true;
+
+    let res = evaluate_local_target(
+        &out_path,
+        Some(&temp_path),
+        None,
+        Some(&full_temp_info),
+        &args_temp_finalize,
+        Some(payload.len() as u64),
+        Some(server_lm_same),
+        None,
+        &mut cache,
+    )
+    .unwrap();
+    assert!(matches!(res, LocalTargetAction::AlreadyComplete));
+    assert!(!temp_path.exists(), "Temp file should have been moved to output_path");
+    assert_eq!(std::fs::read(&out_path).unwrap(), payload);
+}
+
+#[test]
+fn test_ipv6_isatap_and_siit_translated_private_detection() {
+    // IPv4-translated IPv6 (RFC 2765 SIIT): ::ffff:0:a.b.c.d (::ffff:0:0/96)
+    let siit_loopback: IpAddr = "::ffff:0:127.0.0.1".parse().unwrap();
+    let siit_private: IpAddr = "::ffff:0:10.0.0.1".parse().unwrap();
+    let siit_public: IpAddr = "::ffff:0:8.8.8.8".parse().unwrap();
+
+    assert!(is_private_ip(&siit_loopback), "SIIT loopback must be blocked as private");
+    assert!(is_private_ip(&siit_private), "SIIT RFC1918 must be blocked as private");
+    assert!(!is_private_ip(&siit_public), "SIIT 8.8.8.8 must be allowed as public");
+
+    // ISATAP (RFC 5214): interface identifier 0000:5efe:a.b.c.d or 0200:5efe:a.b.c.d
+    let isatap_private_1: IpAddr = "2001:4860::0000:5efe:192.168.1.1".parse().unwrap();
+    let isatap_private_2: IpAddr = "2001:4860::0200:5efe:127.0.0.1".parse().unwrap();
+    let isatap_public: IpAddr = "2001:4860::0200:5efe:8.8.8.8".parse().unwrap();
+
+    assert!(
+        is_private_ip(&isatap_private_1),
+        "ISATAP 0000:5efe embedding private IPv4 must be blocked"
+    );
+    assert!(
+        is_private_ip(&isatap_private_2),
+        "ISATAP 0200:5efe embedding loopback IPv4 must be blocked"
+    );
+    assert!(!is_private_ip(&isatap_public), "ISATAP embedding public IPv4 should be public");
+}
+
+#[test]
+fn test_is_permanent_error_rate_limited_variants() {
+    // 429 or 503 rate limits are always transient (retryable)
+    let rl_429 = anyhow::Error::new(PermanentError::HttpRateLimited {
+        status: 429,
+        wait: None,
+        problem_detail: None,
+    });
+    assert!(!is_permanent_error(&rl_429));
+
+    // A 403 with an explicit Retry-After / RateLimit wait or problem detail is also transient
+    let rl_403_wait = anyhow::Error::new(PermanentError::HttpRateLimited {
+        status: 403,
+        wait: Some(Duration::from_secs(5)),
+        problem_detail: None,
+    });
+    assert!(!is_permanent_error(&rl_403_wait));
+
+    let rl_403_detail = anyhow::Error::new(PermanentError::HttpRateLimited {
+        status: 403,
+        wait: None,
+        problem_detail: Some("rate limit exceeded".to_string()),
+    });
+    assert!(!is_permanent_error(&rl_403_detail));
+
+    // A bare 403 without wait or rate-limit problem detail is permanent
+    let rl_403_plain = anyhow::Error::new(PermanentError::HttpRateLimited {
+        status: 403,
+        wait: None,
+        problem_detail: None,
+    });
+    assert!(is_permanent_error(&rl_403_plain));
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn test_open_temp_file_safely_and_server_timestamps() {
+    let dir = tempfile::tempdir().unwrap();
+    let temp_path = dir.path().join(".test_safe.rget.tmp");
     let mut cache = DirCache::default();
     let args = make_args();
 
-    std::fs::write(&temp_path, b"hello world").unwrap();
+    // 1. Fresh creation succeeds and writes data
+    {
+        let mut f = open_temp_file_safely(&temp_path, &args, 0, false, &mut cache).unwrap();
+        f.write_all(b"part1").unwrap();
+    }
 
-    // Move to non-existent target succeeds
-    let final_p = perform_atomic_move(&temp_path, &target_path, &args, &mut cache).unwrap();
-    assert_eq!(final_p, target_path);
-    assert!(!temp_path.exists());
-    assert_eq!(std::fs::read(&target_path).unwrap(), b"hello world");
+    // 2. Resume (start_byte > 0, force_truncate = false) appends to existing temp file
+    {
+        let mut f = open_temp_file_safely(&temp_path, &args, 5, false, &mut cache).unwrap();
+        f.write_all(b"_part2").unwrap();
+    }
+    assert_eq!(std::fs::read(&temp_path).unwrap(), b"part1_part2");
 
-    // Verify SHA256 of "hello world"
-    let expected_sha = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
-    verify_sha256_file(&target_path, expected_sha, true, &mut cache)
-        .expect("Valid SHA256 should succeed");
+    // 3. Restart (start_byte = 0 or force_truncate = true) unlinks stale regular file and recreates via O_EXCL
+    {
+        let mut f = open_temp_file_safely(&temp_path, &args, 0, true, &mut cache).unwrap();
+        f.write_all(b"fresh").unwrap();
+    }
+    assert_eq!(std::fs::read(&temp_path).unwrap(), b"fresh");
 
-    let bad_sha = "0".repeat(64);
-    let err = verify_sha256_file(&target_path, &bad_sha, true, &mut cache)
-        .expect_err("Mismatched SHA256 must fail");
-    assert!(matches!(
-        err.downcast_ref::<PermanentError>(),
-        Some(PermanentError::JsonHashMismatch { .. })
-    ));
+    // 4. apply_server_timestamp sets exact Last-Modified mtime
+    let lm = "Wed, 11 Nov 2026 20:59:07 GMT";
+    apply_server_timestamp(&temp_path, Some(lm), false, &mut cache);
+    let info = stat_file_via_cache(&temp_path, &mut cache).unwrap().unwrap();
+    assert_eq!(info.modified, parse_http_date(lm));
 
-    // Moving onto an existing target without --overwrite fails with FileAppearedDuringDownload
-    std::fs::write(&temp_path, b"new content").unwrap();
-    let move_err = perform_atomic_move(&temp_path, &target_path, &args, &mut cache)
-        .expect_err("Atomic move without overwrite must not clobber existing file");
-    assert!(matches!(
-        move_err.downcast_ref::<PermanentError>(),
-        Some(PermanentError::FileAppearedDuringDownload(_))
-    ));
-    // Original file content is preserved
-    assert_eq!(std::fs::read(&target_path).unwrap(), b"hello world");
-
-    // With --overwrite, atomic move replaces the target
-    let mut args_ow = make_args();
-    args_ow.overwrite = true;
-    perform_atomic_move(&temp_path, &target_path, &args_ow, &mut cache)
-        .expect("Atomic move with --overwrite should succeed");
-    assert_eq!(std::fs::read(&target_path).unwrap(), b"new content");
+    // 5. Symlink at temp_path is rejected with PermanentError::IsASymlink
+    #[cfg(unix)]
+    {
+        let sym_temp = dir.path().join(".sym.rget.tmp");
+        std::os::unix::fs::symlink(&temp_path, &sym_temp).unwrap();
+        let err = open_temp_file_safely(&sym_temp, &args, 0, false, &mut cache)
+            .expect_err("Must refuse symlink at temp path");
+        assert!(matches!(
+            err.downcast_ref::<PermanentError>(),
+            Some(PermanentError::IsASymlink(_))
+        ));
+    }
 }

@@ -11,6 +11,7 @@ fn make_test_args() -> Args {
         no_proxy: false,
         ipv4_only: false,
         ipv6_only: false,
+        doh: false,
         overwrite: false,
         temp: false,
         resume: false,

@@ -57,9 +57,8 @@ regex = "1"
 rustix = "1"
 cap-std = { version = "4", features = ["fs_utf8"] }
 ipnet = "2.12"
-
-[target.'cfg(target_os = "linux")'.dependencies]
-libseccomp = "0.4"
+hickory-resolver = { version = "0.26", features = ["https-aws-lc-rs", "webpki-roots"] }
+fst = "0.4"
 
 [profile.release]
 opt-level = 3
@@ -70,3 +69,4 @@ panic = "abort"
 
 [build-dependencies]
 time = { version = "0.3", features = ["formatting", "macros"] }
+fst = "0.4"

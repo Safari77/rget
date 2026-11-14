@@ -25,11 +25,25 @@
 * **Progress Bar:** Beautiful, informative progress indicators via `indicatif`.
 
 ### **Setup**
-Unix:
+- Unix:
+```
 mkdir -p ~/.config/rget && uuidgen > ~/.config/rget/resumekey.conf
+```
 
-Windows:
+- Windows:
+```
 $dir = "$env:APPDATA\rget"; New-Item -ItemType Directory -Force -Path $dir | Out-Null; $b=new-object byte[] 16; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b); [BitConverter]::ToString($b).Replace('-','').ToLower() | Set-Content -Path "$dir\resumekey.conf"
+```
+
+### --overwrite flag behavior
+
+| Command Flags | Local File State | Result |
+|:--------------|:-----------------|:-------|
+| rget --overwrite <url> | Exists (any mtime/size) | Forces fresh download and overwrites local file. |
+| rget --overwrite -N <url> | Exists, `server_mtime` <= `local_mtime` and `size == Content-Length` | Skips download (Server file is not newer than local file '...', skipping.). |
+| rget --overwrite -N <url> | Exists, `server_mtime` > `local_mtime` or `size != Content-Length` | Re-downloads from byte 0 and atomically replaces local file. |
+| rget --overwrite -c -N <url> | Exists, `size < Content-Length` (partial download) | Resumes from local file/temp file offset. |
+| rget --overwrite -c -N <url> | Exists, `size == Content-Length` and `server_mtime <= local_mtime` | Skips download (Server file is not newer than local file '...', skipping.). |
 
 ### **Notes**
 

@@ -679,7 +679,7 @@ mod tests {
         let header = "attachment; filename*=UTF-8''test%2";
         let dis = parse_content_disposition(header);
         // Should handle gracefully - the incomplete sequence is preserved
-        assert!(dis.params.get("filename").is_some());
+        assert!(dis.params.contains_key("filename"));
     }
 
     #[test]
@@ -688,7 +688,7 @@ mod tests {
         let header = "attachment; filename*=UTF-8''test%GG";
         let dis = parse_content_disposition(header);
         // Should handle gracefully
-        assert!(dis.params.get("filename").is_some());
+        assert!(dis.params.contains_key("filename"));
     }
 
     // --------------------------------------------------------------------------

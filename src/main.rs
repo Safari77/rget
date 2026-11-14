@@ -41,7 +41,7 @@ use std::{
     path::{Component, Path, PathBuf},
     process::ExitCode,
     sync::{
-        LazyLock,
+        Arc, LazyLock, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -54,12 +54,21 @@ use cap_std::{
 };
 use clap::{Parser, builder::TypedValueParser};
 use data_encoding::BASE32_NOPAD;
+use hickory_resolver::{
+    TokioResolver,
+    config::{QUAD9, ResolverConfig},
+    net::runtime::TokioRuntimeProvider,
+};
 use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
 use ipnet::{Ipv4Net, Ipv6Net};
 use regex::Regex;
 use reqwest::{
     Client, Identity, Response, StatusCode,
-    header::{HeaderMap, HeaderName, HeaderValue},
+    header::{
+        AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, COOKIE,
+        HeaderMap, HeaderName, HeaderValue, IF_MODIFIED_SINCE, LAST_MODIFIED, LOCATION,
+        PROXY_AUTHORIZATION, RANGE, STRICT_TRANSPORT_SECURITY,
+    },
 };
 use rustls::ClientConfig;
 use rustls_platform_verifier::BuilderVerifierExt;
@@ -83,21 +92,121 @@ use crate::{
 mod content_disposition;
 mod ratelimit;
 
-static BLOCKED_IPV4_NETS: LazyLock<[Ipv4Net; 5]> = LazyLock::new(|| {
+static DNS_RESOLVER: LazyLock<TokioResolver> = LazyLock::new(|| {
+    TokioResolver::builder_tokio().ok().and_then(|builder| builder.build().ok()).unwrap_or_else(
+        || {
+            TokioResolver::builder_with_config(
+                ResolverConfig::default(),
+                TokioRuntimeProvider::default(),
+            )
+            .build()
+            .expect("failed to initialize fallback DNS resolver")
+        },
+    )
+});
+
+static DOH_RESOLVER: OnceLock<TokioResolver> = OnceLock::new();
+
+static EMBEDDED_PSL_FST_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/embedded_psl.fst"));
+
+struct PslMatcher {
+    embedded_fst: Option<fst::raw::Fst<&'static [u8]>>,
+    dict_size: usize,
+}
+
+impl PslMatcher {
+    pub fn new() -> Self {
+        Self { embedded_fst: None, dict_size: 0 }.with_embedded_dictionary()
+    }
+
+    pub fn with_embedded_dictionary(mut self) -> Self {
+        if let Ok(raw_fst) = fst::raw::Fst::new(EMBEDDED_PSL_FST_BYTES) {
+            self.dict_size = raw_fst.len();
+            if self.dict_size > 0 {
+                self.embedded_fst = Some(raw_fst);
+            } else {
+                self.embedded_fst = None;
+            }
+        }
+        self
+    }
+
+    fn lookup_flags(&self, domain: &str) -> u64 {
+        let Some(ref raw) = self.embedded_fst else {
+            return 0;
+        };
+        raw.get(domain.as_bytes()).map_or(0, fst::raw::Output::value)
+    }
+
+    /// Returns `true` if `domain` (already normalized: lowercase, no trailing dot)
+    /// is a Public Suffix (e.g. `com`, `co.uk`, `foo.appspot.com` under `*.appspot.com`,
+    /// unless exempted by `!city.kawasaki.jp`).
+    pub fn is_public_suffix(&self, domain: &str) -> bool {
+        const PSL_EXACT: u64 = 1;
+        const PSL_WILDCARD: u64 = 2;
+        const PSL_EXCEPTION: u64 = 4;
+
+        if domain.is_empty() {
+            return false;
+        }
+        // Unlisted 1-label TLDs are always public suffixes per PSL §2 ("*" implicit rule)
+        if !domain.contains('.') {
+            return true;
+        }
+
+        let flags = self.lookup_flags(domain);
+        if (flags & PSL_EXCEPTION) != 0 {
+            return false;
+        }
+        if (flags & PSL_EXACT) != 0 {
+            return true;
+        }
+
+        // Check parent for "*.parent" wildcard rule
+        if let Some((_, parent)) = domain.split_once('.') {
+            let parent_flags = self.lookup_flags(parent);
+            if (parent_flags & PSL_WILDCARD) != 0 {
+                return true;
+            }
+        }
+
+        false
+    }
+}
+
+static PSL_MATCHER: LazyLock<PslMatcher> = LazyLock::new(PslMatcher::new);
+
+fn log_psl_debug(debug: bool) {
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if debug && !LOGGED.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "[DEBUG] HSTS: Public Suffix List loaded with {} entries from public_suffix_list.dat",
+            PSL_MATCHER.dict_size
+        );
+    }
+}
+
+static BLOCKED_IPV4_NETS: LazyLock<[Ipv4Net; 6]> = LazyLock::new(|| {
     [
-        // "This network" (RFC 6890): 0.0.0.0/8 - on Linux these
-        // addresses can reach localhost, a classic SSRF bypass
+        // "This network" (RFC 6890): 0.0.0.0/8
         "0.0.0.0/8".parse().expect("valid IPv4 CIDR"),
-        // Shared Address Space (RFC 6598): 100.64.0.0/10
+        // Shared Address Space / CGNAT (RFC 6598): 100.64.0.0/10
         "100.64.0.0/10".parse().expect("valid IPv4 CIDR"),
-        // IETF Protocol Assignments: 192.0.0.0/24
+        // IETF Protocol Assignments (RFC 6890): 192.0.0.0/24
         "192.0.0.0/24".parse().expect("valid IPv4 CIDR"),
+        // Deprecated 6to4 Relay Anycast (RFC 3068 / RFC 7526): 192.88.99.0/24
+        "192.88.99.0/24".parse().expect("valid IPv4 CIDR"),
         // Benchmarking (RFC 2544): 198.18.0.0/15
         "198.18.0.0/15".parse().expect("valid IPv4 CIDR"),
         // Reserved for future use (RFC 1112 §4): 240.0.0.0/4
         "240.0.0.0/4".parse().expect("valid IPv4 CIDR"),
     ]
 });
+
+// IPv4-translated IPv6 (RFC 2765 SIIT): ::ffff:0:a.b.c.d (::ffff:0:0:0/96)
+static IPV4_TRANSLATED_IPV6_NET: LazyLock<Ipv6Net> =
+    LazyLock::new(|| "::ffff:0:0:0/96".parse().expect("valid IPv6 CIDR"));
 
 static BLOCKED_IPV6_NETS: LazyLock<[Ipv6Net; 9]> = LazyLock::new(|| {
     [
@@ -145,6 +254,39 @@ static CURRENT_TEMP_PATH: std::sync::Mutex<Option<(Dir, PathBuf)>> = std::sync::
 
 // A cache to keep directory handles permanently open during the run
 type DirCache = std::collections::HashMap<PathBuf, Dir>;
+
+struct ResolvedTarget {
+    client: Client,
+    final_url: Url,
+    content_length: Option<u64>,
+    content_disposition: Option<String>,
+    last_modified: Option<String>,
+    same_host: bool,
+    /// Present when a 405 fallback GET ignored `Range: bytes=0-0` and returned a
+    /// full `200 OK` body stream — reusing it avoids aborting the socket and
+    /// wasting bandwidth.
+    prefetched_get: Option<Response>,
+}
+
+/// RAII guard that registers `(Dir, PathBuf)` in `CURRENT_TEMP_PATH` for the
+/// signal handler and guarantees it is cleared on all return paths (including `?`
+/// errors and panics).
+struct TempPathGuard;
+
+impl TempPathGuard {
+    fn arm(pinned_dir: Option<Dir>, temp_path: &Path) -> Self {
+        let mut guard = CURRENT_TEMP_PATH.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = pinned_dir.map(|d| (d, temp_path.to_path_buf()));
+        Self
+    }
+}
+
+impl Drop for TempPathGuard {
+    fn drop(&mut self) {
+        let mut guard = CURRENT_TEMP_PATH.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = None;
+    }
+}
 
 #[derive(Debug)]
 pub enum PermanentError {
@@ -447,11 +589,6 @@ impl std::fmt::Display for PermanentError {
     }
 }
 
-use reqwest::header::{
-    AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, COOKIE,
-    IF_MODIFIED_SINCE, LAST_MODIFIED, LOCATION, PROXY_AUTHORIZATION, RANGE,
-    STRICT_TRANSPORT_SECURITY,
-};
 impl std::error::Error for PermanentError {}
 
 /// Maximum number of redirects to follow
@@ -480,6 +617,24 @@ const MAX_EXTENSION_BYTES: usize = 20;
 /// - macOS: ~/Library/Application Support/rget/resumekey.conf
 /// - Windows: C:\Users\<User>\AppData\Roaming\rget\resumekey.conf
 const RESUME_KEY_FILENAME: &str = "resumekey.conf";
+
+/// HSTS database filename
+const HSTS_DB_FILENAME: &str = "hsts.json";
+
+/// Maximum number of HSTS entries retained in memory and persisted to disk.
+/// When an update would push the cache above this cap, the entries with the
+/// soonest expiry are evicted first (curl uses a comparable fixed cap).
+const MAX_HSTS_ENTRIES: usize = 5000;
+
+const VERSION_MESSAGE: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\nLicense: ",
+    env!("CARGO_PKG_LICENSE"),
+    "\nCopyright ",
+    env!("BUILD_YEAR"),
+    " ",
+    env!("CARGO_PKG_AUTHORS"),
+);
 
 /// Check if `io::Error` is ENAMETOOLONG or equivalent
 fn is_name_too_long(err: &std::io::Error) -> bool {
@@ -510,23 +665,44 @@ fn is_sync_ignorable(e: &std::io::Error) -> bool {
     }
 }
 
-/// HSTS database filename
-const HSTS_DB_FILENAME: &str = "hsts.json";
+/// Normalize a hostname by stripping brackets/trailing dots and ASCII-lowercasing.
+fn normalize_host(host: &str) -> String {
+    let bare = host.strip_prefix('[').and_then(|s| s.strip_suffix(']')).unwrap_or(host);
+    bare.strip_suffix('.').unwrap_or(bare).to_ascii_lowercase()
+}
 
-/// Maximum number of HSTS entries retained in memory and persisted to disk.
-/// When an update would push the cache above this cap, the entries with the
-/// soonest expiry are evicted first (curl uses a comparable fixed cap).
-const MAX_HSTS_ENTRIES: usize = 5000;
+fn get_doh_resolver(args: &Args) -> &'static TokioResolver {
+    DOH_RESOLVER.get_or_init(|| {
+        let mut name_servers = ResolverConfig::https(&QUAD9).name_servers().to_vec();
+        if args.ipv4_only {
+            name_servers.retain(|ns| ns.ip.is_ipv4());
+        } else if args.ipv6_only {
+            name_servers.retain(|ns| ns.ip.is_ipv6());
+        }
+        let config = ResolverConfig::from_name_servers(name_servers);
+        TokioResolver::builder_with_config(config, TokioRuntimeProvider::default())
+            .build()
+            .expect("failed to initialize Quad9 DoH resolver")
+    })
+}
 
-const VERSION_MESSAGE: &str = concat!(
-    env!("CARGO_PKG_VERSION"),
-    "\nLicense: ",
-    env!("CARGO_PKG_LICENSE"),
-    "\nCopyright ",
-    env!("BUILD_YEAR"),
-    " ",
-    env!("CARGO_PKG_AUTHORS"),
-);
+struct DohReqwestResolver;
+
+impl reqwest::dns::Resolve for DohReqwestResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let resolver = DOH_RESOLVER.get().expect("DOH_RESOLVER must be initialized");
+            let lookup = resolver
+                .lookup_ip(host)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+            let addrs: reqwest::dns::Addrs =
+                Box::new(lookup.into_iter().map(|ip| SocketAddr::new(ip, 0)));
+            Ok(addrs)
+        })
+    }
+}
 
 /// Secure file downloader - works like wget
 #[derive(Parser, Debug, Clone)]
@@ -575,10 +751,14 @@ struct Args {
     )]
     ipv6_only: bool,
 
-    /// Overwrite existing file without prompting; forces re-download even if the local file size matches Content-Length
+    /// Use DNS-over-HTTPS (Quad9 by default) for DNS resolution
+    #[arg(long = "doh", help = "Use DNS-over-HTTPS (Quad9) for DNS resolution")]
+    doh: bool,
+
+    /// Overwrite existing file without prompting; forces re-download even if the local file size matches Content-Length (unless -N/--newer is also set, in which case timestamp checks take precedence)
     #[arg(
         long = "overwrite",
-        help = "Overwrite existing file (forces re-download even when local size matches server's Content-Length)"
+        help = "Overwrite existing file (forces re-download unless -N/--newer is also specified)"
     )]
     overwrite: bool,
 
@@ -708,8 +888,12 @@ struct Args {
     #[arg(long = "no-hsts-update", help = "Disable HSTS database persistence and updates")]
     no_hsts_update: bool,
 
-    /// Download only if remote file is newer than local file
-    #[arg(short = 'N', long = "newer", help = "Download only if remote file is newer than local")]
+    /// Download only if remote file is newer than local file (takes precedence over --overwrite)
+    #[arg(
+        short = 'N',
+        long = "newer",
+        help = "Download only if remote file is newer than local (takes precedence over --overwrite)"
+    )]
     newer: bool,
 
     /// Do not send If-Modified-Since header in -N mode; send preliminary HEAD request instead
@@ -832,24 +1016,28 @@ fn try_hsts_upgrade(url: &mut Url, hsts_db: &HstsMap, args: &Args) -> Result<boo
     if !args.disable_hsts
         && url.scheme() == "http"
         && let Some(host) = url.host_str()
-        && check_hsts(hsts_db, host)
     {
-        if args.verbose {
-            eprintln!("HSTS: Upgrading insecure request to {host}");
+        log_psl_debug(args.debug);
+        if check_hsts(hsts_db, host) {
+            if args.verbose {
+                eprintln!("HSTS: Upgrading insecure request to {host}");
+            }
+            // RFC 6797 §8.3: when upgrading to https, an explicit port of 80
+            // MUST be converted to 443; any other explicit port is preserved;
+            // and if no explicit port is present, none is added. url::Url's
+            // set_scheme does not touch the port for us, so do it here.
+            // Both setters are fallible (e.g. cannot-be-a-base URLs): failing
+            // silently must NOT leave the request on http://, so error out.
+            if url.port() == Some(80) {
+                url.set_port(Some(443)).map_err(|()| {
+                    anyhow::anyhow!("HSTS upgrade: cannot set port 443 on '{url}'")
+                })?;
+            }
+            url.set_scheme("https").map_err(|()| {
+                anyhow::anyhow!("HSTS upgrade: cannot set scheme to https on '{url}'")
+            })?;
+            return Ok(true);
         }
-        // RFC 6797 §8.3: when upgrading to https, an explicit port of 80
-        // MUST be converted to 443; any other explicit port is preserved;
-        // and if no explicit port is present, none is added. url::Url's
-        // set_scheme does not touch the port for us, so do it here.
-        // Both setters are fallible (e.g. cannot-be-a-base URLs): failing
-        // silently must NOT leave the request on http://, so error out.
-        if url.port() == Some(80) {
-            url.set_port(Some(443))
-                .map_err(|()| anyhow::anyhow!("HSTS upgrade: cannot set port 443 on '{url}'"))?;
-        }
-        url.set_scheme("https")
-            .map_err(|()| anyhow::anyhow!("HSTS upgrade: cannot set scheme to https on '{url}'"))?;
-        return Ok(true);
     }
     Ok(false)
 }
@@ -911,56 +1099,53 @@ fn save_hsts_db(path: &Path, map: &HstsMap) {
 fn check_hsts(map: &HstsMap, host: &str) -> bool {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
 
-    // RFC 6797 §8.3 / §8.1.1: IP-literal hosts are never Known HSTS Hosts and
-    // cannot trigger an upgrade.
+    // RFC 6797 §8.3 / §8.1.1: IP-literal hosts are never Known HSTS Hosts.
     let bare = host.strip_prefix('[').and_then(|s| s.strip_suffix(']')).unwrap_or(host);
     if bare.parse::<IpAddr>().is_ok() {
         return false;
     }
 
-    // Normalize trailing dot ('example.com.' is the same FQDN as 'example.com').
-    let host = host.strip_suffix('.').unwrap_or(host);
-    if host.is_empty() {
+    let host_norm = normalize_host(host);
+    if host_norm.is_empty() {
         return false;
     }
 
-    // Check exact match
-    if let Some(entry) = map.get(host)
+    // Exact match is allowed even on a public suffix if the host itself set HSTS
+    // without superdomain expansion, unless you want to block PSL exact too;
+    // RFC 6797 allows exact host match, while superdomain matching MUST stop at PSL.
+    if let Some(entry) = map.get(&host_norm)
         && entry.expiry > now
     {
         return true;
     }
 
-    // Check superdomains if they have includeSubDomains set.
-    // Walk down stripping the leftmost label, but stop before the TLD
-    // (a 1-label "superdomain" is the TLD; no HSTS pinning happens there).
-    let mut parts: Vec<&str> = host.split('.').collect();
-    while parts.len() > 2 {
-        parts.remove(0); // Remove subdomain
-        let superdomain = parts.join(".");
-        if let Some(entry) = map.get(&superdomain)
+    // Walk superdomains, stopping as soon as a superdomain is a Public Suffix.
+    let mut rest = host_norm.as_str();
+    while let Some((_, superdomain)) = rest.split_once('.') {
+        if PSL_MATCHER.is_public_suffix(superdomain) {
+            break;
+        }
+        if let Some(entry) = map.get(superdomain)
             && entry.include_subdomains
             && entry.expiry > now
         {
             return true;
         }
+        rest = superdomain;
     }
 
     false
 }
 
 fn update_hsts(map: &mut HstsMap, url: &Url, headers: &HeaderMap, debug: bool) {
-    // HeaderMap::get returns the first value for repeated header names, which
-    // already satisfies RFC 6797 §8.1: "process only the first such header field".
     let Some(hsts_val) = headers.get(STRICT_TRANSPORT_SECURITY) else {
         return;
     };
     let Ok(hsts_str) = hsts_val.to_str() else {
         return;
     };
+    log_psl_debug(debug);
 
-    // RFC 6797 §8.1.1: an IP-literal authority MUST NOT be noted as an HSTS host.
-    // Url::host() returns a typed enum, distinguishing Domain from Ipv4/Ipv6 cleanly.
     let host_raw = match url.host() {
         Some(url::Host::Domain(d)) => d,
         Some(_) => {
@@ -972,15 +1157,11 @@ fn update_hsts(map: &mut HstsMap, url: &Url, headers: &HeaderMap, debug: bool) {
         None => return,
     };
 
-    // Strip a trailing dot so 'example.com.' and 'example.com' resolve to one entry.
-    let host = host_raw.strip_suffix('.').unwrap_or(host_raw);
+    let host = normalize_host(host_raw);
     if host.is_empty() {
         return;
     }
 
-    // RFC 6797 §6.1 rule 2: each directive MUST appear only once.
-    // RFC 6797 §6.1 rule 4: a header that does not conform to the syntax
-    // MUST be ignored in its entirety. Track duplicates and bail on a violation.
     let mut max_age: Option<u64> = None;
     let mut include_subdomains = false;
     let mut seen_max_age = false;
@@ -989,8 +1170,6 @@ fn update_hsts(map: &mut HstsMap, url: &Url, headers: &HeaderMap, debug: bool) {
     for part in hsts_str.split(';') {
         let part = part.trim();
         if part.is_empty() {
-            // An empty fragment between two ';'s is permitted by the ABNF
-            // [ directive ] *( ";" [ directive ] ); skip it.
             continue;
         }
 
@@ -1013,15 +1192,10 @@ fn update_hsts(map: &mut HstsMap, url: &Url, headers: &HeaderMap, debug: bool) {
                     return;
                 }
                 seen_max_age = true;
-                // RFC 6797 §6.1 grammar: directive-value = token | quoted-string.
-                // Strip one surrounding pair of double quotes if present.
                 let mut v = val.trim();
                 if v.len() >= 2 && v.starts_with('"') && v.ends_with('"') {
                     v = &v[1..v.len() - 1];
                 }
-                // max-age-value = 1*DIGIT (RFC 6797 §6.1.1). Parse strictly:
-                // u64::from_str would also accept a leading '+', which is not
-                // 1*DIGIT, so use the strict decimal parser instead.
                 if let Some(age) = parse_decimal(v) {
                     max_age = Some(age);
                 } else {
@@ -1031,14 +1205,9 @@ fn update_hsts(map: &mut HstsMap, url: &Url, headers: &HeaderMap, debug: bool) {
                     return;
                 }
             }
-            // Unknown directive with a value: RFC §6.1 rule 5 says ignore
-            // unrecognized directives but still process the recognized ones.
-        } else {
-            // Unknown valueless directive: ignore (RFC §6.1 rule 5).
         }
     }
 
-    // max-age is REQUIRED (RFC §6.1.1). Its absence makes the header malformed.
     let Some(age) = max_age else {
         if debug {
             eprintln!("[DEBUG] HSTS: max-age missing, ignoring header");
@@ -1046,25 +1215,27 @@ fn update_hsts(map: &mut HstsMap, url: &Url, headers: &HeaderMap, debug: bool) {
         return;
     };
 
-    // RFC 6797 §8.1: max-age=0 means delete the cached policy (or do not
-    // store one if it was not already present). The includeSubDomains
-    // directive is explicitly ignored in this case (RFC §6.1.1 NOTE).
     if age == 0 {
-        if map.remove(host).is_some() && debug {
+        if map.remove(&host).is_some() && debug {
             eprintln!("[DEBUG] HSTS: removed entry for '{host}' (max-age=0)");
         }
         return;
     }
 
+    // Never allow a Public Suffix (e.g. "co.uk" or "github.io") to assert
+    // includeSubDomains across unrelated tenants.
+    if include_subdomains && PSL_MATCHER.is_public_suffix(&host) {
+        if debug {
+            eprintln!("[DEBUG] HSTS: stripping includeSubDomains on public suffix '{host}'");
+        }
+        include_subdomains = false;
+    }
+
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     let expiry = now.saturating_add(age);
 
-    map.insert(host.to_string(), HstsEntry { expiry, include_subdomains });
+    map.insert(host.clone(), HstsEntry { expiry, include_subdomains });
 
-    // Cap the cache so a hostile actor controlling many subdomains cannot grow
-    // it without bound. When over the cap, evict the entries with the soonest
-    // expiry, but never evict the entry we just stored (otherwise a server with
-    // a small max-age could be silently dropped on every visit).
     if map.len() > MAX_HSTS_ENTRIES {
         let excess = map.len() - MAX_HSTS_ENTRIES;
         let mut by_expiry: Vec<(String, u64)> = map
@@ -1147,7 +1318,7 @@ fn build_tls_config(args: &Args) -> Result<Option<ClientConfig>> {
 
 /// Check whether a non-empty proxy environment variable is configured for `url`'s scheme.
 /// An empty value (e.g. `HTTP_PROXY=""`) is treated as unset so it neither bypasses
-/// `resolve_safe_ip` nor triggers a false `ProxyIpPolicyConflict`.
+/// `resolve_safe_ips` nor triggers a false `ProxyIpPolicyConflict`.
 fn is_env_proxy_configured(url: &Url, args: &Args) -> bool {
     if args.no_proxy {
         return false;
@@ -1177,36 +1348,33 @@ fn parse_unsatisfied_content_range(header_value: &str) -> Option<u64> {
 
 fn build_client(
     args: &Args,
-    resolve_override: Option<(&str, SocketAddr)>,
+    resolve_addrs: Option<(&str, &[SocketAddr])>,
     tls_config: &Option<ClientConfig>,
 ) -> Result<Client> {
     let mut builder = Client::builder()
         .use_rustls_tls()
-        .redirect(reqwest::redirect::Policy::none()) // Manual redirects
-        //.user_agent(args.user_agent.as_deref().unwrap_or(concat!(env!("CARGO_PKG_NAME"), "/1.0"))) // alternative
+        .hickory_dns(true)
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent(args.user_agent.as_deref().unwrap_or(concat!(
             env!("CARGO_PKG_NAME"),
             "/",
             env!("CARGO_PKG_VERSION")
         )))
-        // --timeout governs both the connection establishment phase and reads
-        // (waiting for response headers and each body read). The stream loop
-        // in write_response_to_file additionally enforces a per-chunk idle
-        // timer, which is redundant belt-and-braces for buffered streams.
         .connect_timeout(Duration::from_secs(args.timeout))
         .read_timeout(Duration::from_secs(args.timeout))
         .no_gzip()
         .no_brotli()
         .no_deflate();
 
-    // Handle Proxy
+    if args.doh {
+        let _ = get_doh_resolver(args);
+        builder = builder.dns_resolver(Arc::new(DohReqwestResolver));
+    }
     if args.no_proxy {
         builder = builder.no_proxy();
     }
 
-    // Handle Security & mTLS
     if args.insecure {
-        // Insecure Path: Allow invalid certs, use default identity handling
         builder = builder.danger_accept_invalid_certs(true).danger_accept_invalid_hostnames(true);
 
         if let (Some(cert_path), Some(key_path)) = (&args.cert, &args.key) {
@@ -1226,7 +1394,6 @@ fn build_client(
                 ))
             })?;
 
-            // Combine cert and key for reqwest/rustls identity (Identity::from_pem handles both)
             let mut combined_pem = cert_pem;
             combined_pem.push(b'\n');
             combined_pem.extend_from_slice(&key_pem);
@@ -1237,12 +1404,10 @@ fn build_client(
             builder = builder.identity(identity);
         }
     } else {
-        // Secure Path: reuse the pre-built TLS config (platform verifier + mTLS)
         let config = tls_config.as_ref().expect("secure mode requires cached TLS config");
         builder = builder.use_preconfigured_tls(config.clone());
     }
 
-    // Handle Custom Headers
     let mut headers = HeaderMap::new();
     if let Some(ref ref_url) = args.referer {
         if let Ok(val) = HeaderValue::from_str(ref_url) {
@@ -1251,11 +1416,6 @@ fn build_client(
             eprintln!("Warning: Invalid referer URL ignored");
         }
     }
-    // Credential-bearing headers (Authorization, Cookie, Proxy-Authorization) are
-    // deliberately NOT installed as client defaults: redirects are followed
-    // manually, so a default header would follow them to any host (and every
-    // JSON-listed host). They are attached per request instead, only when the
-    // target is the host the user named (see with_sensitive_headers).
     let (custom_headers, _) = parse_custom_headers(args, true);
     for (name, value) in &custom_headers {
         headers.insert(name.clone(), value.clone());
@@ -1264,9 +1424,9 @@ fn build_client(
         builder = builder.default_headers(headers);
     }
 
-    // Handle DNS Resolve-and-Override
-    if let Some((host, addr)) = resolve_override {
-        builder = builder.resolve(host, addr);
+    // Pass all safe resolved addresses so reqwest can fail over across healthy IPs
+    if let Some((host, addrs)) = resolve_addrs {
+        builder = builder.resolve_to_addrs(host, addrs);
     }
 
     builder
@@ -1341,14 +1501,17 @@ struct CredentialScope {
 impl CredentialScope {
     fn from_url(url: &Url) -> Option<Self> {
         url.host_str().map(|h| Self {
-            host: h.to_string(),
+            host: normalize_host(h),
             port: url.port_or_known_default(),
             require_https: url.scheme() == "https",
         })
     }
 
     fn allows(&self, url: &Url) -> bool {
-        if url.host_str() != Some(self.host.as_str()) {
+        let Some(target_host) = url.host_str() else {
+            return false;
+        };
+        if normalize_host(target_host) != self.host {
             return false;
         }
         if self.require_https && url.scheme() != "https" {
@@ -1409,30 +1572,11 @@ async fn resolve_final_url_and_client(
     tls_config: &Option<ClientConfig>,
     cred_scope: Option<&CredentialScope>,
     rl_tracker: &mut RateLimitTracker,
-) -> Result<(Client, Url, Option<u64>, Option<String>, Option<String>, bool)> {
-    // CLI policy: validate the URL the user actually supplied BEFORE any HSTS
-    // rewriting. Without this, 'http://example.com' would silently succeed
-    // whenever 'example.com' happens to be in the HSTS DB (the in-loop upgrade
-    // rewrites it to https:// before validate_url sees it) but fail otherwise --
-    // behaviour that depends on persistent state the user is not necessarily
-    // aware of. We require a user-supplied 'http://' URL to be paired with
-    // --insecure regardless of HSTS state. HSTS upgrade still applies to
-    // redirect targets returned by the server (handled inside the loop below),
-    // which preserves HSTS's anti-TLS-stripping purpose on redirect chains.
-    //
-    // In accordance with RFC 6797 §8.3, HSTS hosts automatically upgrade
-    // to HTTPS before validation, so try_hsts_upgrade runs first inside the loop.
-
-    // HTTP credentials (--user/--password and credential-bearing --header values)
-    // are only ever sent to the host/port in `cred_scope`.
+) -> Result<ResolvedTarget> {
     let mut current_url = initial_url;
     let mut redirect_count = 0;
 
     loop {
-        // HSTS Upgrade Check (RFC 6797 §8.3): Known HSTS hosts automatically rewrite
-        // http:// requests to https:// before emitting any traffic over the network.
-        // Running this before validate_url allows cached HSTS domains to be seamlessly
-        // upgraded without requiring the --insecure flag.
         try_hsts_upgrade(&mut current_url, hsts_db, args)?;
 
         if redirect_count >= MAX_REDIRECTS {
@@ -1441,7 +1585,6 @@ async fn resolve_final_url_and_client(
 
         validate_url(&current_url, args.insecure)?;
 
-        // Honor any active RateLimit / Retry-After window for this origin (§6, §7)
         rl_tracker.wait_before_request(&current_url, args).await;
 
         if args.verbose {
@@ -1449,9 +1592,6 @@ async fn resolve_final_url_and_client(
         }
 
         let client = if is_env_proxy_configured(&current_url, args) {
-            // A proxy resolves names and connects on its own, so resolve_safe_ip
-            // (and with it --no-private-ips, -4 and -6) is never consulted.
-            // Fail closed instead of silently dropping the requested policy.
             if args.no_private_ips || args.ipv4_only || args.ipv6_only {
                 let mut flags: Vec<&str> = Vec::new();
                 if args.no_private_ips {
@@ -1466,43 +1606,40 @@ async fn resolve_final_url_and_client(
                 return Err(PermanentError::ProxyIpPolicyConflict(flags.join(", ")).into());
             }
 
-            let cache_key = "__proxy_client__";
-            if let Some(cached_client) = client_cache.get(cache_key) {
+            let cache_key = format!("__proxy_{}__", current_url.scheme());
+            if let Some(cached_client) = client_cache.get(&cache_key) {
                 if args.verbose {
                     eprintln!("   Reusing connection via proxy");
                 }
                 cached_client.clone()
             } else {
                 let new_client = build_client(args, None, tls_config)?;
-                client_cache.insert(cache_key.to_string(), new_client.clone());
+                client_cache.insert(cache_key, new_client.clone());
                 new_client
             }
         } else {
-            let host = current_url.host_str().ok_or_else(|| anyhow::anyhow!("No host in URL"))?;
-
-            // Include port in cache key to separate HTTP (80) and HTTPS (443) clients
+            let host_raw =
+                current_url.host_str().ok_or_else(|| anyhow::anyhow!("No host in URL"))?;
+            let host_norm = normalize_host(host_raw);
             let port = current_url.port_or_known_default().unwrap_or(443);
-            let cache_key = format!("{host}:{port}");
+            let cache_key = format!("{}://{}:{}", current_url.scheme(), host_norm, port);
 
             if let Some(cached_client) = client_cache.get(&cache_key) {
                 if args.verbose {
-                    eprintln!("   Reusing connection for {host}");
+                    eprintln!("   Reusing connection for {host_raw}");
                 }
                 cached_client.clone()
             } else {
-                let safe_ip = resolve_safe_ip(&current_url, args).await?;
+                let safe_ips = resolve_safe_ips(&current_url, args).await?;
                 if !args.quiet {
-                    eprintln!("Connecting to {} ({})", host, safe_ip.ip());
+                    eprintln!("Connecting to {} ({})", host_raw, safe_ips[0].ip());
                 }
-                let new_client = build_client(args, Some((host, safe_ip)), tls_config)?;
+                let new_client = build_client(args, Some((host_raw, &safe_ips)), tls_config)?;
                 client_cache.insert(cache_key, new_client.clone());
                 new_client
             }
         };
 
-        // Only send credentials to the host/port the user named, never to a host
-        // reached through a redirect or listed in JSON, and never after an
-        // https -> http downgrade.
         let same_host = cred_scope.is_some_and(|scope| scope.allows(&current_url));
 
         let mut request = client.head(current_url.clone());
@@ -1523,16 +1660,16 @@ async fn resolve_final_url_and_client(
         rl_tracker.record_response(&current_url, response.headers(), args);
 
         if response.status() == StatusCode::METHOD_NOT_ALLOWED {
+            // Drain any small 405 body so the connection stays reusable for the GET probe
+            if response.content_length().is_some_and(|n| n <= 16 * 1024) {
+                let _ = response.bytes().await;
+            }
             if args.debug {
                 eprintln!(
                     "[DEBUG] HEAD status: 405 Method Not Allowed. Probing with GET (Range: bytes=0-0)..."
                 );
             }
             rl_tracker.wait_before_request(&current_url, args).await;
-            // Probe with a 1-byte ranged GET instead of a full-body GET: the
-            // URL is fetched again (with the real download) right after, so
-            // pulling the whole body here would double the transfer. The probe
-            // is only used for its headers.
             let mut get_request = client.get(current_url.clone()).header(RANGE, "bytes=0-0");
             if let Some(ref u) = args.user
                 && same_host
@@ -1550,16 +1687,12 @@ async fn resolve_final_url_and_client(
             && !args.insecure
             && current_url.scheme() == "https"
         {
-            // RFC 6797 §8.1: STS headers received over insecure (http) transport MUST be ignored;
-            // likewise, a TLS connection whose certificate was not verified
-            // (--insecure) must not seed the persistent HSTS database.
             update_hsts(hsts_db, &current_url, response.headers(), args.debug);
         }
 
         if args.debug {
             eprintln!("[DEBUG] HTTP version: {:#?} {}", response.version(), response.status());
             eprintln!("[DEBUG] All headers:");
-            // Sometimes Google CDN sends 'age: "0"' and no content-length or etag
             for (name, value) in response.headers() {
                 eprintln!("[DEBUG]   {name}: {value:?}");
             }
@@ -1574,6 +1707,10 @@ async fn resolve_final_url_and_client(
         let headers = response.headers().clone();
 
         if status.is_redirection() {
+            // Drain tiny redirect body if present so keep-alive can reuse the connection
+            if used_range_probe && response.content_length().is_some_and(|n| n <= 16 * 1024) {
+                let _ = response.bytes().await;
+            }
             let Some(location) = headers.get(LOCATION) else {
                 return Err(PermanentError::RedirectWithoutLocation(status.as_u16()).into());
             };
@@ -1588,11 +1725,6 @@ async fn resolve_final_url_and_client(
             continue;
         }
 
-        // When the 405 -> GET (Range: bytes=0-0) probe hits a 0-byte resource,
-        // RFC 9110 §14.1.2 / §14.4 requires the server to reply with 416 Range Not
-        // Satisfiable and `Content-Range: bytes */0`. Recognize that as a valid
-        // 0-byte resource rather than mistaking the 416 error body's Content-Length
-        // for the file size.
         let is_zero_byte_range_probe = used_range_probe
             && status == StatusCode::RANGE_NOT_SATISFIABLE
             && headers
@@ -1601,20 +1733,18 @@ async fn resolve_final_url_and_client(
                 .and_then(parse_unsatisfied_content_range)
                 == Some(0);
 
-        // If HEAD/probe itself was throttled (429 / 503 with Retry-After or RateLimit r=0)
-        // and --content-on-error is not set, fail immediately so the retry loop waits
-        // before sending the GET request.
         if (status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::SERVICE_UNAVAILABLE)
             && !args.content_on_error
         {
             return Err(handle_error_response(response, &current_url, args, rl_tracker).await);
         }
 
-        // Only extract resource metadata (Content-Length, Content-Disposition,
-        // Last-Modified) from successful responses (or a 0-byte 416 range probe).
-        // Error responses (4xx/5xx) carry the error page's Content-Length, which
-        // must never be treated as the target file size in download_file.
+        let mut prefetched_get = None;
+
         let (content_length, content_disposition, last_modified) = if is_zero_byte_range_probe {
+            if response.content_length().is_some_and(|n| n <= 16 * 1024) {
+                let _ = response.bytes().await;
+            }
             let cd = headers
                 .get(CONTENT_DISPOSITION)
                 .and_then(|v| v.to_str().ok())
@@ -1625,21 +1755,28 @@ async fn resolve_final_url_and_client(
                 .map(std::string::ToString::to_string);
             (Some(0), cd, lm)
         } else if status.is_success() {
-            // For a 206 response the Content-Length header is the *remaining* byte
-            // count, and the full resource size lives in Content-Range's
-            // complete-length field. This matters for the 405->GET probe above,
-            // which sends `Range: bytes=0-0` (its Content-Length would be 1).
             let cl = if status == StatusCode::PARTIAL_CONTENT {
+                // Drain the 1-byte probe body so HTTP/1.1 connection returns to pool!
+                if used_range_probe {
+                    let _ = response.bytes().await;
+                }
                 headers
                     .get(CONTENT_RANGE)
                     .and_then(|v| v.to_str().ok())
                     .and_then(parse_content_range_resp)
                     .and_then(|r| r.complete_length)
             } else {
-                headers
+                let len = headers
                     .get(CONTENT_LENGTH)
                     .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse::<u64>().ok())
+                    .and_then(|s| s.parse::<u64>().ok());
+                // Server ignored Range: bytes=0-0 and returned 200 OK with full stream:
+                // keep the open Response so download_file/fetch_json_body can consume it
+                // directly without dropping the connection!
+                if used_range_probe {
+                    prefetched_get = Some(response);
+                }
+                len
             };
             let cd = headers
                 .get(CONTENT_DISPOSITION)
@@ -1651,18 +1788,22 @@ async fn resolve_final_url_and_client(
                 .map(std::string::ToString::to_string);
             (cl, cd, lm)
         } else {
+            if used_range_probe && response.content_length().is_some_and(|n| n <= 16 * 1024) {
+                let _ = response.bytes().await;
+            }
             (None, None, None)
         };
 
         if status.is_success() || status.is_client_error() || status.is_server_error() {
-            return Ok((
+            return Ok(ResolvedTarget {
                 client,
-                current_url,
+                final_url: current_url,
                 content_length,
                 content_disposition,
                 last_modified,
                 same_host,
-            ));
+                prefetched_get,
+            });
         }
 
         bail!("Unexpected status code: {status}");
@@ -1677,7 +1818,7 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
     if args.debug {
         log_builder.filter_level(log::LevelFilter::Debug);
     }
-    log_builder.init();
+    let _ = log_builder.try_init();
 
     if let Some(ref input_path) = args.input_file {
         let reader: Box<dyn BufRead> = if input_path == "-" {
@@ -1690,14 +1831,12 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
         for line in reader.lines() {
             let line = line?;
             let trimmed = line.trim();
-            // Skip blank lines and '#' comment lines (a URL cannot start with '#')
             if !trimmed.is_empty() && !trimmed.starts_with('#') {
                 all_urls.push(trimmed.to_string());
             }
         }
     }
 
-    // Deduplicate URLs automatically if --output is not specified
     let urls: Vec<String> = if args.output.is_none() {
         let mut seen = HashSet::new();
         all_urls.iter().filter(|url| seen.insert(*url)).cloned().collect()
@@ -1712,17 +1851,14 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
         .into());
     }
 
-    // Validate --no-if-modified-since requires -N
     if args.no_if_modified_since && !args.newer {
         return Err(PermanentError::NoIfModifiedSinceWithoutNewer.into());
     }
 
-    // Validate --keep-extension requires --multiple-copies
     if args.keep_extension && !args.multiple_copies {
         return Err(PermanentError::KeepExtensionWithoutMultipleCopies.into());
     }
 
-    // Validate --filemode
     if let Some(ref mode_str) = args.filemode {
         match u32::from_str_radix(mode_str, 8) {
             Ok(m) if m <= 0o7777 => {},
@@ -1735,13 +1871,9 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
         }
     }
 
-    // Validate --json-parse requirements
     if args.json_parse && args.json_url_field.is_none() {
         return Err(PermanentError::JsonUrlFieldRequired.into());
     }
-    // -O points every JSON entry at a single filename: without --json-name-field
-    // all entries would collide on that one file (later entries failing with
-    // FileAlreadyExists, or silently overwriting with --overwrite).
     if args.json_parse && args.output.is_some() && args.json_name_field.is_none() {
         return Err(PermanentError::InvalidArguments(
             "--output (-O) with --json-parse requires --json-name-field (otherwise all entries would collide on one filename)".to_string(),
@@ -1751,7 +1883,6 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
     if args.json_verify_hash && args.json_hash_field.is_none() {
         return Err(PermanentError::JsonVerifyHashWithoutHashField.into());
     }
-    // --json-hash-field, --json-name-field, --json-size-field, --json-filter, --json-verify-hash imply --json-parse
     if (args.json_url_field.is_some()
         || args.json_hash_field.is_some()
         || args.json_name_field.is_some()
@@ -1765,12 +1896,6 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
         ).into());
     }
 
-    if let Err(e) = apply_security_sandbox() {
-        eprintln!("Failed to apply seccomp filter: {e}");
-        std::process::exit(1);
-    }
-
-    // Validate --output-dir: must exist and be a directory (never create it)
     if let Some(ref dir_str) = args.output_dir {
         let dir_path = Path::new(dir_str);
         match fs::metadata(dir_path) {
@@ -1794,13 +1919,6 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
         }
     }
 
-    // --output and --output-dir are mutually exclusive: -O already names the
-    // full destination path, so combining the two is ambiguous (and with
-    // '-O -' outright contradictory). Normally clap rejects this at parse time
-    // (conflicts_with on output_dir); this check is the safety net for Args
-    // built programmatically. NOTE: it deliberately runs on the top-level args
-    // only -- JSON mode sets entry_args.output from --json-name-field and does
-    // rely on --output-dir prefixing that name.
     if args.output_dir.is_some() && args.output.is_some() {
         return Err(PermanentError::InvalidArguments(
             "--output-dir cannot be used with --output (-O already specifies the full path)"
@@ -1814,23 +1932,17 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
     let mut overall_success = true;
     let max_retries = if args.retries == 0 { u64::MAX } else { args.retries };
 
-    // Track used output filenames for --multiple-copies
     let mut used_filenames: HashMap<PathBuf, u32> = HashMap::new();
     let mut dir_cache = DirCache::default();
 
-    // Pre-populate DirCache with --output-dir handle so all downloads reuse it
     if let Some(ref dir_str) = args.output_dir {
         let dir_path = Path::new(dir_str);
-
-        // Use standard Dir and standard Path
         let dir_handle = Dir::open_ambient_dir(dir_path, ambient_authority()).map_err(|e| {
             anyhow::anyhow!("Failed to open output directory '{}': {}", dir_path.display(), e)
         })?;
         dir_cache.insert(normalize_path_lexically(dir_path), dir_handle);
     }
 
-    // Build TLS config once (platform verifier + mTLS) and reuse for all clients.
-    // This avoids re-running rustls_platform_verifier for every new connection.
     let tls_config = build_tls_config(&args)?;
 
     for url_str in &urls {
@@ -1843,27 +1955,20 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
             },
         };
 
-        // HTTP credentials may only go to the host of the URL the user supplied
-        // (URLs listed in server-supplied JSON are not trusted with them).
         let cred_scope = CredentialScope::from_url(&url);
 
         if !args.quiet {
             eprintln!("Starting download: {url}");
         }
 
-        // JSON parse mode: fetch JSON, extract URLs, download them
         if args.json_parse {
             let mut attempt = 0;
             loop {
                 let current_args = args.clone();
-                // Snapshot the filename cache before the attempt — process_json_downloads
-                // mutates it as individual downloads succeed. Without this snapshot, a
-                // retry of the whole JSON flow would see successful entries' filenames
-                // as "used" and (with --multiple-copies) write numbered duplicates.
                 let mut attempt_used_filenames = used_filenames.clone();
 
                 let result = async {
-                    match resolve_final_url_and_client(
+                    let resolved = resolve_final_url_and_client(
                         url.clone(),
                         &current_args,
                         &mut client_cache,
@@ -1872,56 +1977,40 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                         cred_scope.as_ref(),
                         &mut rl_tracker,
                     )
-                    .await
-                    {
-                        Ok((
-                            client,
-                            final_url,
-                            _content_length,
-                            _content_disposition,
-                            _last_modified,
-                            send_auth,
-                        )) => {
-                            if current_args.verbose && final_url != url {
-                                eprintln!("Final URL: {final_url}");
-                            }
-                            process_json_downloads(
-                                &client,
-                                &final_url,
-                                &current_args,
-                                &mut client_cache,
-                                hsts_db,
-                                &mut attempt_used_filenames,
-                                &mut dir_cache,
-                                &tls_config,
-                                cred_scope.as_ref(),
-                                send_auth,
-                                &mut rl_tracker,
-                            )
-                            .await
-                        },
-                        Err(e) => Err(e),
+                    .await?;
+                    if current_args.verbose && resolved.final_url != url {
+                        eprintln!("Final URL: {}", resolved.final_url);
                     }
+                    process_json_downloads(
+                        &resolved.client,
+                        &resolved.final_url,
+                        resolved.prefetched_get,
+                        &current_args,
+                        &mut client_cache,
+                        hsts_db,
+                        &mut attempt_used_filenames,
+                        &mut dir_cache,
+                        &tls_config,
+                        cred_scope.as_ref(),
+                        resolved.same_host,
+                        &mut rl_tracker,
+                    )
+                    .await
                 }
                 .await;
 
                 match result {
                     Ok(()) => {
-                        // Commit the cache only on full success
                         used_filenames = attempt_used_filenames;
                         break;
                     },
                     Err(e) => {
-                        if is_permanent_error(&e) {
+                        if is_permanent_error(&e) || attempt >= max_retries {
                             eprintln!("Failed: {e:#}");
                             overall_success = false;
                             break;
                         }
-                        if attempt >= max_retries {
-                            eprintln!("Failed: {e:#}");
-                            overall_success = false;
-                            break;
-                        }
+                        client_cache.clear();
                         eprintln!(
                             "Error: {}. Retrying (attempt {}/{})...",
                             e,
@@ -1948,14 +2037,8 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
             continue;
         }
 
-        // Normal (non-JSON) download mode
         let mut attempt = 0;
-        // Output path and counter state pinned by the first attempt; retries
-        // reuse it so the auto-set resume flag cannot re-route the download into
-        // a different pre-existing file (see download_file).
         let mut resolved_output: Option<PinnedOutput> = None;
-        // Set by download_file once an attempt reaches the point of opening the
-        // destination (or its temp file).
         let mut dest_touched = false;
 
         loop {
@@ -1963,12 +2046,10 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
             if attempt > 0 && dest_touched {
                 current_args.resume = true;
             }
-            // 1. Snapshot the cache before the attempt begins
             let mut attempt_used_filenames = used_filenames.clone();
 
-            // Pass the cache to be used/updated
             let result = async {
-                match resolve_final_url_and_client(
+                let resolved = resolve_final_url_and_client(
                     url.clone(),
                     &current_args,
                     &mut client_cache,
@@ -1977,69 +2058,54 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                     cred_scope.as_ref(),
                     &mut rl_tracker,
                 )
-                .await
-                {
-                    Ok((
-                        client,
-                        final_url,
-                        content_length,
-                        content_disposition,
-                        last_modified,
-                        send_auth,
-                    )) => {
-                        if current_args.verbose && final_url != url {
-                            eprintln!("Final URL: {final_url}");
-                        }
+                .await?;
 
-                        if let (Some(max), Some(size)) = (current_args.max_size, content_length)
-                            && size > max
-                        {
-                            return Err(PermanentError::FileSizeExceedsLimit {
-                                size,
-                                max,
-                                url: final_url.to_string(),
-                            }
-                            .into());
-                        }
-                        download_file(
-                            &client,
-                            &final_url,
-                            &current_args,
-                            content_length,
-                            content_disposition.as_deref(),
-                            last_modified.as_deref(),
-                            &mut attempt_used_filenames,
-                            None,
-                            &mut dir_cache,
-                            &mut resolved_output,
-                            &mut dest_touched,
-                            send_auth,
-                            &mut rl_tracker,
-                        )
-                        .await
-                    },
-                    Err(e) => Err(e),
+                if current_args.verbose && resolved.final_url != url {
+                    eprintln!("Final URL: {}", resolved.final_url);
                 }
+
+                if let (Some(max), Some(size)) = (current_args.max_size, resolved.content_length)
+                    && size > max
+                {
+                    return Err(PermanentError::FileSizeExceedsLimit {
+                        size,
+                        max,
+                        url: resolved.final_url.to_string(),
+                    }
+                    .into());
+                }
+                download_file(
+                    &resolved.client,
+                    &resolved.final_url,
+                    resolved.prefetched_get,
+                    &current_args,
+                    resolved.content_length,
+                    resolved.content_disposition.as_deref(),
+                    resolved.last_modified.as_deref(),
+                    &mut attempt_used_filenames,
+                    None,
+                    &mut dir_cache,
+                    &mut resolved_output,
+                    &mut dest_touched,
+                    resolved.same_host,
+                    &mut rl_tracker,
+                )
+                .await
             }
             .await;
 
             match result {
                 Ok(()) => {
-                    // 3. Commit the cache ONLY if the download was successful
                     used_filenames = attempt_used_filenames;
                     break;
                 },
                 Err(e) => {
-                    if is_permanent_error(&e) {
+                    if is_permanent_error(&e) || attempt >= max_retries {
                         eprintln!("Failed to download {url}: {e:#}");
                         overall_success = false;
                         break;
                     }
-                    if attempt >= max_retries {
-                        eprintln!("Failed to download {url}: {e:#}");
-                        overall_success = false;
-                        break;
-                    }
+                    client_cache.clear();
                     eprintln!(
                         "Error: {}. Retrying (attempt {}/{})...",
                         e,
@@ -2052,10 +2118,6 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
                     );
                     attempt += 1;
 
-                    // If the error carried a RateLimit / Retry-After wait,
-                    // rl_tracker has already recorded the exact deadline and
-                    // wait_before_request will honor it on the next iteration;
-                    // otherwise apply standard exponential backoff: 2^attempt (capped at 64s).
                     if extract_ratelimit_wait(&e).is_none() {
                         let delay = 1u64 << attempt.clamp(0, 6);
                         sleep(Duration::from_secs(delay)).await;
@@ -2143,6 +2205,16 @@ fn resolve_output_path(original_path: &Path) -> Result<PathBuf> {
 }
 
 fn is_private_ip(ip: &IpAddr) -> bool {
+    let extract_tail_ipv4 = |ipv6: &Ipv6Addr| -> Ipv4Addr {
+        let s = ipv6.segments();
+        Ipv4Addr::new(
+            (s[6] >> 8) as u8,
+            (s[6] & 0xFF) as u8,
+            (s[7] >> 8) as u8,
+            (s[7] & 0xFF) as u8,
+        )
+    };
+
     match ip {
         IpAddr::V4(ipv4) => {
             ipv4.is_loopback()
@@ -2151,35 +2223,89 @@ fn is_private_ip(ip: &IpAddr) -> bool {
                 || ipv4.is_broadcast()
                 || ipv4.is_unspecified()
                 || ipv4.is_documentation()
-                // Multicast (RFC 5771): 224.0.0.0/4
                 || ipv4.is_multicast()
                 || BLOCKED_IPV4_NETS.iter().any(|net| net.contains(ipv4))
         },
         IpAddr::V6(ipv6) => {
             ipv6.is_loopback()
                 || ipv6.is_unspecified()
-                // Multicast: ff00::/8
                 || ipv6.is_multicast()
                 || BLOCKED_IPV6_NETS.iter().any(|net| net.contains(ipv6))
-                // 6to4: 2002::/16 - embeds IPv4 address, check if embedded IP is private
+                // 6to4: 2002::/16 - embeds IPv4 in bits 16..48
                 || is_6to4_private(ipv6)
-                // NAT64: 64:ff9b::/96 (RFC 6052) embeds IPv4; 64:ff9b:1::/48 (RFC 8215)
+                // NAT64: 64:ff9b::/96 (RFC 6052) and 64:ff9b:1::/48 (RFC 8215)
                 || is_nat64_private(ipv6)
-                // IPv4-mapped IPv6: ::ffff:x.x.x.x
+                // IPv4-mapped IPv6 (RFC 4291 §2.5.5.2): ::ffff:a.b.c.d
                 || ipv6
                     .to_ipv4_mapped()
                     .is_some_and(|v4| is_private_ip(&IpAddr::V4(v4)))
-                // IPv4-compatible IPv6 (deprecated RFC 4291 §2.5.5.1): ::x.x.x.x
+                // IPv4-translated IPv6 (RFC 2765 SIIT): ::ffff:0:a.b.c.d (::ffff:0:0/96)
+                || (IPV4_TRANSLATED_IPV6_NET.contains(ipv6)
+                    && is_private_ip(&IpAddr::V4(extract_tail_ipv4(ipv6))))
+                // IPv4-compatible IPv6 (deprecated RFC 4291 §2.5.5.1): ::a.b.c.d (::/96)
                 || (IPV4_COMPAT_IPV6_NET.contains(ipv6)
                     && !ipv6.is_unspecified()
                     && !ipv6.is_loopback()
-                    && is_private_ip(&IpAddr::V4(Ipv4Addr::new(
-                        (ipv6.segments()[6] >> 8) as u8,
-                        (ipv6.segments()[6] & 0xff) as u8,
-                        (ipv6.segments()[7] >> 8) as u8,
-                        (ipv6.segments()[7] & 0xff) as u8,
-                    ))))
+                    && is_private_ip(&IpAddr::V4(extract_tail_ipv4(ipv6))))
+                // ISATAP (RFC 5214): interface identifier 0000:5efe:a.b.c.d or 0200:5efe:a.b.c.d
+                || ((ipv6.segments()[4] & 0xfdff) == 0x0000
+                    && ipv6.segments()[5] == 0x5efe
+                    && is_private_ip(&IpAddr::V4(extract_tail_ipv4(ipv6))))
         },
+    }
+}
+
+/// Resolve DNS via Hickory DNS (pure Rust, works on Linux/macOS/Windows)
+/// to enforce SSRF protection, DNS rebinding protection, and IP family rules.
+async fn resolve_safe_ips(url: &Url, args: &Args) -> Result<Vec<SocketAddr>> {
+    let port = url.port_or_known_default().unwrap_or(443);
+
+    let make_error = |host_str: &str| {
+        if args.ipv4_only {
+            PermanentError::NoSafeIpv4(host_str.to_string()).into()
+        } else if args.ipv6_only {
+            PermanentError::NoSafeIpv6(host_str.to_string()).into()
+        } else {
+            PermanentError::NoSafePublicIp(host_str.to_string()).into()
+        }
+    };
+
+    match url.host() {
+        Some(url::Host::Domain(host_str)) => {
+            let resolver = if args.doh {
+                if args.debug {
+                    eprintln!("[DEBUG] DNS: Resolving '{host_str}' via DoH (Quad9)");
+                }
+                get_doh_resolver(args)
+            } else {
+                if args.debug {
+                    eprintln!("[DEBUG] DNS: Resolving '{host_str}' via standard DNS");
+                }
+                &DNS_RESOLVER
+            };
+
+            let lookup = resolver
+                .lookup_ip(host_str)
+                .await
+                .with_context(|| format!("Failed to resolve hostname '{host_str}'"))?;
+
+            let safe_addrs: Vec<SocketAddr> = lookup
+                .iter()
+                .map(|ip| SocketAddr::new(ip, port))
+                .filter(|sa| is_ip_allowed(sa, args))
+                .collect();
+
+            if safe_addrs.is_empty() { Err(make_error(host_str)) } else { Ok(safe_addrs) }
+        },
+        Some(url::Host::Ipv4(addr)) => {
+            let sa = SocketAddr::new(IpAddr::V4(addr), port);
+            if is_ip_allowed(&sa, args) { Ok(vec![sa]) } else { Err(make_error(&addr.to_string())) }
+        },
+        Some(url::Host::Ipv6(addr)) => {
+            let sa = SocketAddr::new(IpAddr::V6(addr), port);
+            if is_ip_allowed(&sa, args) { Ok(vec![sa]) } else { Err(make_error(&addr.to_string())) }
+        },
+        None => Err(anyhow::anyhow!("URL has no host")),
     }
 }
 
@@ -2241,52 +2367,6 @@ fn is_ip_allowed(addr: &SocketAddr, args: &Args) -> bool {
     }
 
     true
-}
-
-/// Resolve DNS manually to handle SSRF protection, DNS rebinding, and IP version enforcement
-async fn resolve_safe_ip(url: &Url, args: &Args) -> Result<SocketAddr> {
-    let port = url.port_or_known_default().unwrap_or(443);
-
-    // Helper to generate consistent error messages
-    let make_error = |host_str: &str| {
-        if args.ipv4_only {
-            PermanentError::NoSafeIpv4(host_str.to_string()).into()
-        } else if args.ipv6_only {
-            PermanentError::NoSafeIpv6(host_str.to_string()).into()
-        } else {
-            PermanentError::NoSafePublicIp(host_str.to_string()).into()
-        }
-    };
-
-    match url.host() {
-        // 1. Handle Domain Names (DNS Lookup)
-        Some(url::Host::Domain(host_str)) => {
-            let addrs = tokio::net::lookup_host((host_str, port))
-                .await
-                .context("Failed to resolve hostname")?;
-
-            for addr in addrs {
-                if is_ip_allowed(&addr, args) {
-                    return Ok(addr);
-                }
-            }
-            Err(make_error(host_str))
-        },
-
-        // 2. Handle IPv4 Literals directly (No DNS)
-        Some(url::Host::Ipv4(addr)) => {
-            let sa = SocketAddr::new(std::net::IpAddr::V4(addr), port);
-            if is_ip_allowed(&sa, args) { Ok(sa) } else { Err(make_error(&addr.to_string())) }
-        },
-
-        // 3. Handle IPv6 Literals directly
-        Some(url::Host::Ipv6(addr)) => {
-            let sa = SocketAddr::new(std::net::IpAddr::V6(addr), port);
-            if is_ip_allowed(&sa, args) { Ok(sa) } else { Err(make_error(&addr.to_string())) }
-        },
-
-        None => Err(anyhow::anyhow!("URL has no host")),
-    }
 }
 
 /// Parse Content-Disposition header and extract filename if valid.
@@ -2697,6 +2777,14 @@ fn percent_f64(part: u64, total: u64) -> f64 {
 /// Inspect existing `output_info` (checked first) and `temp_info` (checked second)
 /// to decide whether the download is already complete, prohibited by conflict rules,
 /// or should proceed from `start_byte` (with or without `force_truncate`).
+///
+/// Precedence rules when `--overwrite` is combined with `-N` (`--newer`):
+/// - `-N` takes precedence over `--overwrite`: timestamp checks (`If-Modified-Since`
+///   or `HEAD` `Last-Modified`) are still performed, and if the remote file is not
+///   newer (and local size matches `Content-Length`), the download is skipped.
+/// - When `-N` and `-c` (`--continue`) are both active alongside `--overwrite`,
+///   partial downloads (direct or `--temp`) are resumed rather than truncated, and
+///   completed files are checked against the server's `Last-Modified` timestamp.
 fn evaluate_local_target(
     output_path: &Path,
     temp_path: Option<&Path>,
@@ -2708,91 +2796,96 @@ fn evaluate_local_target(
     expected_sha256: Option<&str>,
     dir_cache: &mut DirCache,
 ) -> Result<LocalTargetAction> {
-    // 1. Handle -N (--newer) mode when the destination file already exists on disk.
+    // When -N (--newer) is active, it takes precedence over --overwrite so that
+    // `rget --overwrite -N` and `rget --overwrite -c -N` still honor timestamp
+    // checks and partial resume rather than forcing an unconditional re-download.
+    let force_overwrite = args.overwrite && !args.newer;
+
     let mut newer_forces_restart = false;
     if args.newer
         && let Some(out_info) = output_info
     {
-        if args.no_if_modified_since {
-            // --no-if-modified-since: Use the HEAD/GET response's Last-Modified
-            if let Some(lm_str) = last_modified
-                && let Some(server_time) = parse_http_date(lm_str)
-            {
-                if let Some(local_mtime) = out_info.modified {
-                    if server_time <= local_mtime {
-                        // Check if local file size matches expected server size (if known)
-                        if let Some(total) = expected_length {
-                            if out_info.is_regular && out_info.size == total {
-                                if !args.quiet {
-                                    eprintln!(
-                                        "Server file is not newer than local file '{}', skipping.",
-                                        output_path.display()
-                                    );
-                                }
-                                if let Some(expected) = expected_sha256 {
-                                    verify_sha256_file(
-                                        output_path,
-                                        expected,
-                                        args.quiet,
-                                        dir_cache,
-                                    )?;
-                                }
-                                return Ok(LocalTargetAction::AlreadyComplete);
-                            }
-                            if args.verbose {
-                                eprintln!(
-                                    "Local file size ({}) differs from server ({}), downloading entire file.",
-                                    HumanBytes(out_info.size),
-                                    HumanBytes(total)
-                                );
-                            }
-                            newer_forces_restart = true;
-                        } else {
-                            if !args.quiet {
-                                eprintln!(
-                                    "Server file is not newer than local file '{}', skipping.",
-                                    output_path.display()
-                                );
-                            }
-                            return Ok(LocalTargetAction::AlreadyComplete);
+        // Check HEAD Last-Modified whenever it is available (both with --no-if-modified-since
+        // and in standard -N mode when HEAD provided Last-Modified + Content-Length).
+        // If HEAD did not provide Last-Modified (or Content-Length when needed), standard -N
+        // mode falls through to send If-Modified-Since on the GET request.
+        if let Some(lm_str) = last_modified
+            && let Some(server_time) = parse_http_date(lm_str)
+            && let Some(local_mtime) = out_info.modified
+        {
+            if server_time <= local_mtime {
+                if let Some(total) = expected_length {
+                    if out_info.is_regular && out_info.size == total {
+                        if !args.quiet {
+                            eprintln!(
+                                "Server file is not newer than local file '{}', skipping.",
+                                output_path.display()
+                            );
                         }
-                    } else {
+                        if let Some(expected) = expected_sha256 {
+                            verify_sha256_file(output_path, expected, args.quiet, dir_cache)?;
+                        }
+                        return Ok(LocalTargetAction::AlreadyComplete);
+                    }
+                    // If --continue is also set and local file is smaller, let resume
+                    // logic below pick up from out_info.size instead of restarting at 0!
+                    if !(args.resume && out_info.is_regular && out_info.size < total) {
                         if args.verbose {
                             eprintln!(
-                                "Server file is newer than local file, proceeding with download."
+                                "Local file size ({}) differs from server ({}), downloading entire file.",
+                                HumanBytes(out_info.size),
+                                HumanBytes(total)
                             );
                         }
                         newer_forces_restart = true;
                     }
-                } else {
+                } else if args.no_if_modified_since {
+                    // Without Content-Length from HEAD, --no-if-modified-since trusts mtime alone;
+                    // standard -N mode falls through to send If-Modified-Since on GET.
+                    if !args.quiet {
+                        eprintln!(
+                            "Server file is not newer than local file '{}', skipping.",
+                            output_path.display()
+                        );
+                    }
+                    return Ok(LocalTargetAction::AlreadyComplete);
+                } else if !args.resume {
                     newer_forces_restart = true;
                 }
             } else {
-                if args.debug {
-                    eprintln!(
-                        "[DEBUG] -N --no-if-modified-since: No Last-Modified from HEAD, proceeding with download"
-                    );
+                if args.verbose {
+                    eprintln!("Server file is newer than local file, proceeding with download.");
                 }
+                if !(args.resume
+                    && out_info.is_regular
+                    && expected_length.is_some_and(|total| out_info.size < total))
+                {
+                    newer_forces_restart = true;
+                }
+            }
+        } else if args.no_if_modified_since {
+            if args.debug {
+                eprintln!(
+                    "[DEBUG] -N --no-if-modified-since: No Last-Modified from HEAD, proceeding with download"
+                );
+            }
+            if !args.resume {
                 newer_forces_restart = true;
             }
-        } else {
-            // In -N mode with If-Modified-Since, never send a partial Range header
-            // for the existing local file; if the server reports the file was
-            // modified (200 OK), we replace it from byte 0.
+        } else if !args.resume {
+            // Wget behavior: force byte-0 If-Modified-Since check on GET when HEAD lacked
+            // Last-Modified or local file has no mtime, and we are not resuming (--continue).
             newer_forces_restart = true;
         }
     }
 
-    // 2. Check output_info BEFORE temp_info so an already-complete output file
-    // is detected immediately (even in --temp --continue mode).
     if let Some(out_info) = output_info {
         let existing_size = out_info.size;
 
-        // --continue: skip if server file is smaller than local
         if out_info.is_regular
             && args.resume
-            && !args.newer
-            && !args.overwrite
+            && !newer_forces_restart
+            && !force_overwrite
             && let Some(total) = expected_length
             && existing_size > total
         {
@@ -2806,30 +2899,55 @@ fn evaluate_local_target(
             return Ok(LocalTargetAction::AlreadyComplete);
         }
 
-        // Check if file is already complete (when we know expected size)
         if out_info.is_regular
             && let Some(total) = expected_length
             && existing_size >= total
             && !args.newer
-            && !args.overwrite
+            && !force_overwrite
         {
             if !args.quiet {
                 eprintln!("File already fully downloaded.");
             }
-            // --json-verify-hash must still check a pre-existing file
             if let Some(expected) = expected_sha256 {
                 verify_sha256_file(output_path, expected, args.quiet, dir_cache)?;
             }
             return Ok(LocalTargetAction::AlreadyComplete);
         }
 
-        // Output file exists but is incomplete (or unknown size)
+        // In -N -c mode where local file size already equals expected_length, check mtime via
+        // HEAD Last-Modified if available or fall through to fresh GET if needed.
+        // Note: -N takes precedence over --overwrite here, so `!force_overwrite` is always true.
+        if out_info.is_regular
+            && args.newer
+            && args.resume
+            && !newer_forces_restart
+            && !force_overwrite
+            && let Some(total) = expected_length
+            && existing_size == total
+        {
+            if let (Some(lm_str), Some(local_mtime)) = (last_modified, out_info.modified)
+                && let Some(server_time) = parse_http_date(lm_str)
+                && server_time <= local_mtime
+            {
+                if !args.quiet {
+                    eprintln!(
+                        "Server file is not newer than local file '{}', skipping.",
+                        output_path.display()
+                    );
+                }
+                if let Some(expected) = expected_sha256 {
+                    verify_sha256_file(output_path, expected, args.quiet, dir_cache)?;
+                }
+                return Ok(LocalTargetAction::AlreadyComplete);
+            }
+            newer_forces_restart = true;
+        }
+
         if !args.resume && !args.overwrite && !args.newer {
             return Err(PermanentError::FileAlreadyExists(output_path.to_path_buf()).into());
         }
     }
 
-    // 3. Temp mode: check temp_info for resume or finalization
     if let Some(tp) = temp_path {
         if newer_forces_restart {
             return Ok(LocalTargetAction::Proceed { start_byte: 0, force_truncate: true });
@@ -2837,7 +2955,7 @@ fn evaluate_local_target(
 
         if let Some(t_info) = temp_info
             && args.resume
-            && !args.overwrite
+            && !force_overwrite
             && t_info.is_regular
         {
             let start_byte = t_info.size;
@@ -2848,7 +2966,6 @@ fn evaluate_local_target(
                 );
             }
             if let Some(total) = expected_length {
-                // --continue: skip if server file is smaller than local
                 if start_byte > total {
                     if !args.quiet {
                         eprintln!(
@@ -2866,14 +2983,9 @@ fn evaluate_local_target(
                             tp.display()
                         );
                     }
-                    // Verify before finalizing: a temp file left behind by an
-                    // earlier run (e.g. after a failed verification with
-                    // --keep-temp) must not be promoted unchecked.
                     if let Some(expected) = expected_sha256 {
                         verify_sha256_file(tp, expected, args.quiet, dir_cache)?;
                     }
-                    // Set mtime on the temp file BEFORE atomic rename so the
-                    // destination path is published with its final timestamp.
                     if args.server_timestamps {
                         apply_server_timestamp(tp, last_modified, args.debug, dir_cache);
                     }
@@ -2885,7 +2997,7 @@ fn evaluate_local_target(
                         "Resuming temp file '{}' from byte {} ({:.1}%)",
                         tp.display(),
                         start_byte,
-                        (start_byte as f64 / total as f64) * 100.0
+                        percent_f64(start_byte, total)
                     );
                     eprintln!("Remaining to download: {}", HumanBytes(total - start_byte));
                 }
@@ -2893,9 +3005,7 @@ fn evaluate_local_target(
                 eprintln!("Resuming temp file '{}' from byte {}", tp.display(), start_byte);
             }
             return Ok(LocalTargetAction::Proceed { start_byte, force_truncate: false });
-        } else if temp_info.is_some() && !args.resume && !args.overwrite {
-            // Temp file exists but --continue not specified
-            // We'll overwrite it since it's our temp file
+        } else if temp_info.is_some() && !args.resume && !force_overwrite {
             if !args.quiet {
                 eprintln!(
                     "Existing temp file '{}' found, starting fresh (use --continue to resume)",
@@ -2904,25 +3014,22 @@ fn evaluate_local_target(
             }
         } else if args.debug {
             eprintln!(
-                "[DEBUG] Temp file state: Exists={}, Resume={}, Overwrite={}. Start Byte: 0",
+                "[DEBUG] Temp file state: Exists={}, Resume={}, Overwrite={} (ForceOverwrite={}). Start Byte: 0",
                 temp_info.is_some(),
                 args.resume,
-                args.overwrite
+                args.overwrite,
+                force_overwrite
             );
         }
 
         return Ok(LocalTargetAction::Proceed { start_byte: 0, force_truncate: false });
     }
 
-    // 4. Non-temp mode: determine resume offset on output_path
     if let Some(out_info) = output_info {
         if newer_forces_restart {
-            // -N mode: when server is newer (or checked via If-Modified-Since),
-            // reset start_byte = 0 and force_truncate = true so -N -c replaces the file.
             return Ok(LocalTargetAction::Proceed { start_byte: 0, force_truncate: true });
         }
-        if args.resume && !args.overwrite && out_info.is_regular {
-            // --continue flag: resume from existing position
+        if args.resume && !force_overwrite && out_info.is_regular {
             let start_byte = out_info.size;
             if let Some(total) = expected_length {
                 if !args.quiet {
@@ -2937,7 +3044,6 @@ fn evaluate_local_target(
             }
             return Ok(LocalTargetAction::Proceed { start_byte, force_truncate: false });
         }
-        // If --overwrite is set, we fall through and truncate the file
     }
 
     Ok(LocalTargetAction::Proceed { start_byte: 0, force_truncate: false })
@@ -3269,7 +3375,12 @@ fn perform_atomic_move(
     args: &Args,
     cache: &mut DirCache,
 ) -> Result<PathBuf, anyhow::Error> {
-    // Internal helper to perform the move using Dir handles
+    // Only explicit --overwrite (or -N when updating an existing file, which sets
+    // effective_args.overwrite = true) may replace an existing destination file.
+    // --continue (args.resume) or transient auto-retries in --temp mode MUST NOT
+    // disable atomic no-clobber TOCTOU protection on target_path!
+    let allow_overwrite = args.overwrite;
+
     let try_move = |src: &Path, dst: &Path, cache: &mut DirCache| -> std::io::Result<()> {
         let parent_from = safe_parent(src);
         let parent_to = safe_parent(dst);
@@ -3280,32 +3391,21 @@ fn perform_atomic_move(
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "Missing destination filename")
         })?;
 
-        // Populate cache sequentially so mutable borrows don't overlap
         let _ = get_cached_dir(cache, parent_from)?;
         let _ = get_cached_dir(cache, parent_to)?;
 
         let key_from = normalize_path_lexically(parent_from);
         let key_to = normalize_path_lexically(parent_to);
 
-        // Now borrow immutably concurrently
         let dir_from = cache.get(&key_from).unwrap();
         let dir_to = cache.get(&key_to).unwrap();
 
-        let overwrite_or_resume = args.overwrite || args.resume;
-
-        // ─── LINUX FAST-PATH (excluding Android) ───────────────────────────
-        // Use rustix for RENAME_NOREPLACE via cap-std file descriptors.
-        // Android is excluded because its FUSE layer and SELinux policies
-        // make renameat2 behavior inconsistent and hard_link unreliable.
         #[cfg(all(target_os = "linux", not(target_os = "android")))]
         {
             use std::os::fd::AsFd;
 
             use rustix::fs::RenameFlags;
 
-            // Always attempt NOREPLACE first — it's the only truly atomic
-            // no-clobber primitive. Even when overwriting, trying NOREPLACE
-            // first gives us an atomic "target doesn't exist" confirmation.
             let noreplace_result = rustix::fs::renameat_with(
                 dir_from.as_fd(),
                 file_from,
@@ -3316,9 +3416,7 @@ fn perform_atomic_move(
 
             match noreplace_result {
                 Ok(()) => return Ok(()),
-
-                // Target exists: if overwrite is allowed, retry with plain rename
-                Err(rustix::io::Errno::EXIST) if overwrite_or_resume => {
+                Err(rustix::io::Errno::EXIST) if allow_overwrite => {
                     match rustix::fs::renameat_with(
                         dir_from.as_fd(),
                         file_from,
@@ -3330,36 +3428,23 @@ fn perform_atomic_move(
                         Err(e) => return Err(std::io::Error::from(e)),
                     }
                 },
-
-                // Target exists but overwrite not allowed → propagate AlreadyExists
                 Err(rustix::io::Errno::EXIST) => {
                     return Err(std::io::Error::from(rustix::io::Errno::EXIST));
                 },
-
-                // Fall through to cap-std
                 Err(rustix::io::Errno::XDEV)
                 | Err(
                     rustix::io::Errno::NOSYS | rustix::io::Errno::NOTSUP | rustix::io::Errno::INVAL,
                 ) => {},
-
-                // ALL OTHER ERRORS (EACCES, EPERM, EIO, ENOSPC, etc.)
-                // MUST propagate immediately. Never swallow these.
                 Err(e) => return Err(std::io::Error::from(e)),
             }
         }
 
-        // ─── ANDROID-SPECIFIC PATH ─────────────────────────────────────────
-        // Android's FUSE layer supports renameat2(NOREPLACE) in many cases
-        // but hard_link() reliably returns EACCES. We use renameat2 via
-        // rustix when possible, then fall back to cap-std rename (never
-        // hard_link).
         #[cfg(target_os = "android")]
         {
             use std::os::fd::AsFd;
 
             use rustix::fs::RenameFlags;
 
-            // Try NOREPLACE first — strace confirms this works on Termux FUSE
             let noreplace_result = rustix::fs::renameat_with(
                 dir_from.as_fd(),
                 file_from,
@@ -3370,9 +3455,7 @@ fn perform_atomic_move(
 
             match noreplace_result {
                 Ok(_) => return Ok(()),
-
-                // Target exists and overwrite allowed: plain rename
-                Err(rustix::io::Errno::EXIST) if overwrite_or_resume => {
+                Err(rustix::io::Errno::EXIST) if allow_overwrite => {
                     match rustix::fs::renameat_with(
                         dir_from.as_fd(),
                         file_from,
@@ -3384,34 +3467,19 @@ fn perform_atomic_move(
                         Err(e) => return Err(std::io::Error::from(e)),
                     }
                 },
-
-                // Target exists, no overwrite
                 Err(rustix::io::Errno::EXIST) => {
                     return Err(std::io::Error::from(rustix::io::Errno::EXIST));
                 },
-
-                // renameat2 entirely unsupported on this Android build/kernel:
-                // fall through to cap-std rename below (NOT hard_link)
                 Err(
                     rustix::io::Errno::NOSYS | rustix::io::Errno::NOTSUP | rustix::io::Errno::INVAL,
                 ) => {},
-
-                // Cross-device: fall through to cap-std
                 Err(rustix::io::Errno::XDEV) => {},
-
-                // Real errors propagate immediately
                 Err(e) => return Err(std::io::Error::from(e)),
             }
 
-            // Fallback for Android when renameat2 is unsupported:
-            // cap-std rename WITHOUT hard_link (hard_link returns EACCES on FUSE)
-            if overwrite_or_resume {
+            if allow_overwrite {
                 return dir_from.rename(file_from, dir_to, file_to);
             } else {
-                // Non-atomic check-then-rename: accepted TOCTOU risk because
-                // Android FUSE provides no atomic no-clobber alternative.
-                // The pre-download existence checks already passed; this is
-                // a last-resort safety net, not a guarantee.
                 if dir_to.symlink_metadata(file_to).is_ok() {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::AlreadyExists,
@@ -3422,53 +3490,36 @@ fn perform_atomic_move(
             }
         }
 
-        // ─── CROSS-PLATFORM FALLBACK (macOS, Windows, other Unix) ─────────
-        // Only reached on non-Linux/non-Android, or on Linux when renameat2
-        // returned NOSYS/NOTSUP/INVAL/XDEV.
-        if overwrite_or_resume {
+        if allow_overwrite {
             dir_from.rename(file_from, dir_to, file_to)
         } else {
-            // Safe NOREPLACE emulation via hard_link + remove.
-            // This is safe on macOS/Windows/real Linux filesystems.
-            // Never reached on Android (handled above).
             match dir_from.hard_link(file_from, dir_to, file_to) {
                 Ok(()) => {
                     let _ = dir_from.remove_file(file_from);
                     Ok(())
                 },
-                // AlreadyExists preserves the no-replace guarantee.
-                // EXDEV or unsupported hard_link must NOT fall back to
-                // check-then-rename (TOCTOU vulnerability).
                 Err(e) => Err(e),
             }
         }
     };
 
-    // ─── RETRY / ERROR HANDLING WRAPPER ────────────────────────────────────
     match try_move(temp_path, target_path, cache) {
         Ok(()) => Ok(target_path.to_path_buf()),
-
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            if args.overwrite || args.resume {
+            if allow_overwrite {
                 Err(e.into())
             } else {
-                // Pre-download existence checks passed, so AlreadyExists at
-                // rename time means the file appeared during download (TOCTOU).
                 Err(PermanentError::FileAppearedDuringDownload(target_path.to_path_buf()).into())
             }
         },
-
         Err(e) if is_name_too_long(&e) => {
             let truncated = resolve_output_path(target_path)?;
-
             if truncated == target_path {
                 return Err(PermanentError::FilenameTooLong.into());
             }
-
             if !args.quiet {
                 eprintln!("Filename too long, retrying with: {}", truncated.display());
             }
-
             match try_move(temp_path, &truncated, cache) {
                 Ok(()) => Ok(truncated),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -3477,7 +3528,6 @@ fn perform_atomic_move(
                 Err(e) => Err(e).context("Failed to rename to truncated path"),
             }
         },
-
         Err(e) => Err(e).context("Failed to rename temp file"),
     }
 }
@@ -3943,95 +3993,159 @@ enum JqSegment {
     ArrayIndex(usize), // [N]
 }
 
+fn parse_quoted_jq_string(input: &str) -> Result<(String, &str)> {
+    let mut chars = input.char_indices();
+    let Some((_, '"')) = chars.next() else {
+        return Err(PermanentError::JsonPathError(
+            "Expected '\"' at start of quoted key".to_string(),
+        )
+        .into());
+    };
+
+    let mut escaped = false;
+    for (idx, ch) in chars {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            let json_literal = &input[..=idx];
+            let parsed: String = serde_json::from_str(json_literal).map_err(|e| {
+                PermanentError::JsonPathError(format!(
+                    "Invalid quoted string {json_literal} in JSON path: {e}"
+                ))
+            })?;
+            return Ok((parsed, &input[idx + 1..]));
+        }
+    }
+
+    Err(PermanentError::JsonPathError(format!(
+        "Unterminated quoted string in path expression: {input}"
+    ))
+    .into())
+}
+
 /// Parse a jq-like path into segments.
 /// Examples:
 ///   ".assets[].`browser_download_url`" -> [Field("assets"), `ArrayIter`, `Field("browser_download_url`")]
 ///   ".digest" -> [Field("digest")]
 ///   ".data[0].url" -> [Field("data"), ArrayIndex(0), Field("url")]
 fn parse_jq_path(path: &str) -> Result<Vec<JqSegment>> {
-    let path = path.strip_prefix('.').unwrap_or(path);
-    let mut segments = Vec::new();
-    let mut chars = path.chars().peekable();
-    let mut current_field = String::new();
-
-    while let Some(&ch) = chars.peek() {
-        match ch {
-            '.' => {
-                // Flush current field
-                if !current_field.is_empty() {
-                    segments.push(JqSegment::Field(current_field.clone()));
-                    current_field.clear();
-                }
-                chars.next();
-            },
-            '[' => {
-                // Flush current field
-                if !current_field.is_empty() {
-                    segments.push(JqSegment::Field(current_field.clone()));
-                    current_field.clear();
-                }
-                chars.next(); // consume '['
-                let mut bracket_content = String::new();
-                let mut closed = false;
-                while let Some(&bc) = chars.peek() {
-                    if bc == ']' {
-                        chars.next(); // consume ']'
-                        closed = true;
-                        break;
-                    }
-                    bracket_content.push(bc);
-                    chars.next();
-                }
-                if !closed {
-                    return Err(PermanentError::JsonPathError(format!(
-                        "Unclosed bracket in path expression: [{bracket_content}]"
-                    ))
-                    .into());
-                }
-                if bracket_content.is_empty() {
-                    segments.push(JqSegment::ArrayIter);
-                } else if let Ok(idx) = bracket_content.parse::<usize>() {
-                    segments.push(JqSegment::ArrayIndex(idx));
-                } else {
-                    return Err(PermanentError::JsonPathError(format!(
-                        "Invalid array index: [{bracket_content}]"
-                    ))
-                    .into());
-                }
-            },
-            '|' => {
-                // Pipe operator: treat as segment separator (skip whitespace around it)
-                if !current_field.is_empty() {
-                    segments.push(JqSegment::Field(current_field.clone()));
-                    current_field.clear();
-                }
-                chars.next(); // consume '|'
-                // Skip whitespace after pipe
-                while let Some(&wc) = chars.peek() {
-                    if wc.is_whitespace() {
-                        chars.next();
-                    } else {
-                        break;
-                    }
-                }
-                // Skip leading dot after pipe if present
-                if let Some(&'.') = chars.peek() {
-                    chars.next();
-                }
-            },
-            c if c.is_whitespace() => {
-                chars.next(); // skip whitespace
-            },
-            c => {
-                current_field.push(c);
-                chars.next();
-            },
-        }
+    let mut s = path.trim();
+    if s.is_empty() || s == "." {
+        return Err(PermanentError::JsonPathError("Empty path expression".to_string()).into());
     }
 
-    // Flush remaining field
-    if !current_field.is_empty() {
-        segments.push(JqSegment::Field(current_field));
+    let mut segments = Vec::new();
+
+    // Consume an optional leading '.'
+    if let Some(rest) = s.strip_prefix('.') {
+        s = rest;
+    }
+
+    while !s.is_empty() {
+        // Allow pipe separator: ` | .foo` or ` | foo`
+        let trimmed_start = s.trim_start();
+        if let Some(after_pipe) = trimmed_start.strip_prefix('|') {
+            s = after_pipe.trim_start();
+            if let Some(after_dot) = s.strip_prefix('.') {
+                s = after_dot;
+            }
+            if s.is_empty() {
+                return Err(PermanentError::JsonPathError(
+                    "Trailing '|' in path expression".to_string(),
+                )
+                .into());
+            }
+            continue;
+        }
+
+        if let Some(after_dot) = s.strip_prefix('.') {
+            s = after_dot;
+            if s.is_empty() {
+                return Err(PermanentError::JsonPathError(
+                    "Trailing '.' in path expression".to_string(),
+                )
+                .into());
+            }
+        }
+
+        if s.starts_with('"') {
+            // Quoted field name: ."field.with.dots or spaces"
+            let (parsed_key, rest) = parse_quoted_jq_string(s)?;
+            segments.push(JqSegment::Field(parsed_key));
+            s = rest;
+        } else if let Some(after_bracket) = s.strip_prefix('[') {
+            let after_ws = after_bracket.trim_start();
+            if let Some(rest_after_empty) = after_ws.strip_prefix(']') {
+                segments.push(JqSegment::ArrayIter);
+                s = rest_after_empty;
+            } else if after_ws.starts_with('"') {
+                // Bracket-quoted field name: ["field.with.dots or spaces"]
+                let (parsed_key, rest_after_str) = parse_quoted_jq_string(after_ws)?;
+                let rest_after_ws = rest_after_str.trim_start();
+                let Some(after_close) = rest_after_ws.strip_prefix(']') else {
+                    return Err(PermanentError::JsonPathError(
+                        "Expected closing ']' after quoted key".to_string(),
+                    )
+                    .into());
+                };
+                segments.push(JqSegment::Field(parsed_key));
+                s = after_close;
+            } else {
+                // Array index: [N] (no internal spaces inside digits)
+                let Some(close_pos) = after_bracket.find(']') else {
+                    return Err(PermanentError::JsonPathError(format!(
+                        "Unclosed bracket in path expression: [{after_bracket}"
+                    ))
+                    .into());
+                };
+                let idx_str = after_bracket[..close_pos].trim();
+                if idx_str.is_empty() || !idx_str.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(PermanentError::JsonPathError(format!(
+                        "Invalid array index: [{idx_str}]"
+                    ))
+                    .into());
+                }
+                let idx = idx_str.parse::<usize>().map_err(|_| {
+                    PermanentError::JsonPathError(format!("Array index overflow: [{idx_str}]"))
+                })?;
+                segments.push(JqSegment::ArrayIndex(idx));
+                s = &after_bracket[close_pos + 1..];
+            }
+        } else {
+            // Bare identifier up to '.', '[', '|', or whitespace
+            let end = s
+                .find(|c: char| c == '.' || c == '[' || c == '|' || c.is_whitespace())
+                .unwrap_or(s.len());
+            if end == 0 {
+                return Err(
+                    PermanentError::JsonPathError(format!("Unexpected token at '{s}'")).into()
+                );
+            }
+            let ident = &s[..end];
+            if ident.contains('"') || ident.contains(']') {
+                return Err(PermanentError::JsonPathError(format!(
+                    "Invalid character in field name '{ident}'"
+                ))
+                .into());
+            }
+            segments.push(JqSegment::Field(ident.to_string()));
+            s = &s[end..];
+
+            // Only allow whitespace if followed by '|' or end of string
+            let ws_trimmed = s.trim_start();
+            if ws_trimmed.len() < s.len() && !ws_trimmed.is_empty() && !ws_trimmed.starts_with('|')
+            {
+                return Err(PermanentError::JsonPathError(format!(
+                    "Unexpected whitespace in field path before '{ws_trimmed}' (use quotes for keys with spaces)"
+                ))
+                .into());
+            }
+            s = ws_trimmed;
+        }
     }
 
     if segments.is_empty() {
@@ -4053,33 +4167,46 @@ fn collect_values(value: &serde_json::Value, segments: &[JqSegment], results: &m
     if segments.is_empty() {
         match value {
             serde_json::Value::String(s) => results.push(s.clone()),
-            // Null → sentinel, preserving alignment.
-            serde_json::Value::Null => results.push(String::new()),
-            other => results.push(other.to_string()),
+            serde_json::Value::Number(n) => results.push(n.to_string()),
+            serde_json::Value::Bool(b) => results.push(b.to_string()),
+            // Null, Object, or Array at leaf -> empty-string sentinel
+            serde_json::Value::Null
+            | serde_json::Value::Array(_)
+            | serde_json::Value::Object(_) => results.push(String::new()),
         }
         return;
     }
 
     match &segments[0] {
-        JqSegment::Field(name) => match value.get(name.as_str()) {
-            Some(child) => collect_values(child, &segments[1..], results),
-            // Missing field → sentinel, preserving alignment.
-            None => results.push(String::new()),
+        JqSegment::Field(name) => match value {
+            serde_json::Value::Object(map) => match map.get(name) {
+                Some(child) => collect_values(child, &segments[1..], results),
+                None => results.push(String::new()),
+            },
+            // Non-object (including Null) -> sentinel to preserve positional alignment
+            _ => results.push(String::new()),
         },
-        JqSegment::ArrayIter => {
-            if let serde_json::Value::Array(arr) = value {
+        JqSegment::ArrayIter => match value {
+            serde_json::Value::Array(arr) => {
                 for item in arr {
                     collect_values(item, &segments[1..], results);
                 }
-            }
-        },
-        JqSegment::ArrayIndex(idx) => {
-            if let serde_json::Value::Array(arr) = value {
-                match arr.get(*idx) {
-                    Some(item) => collect_values(item, &segments[1..], results),
-                    None => results.push(String::new()),
+            },
+            // If an expected array is null/non-array inside a parent iteration,
+            // push a sentinel when further segments remain so sibling paths stay aligned.
+            _ => {
+                if !segments[1..].is_empty() {
+                    results.push(String::new());
                 }
-            }
+            },
+        },
+        JqSegment::ArrayIndex(idx) => match value {
+            serde_json::Value::Array(arr) => match arr.get(*idx) {
+                Some(item) => collect_values(item, &segments[1..], results),
+                None => results.push(String::new()),
+            },
+            // Non-array (including Null) -> sentinel to preserve positional alignment
+            _ => results.push(String::new()),
         },
     }
 }
@@ -4189,42 +4316,46 @@ struct JsonDownloadEntry {
 async fn fetch_json_body(
     client: &Client,
     url: &Url,
+    prefetched_get: Option<Response>,
     args: &Args,
     send_auth: bool,
     rl_tracker: &mut RateLimitTracker,
 ) -> Result<String> {
-    rl_tracker.wait_before_request(url, args).await;
+    let response = if let Some(resp) = prefetched_get {
+        resp
+    } else {
+        rl_tracker.wait_before_request(url, args).await;
 
-    let mut request = client.get(url.clone());
-    if send_auth && let Some(ref u) = args.user {
-        request = request.basic_auth(u, args.password.as_deref());
-    }
-    request = with_sensitive_headers(request, args, send_auth);
-
-    let response = request.send().await.context("Failed to send GET request for JSON")?;
-    let status = response.status();
-
-    // Check for redirect on GET
-    if status.is_redirection() {
-        rl_tracker.record_response(url, response.headers(), args);
-        if let Some(location) = response.headers().get(LOCATION) {
-            let location_str = location.to_str().unwrap_or("<invalid>");
-            return Err(PermanentError::RedirectOnGet {
-                status: status.as_u16(),
-                location: location_str.to_string(),
-            }
-            .into());
+        let mut request = client.get(url.clone());
+        if send_auth && let Some(ref u) = args.user {
+            request = request.basic_auth(u, args.password.as_deref());
         }
-        return Err(PermanentError::RedirectWithoutLocation(status.as_u16()).into());
-    }
+        request = with_sensitive_headers(request, args, send_auth);
 
-    if !status.is_success() {
-        return Err(handle_error_response(response, url, args, rl_tracker).await);
-    }
+        let resp = request.send().await.context("Failed to send GET request for JSON")?;
+        let status = resp.status();
 
-    rl_tracker.record_response(url, response.headers(), args);
+        if status.is_redirection() {
+            rl_tracker.record_response(url, resp.headers(), args);
+            if let Some(location) = resp.headers().get(LOCATION) {
+                let location_str = location.to_str().unwrap_or("<invalid>");
+                return Err(PermanentError::RedirectOnGet {
+                    status: status.as_u16(),
+                    location: location_str.to_string(),
+                }
+                .into());
+            }
+            return Err(PermanentError::RedirectWithoutLocation(status.as_u16()).into());
+        }
 
-    // Validate Content-Type: application/json
+        if !status.is_success() {
+            return Err(handle_error_response(resp, url, args, rl_tracker).await);
+        }
+
+        rl_tracker.record_response(url, resp.headers(), args);
+        resp
+    };
+
     let content_type =
         response.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
 
@@ -4233,8 +4364,6 @@ async fn fetch_json_body(
         return Err(PermanentError::JsonContentTypeExpected(content_type.to_string()).into());
     }
 
-    // The JSON body is parsed fully in memory, so cap it instead of reading
-    // unbounded data (--max-size tightens the cap when it is smaller).
     let limit = args.max_size.map_or(MAX_JSON_BODY_BYTES, |m| m.min(MAX_JSON_BODY_BYTES));
     if let Some(len) = response.content_length()
         && len > limit
@@ -4257,10 +4386,6 @@ async fn fetch_json_body(
         body_bytes.extend_from_slice(&chunk);
     }
 
-    // JSON is UTF-8 (RFC 8259 §8.1); reject anything else instead of guessing.
-    // This MUST be a PermanentError: the body encoding does not change between
-    // retries, so a transient classification would only burn --retries.
-    // (map_err the value, then `?` — that coerces PermanentError into anyhow::Error.)
     let body = String::from_utf8(body_bytes).map_err(|e| {
         PermanentError::JsonParseError(format!("Response body is not valid UTF-8 ({e})"))
     })?;
@@ -4271,6 +4396,7 @@ async fn fetch_json_body(
 async fn process_json_downloads(
     client: &Client,
     json_url: &Url,
+    prefetched_get: Option<Response>,
     args: &Args,
     client_cache: &mut HashMap<String, Client>,
     hsts_db: &mut HstsMap,
@@ -4283,26 +4409,20 @@ async fn process_json_downloads(
 ) -> Result<()> {
     let json_url_field = args.json_url_field.as_ref().expect("--json-url-field required");
 
-    // 1. Fetch JSON body
     if args.verbose {
         eprintln!("Fetching JSON from: {json_url}");
     }
-    let body = fetch_json_body(client, json_url, args, send_auth, rl_tracker).await?;
+    let body =
+        fetch_json_body(client, json_url, prefetched_get, args, send_auth, rl_tracker).await?;
 
     if args.debug {
         eprintln!("[DEBUG] JSON response body length: {} bytes", body.len());
     }
 
-    // 2. Parse JSON
     let json_value: serde_json::Value =
         serde_json::from_str(&body).map_err(|e| PermanentError::JsonParseError(e.to_string()))?;
-
-    // The parsed tree can be many times larger than the text it came from (a
-    // body of `[0,0,...]` expands about 16x), so release the raw body before
-    // walking the tree instead of holding both until the function returns.
     drop(body);
 
-    // 3. Extract URLs
     let urls = json_path_extract(&json_value, json_url_field)?;
     if args.debug {
         eprintln!("[DEBUG] Extracted {} URL(s) from JSON path '{}':", urls.len(), json_url_field);
@@ -4311,7 +4431,6 @@ async fn process_json_downloads(
         }
     }
 
-    // 4. Extract hashes (if specified)
     let hashes: Option<Vec<String>> = if let Some(ref hash_field) = args.json_hash_field {
         let h = json_path_extract(&json_value, hash_field)?;
         if args.debug {
@@ -4332,7 +4451,6 @@ async fn process_json_downloads(
         None
     };
 
-    // 5. Extract names (if specified)
     let names: Option<Vec<String>> = if let Some(ref name_field) = args.json_name_field {
         let n = json_path_extract(&json_value, name_field)?;
         if args.debug {
@@ -4353,7 +4471,6 @@ async fn process_json_downloads(
         None
     };
 
-    // 5b. Extract sizes (if specified)
     let sizes: Option<Vec<Option<u64>>> = if let Some(ref size_field) = args.json_size_field {
         let s_vals = json_path_extract(&json_value, size_field)?;
         if args.debug {
@@ -4385,11 +4502,8 @@ async fn process_json_downloads(
         None
     };
 
-    // All fields have been extracted into plain strings: the (potentially very
-    // large) JSON tree is no longer needed while the downloads run.
     drop(json_value);
 
-    // 6. Build entries
     let mut entries: Vec<JsonDownloadEntry> = Vec::new();
     for (i, url_str) in urls.iter().enumerate() {
         entries.push(JsonDownloadEntry {
@@ -4400,7 +4514,6 @@ async fn process_json_downloads(
         });
     }
 
-    // 7. Apply regex filter
     if let Some(ref filter_pattern) = args.json_filter {
         let re = Regex::new(filter_pattern).map_err(|e| {
             PermanentError::InvalidArguments(format!(
@@ -4420,9 +4533,6 @@ async fn process_json_downloads(
         }
     }
 
-    // 7b. Drop entries whose URL is the empty-string sentinel produced when a
-    // .url field is null or missing in the JSON. The parallel fields (hash/name/size)
-    // are still aligned within each JsonDownloadEntry, so dropping by entry is safe.
     let before_sentinel_drop = entries.len();
     entries.retain(|e| !e.url.is_empty());
     if args.debug && entries.len() != before_sentinel_drop {
@@ -4436,9 +4546,6 @@ async fn process_json_downloads(
         return Err(PermanentError::JsonNoUrlsExtracted.into());
     }
 
-    // 8. Print summary
-    // (name, URL and hash come from server-supplied JSON and may contain terminal
-    // escape sequences, so they are neutralized before printing)
     if !args.quiet {
         eprintln!("JSON: {} file(s) to download:", entries.len());
         for (i, entry) in entries.iter().enumerate() {
@@ -4458,10 +4565,6 @@ async fn process_json_downloads(
         }
     }
 
-    // 9. Download each entry. Per-entry retries are bounded internally; the outer
-    // retry around process_json_downloads must NOT retry these (it would re-fetch
-    // JSON and duplicate already-successful downloads), so any failure here is
-    // wrapped in PermanentError::JsonDownloadsFailed before returning.
     let max_retries = if args.retries == 0 { u64::MAX } else { args.retries };
     let total = entries.len();
     let mut failed_count: usize = 0;
@@ -4481,24 +4584,14 @@ async fn process_json_downloads(
             eprintln!("Starting download: {url}");
         }
 
-        // Build per-entry args: set --output if json-name-field was provided
-        // Clear json_parse to prevent any accidental re-entry
         let mut entry_args = args.clone();
         entry_args.json_parse = false;
-        if let Some(ref name) = entry.name {
-            // An empty name sentinel (null/missing in JSON) should not become the output filename
-            if !name.is_empty() {
-                // The name comes from server-controlled JSON: sanitize it like a
-                // Content-Disposition filename so it can neither traverse
-                // directories nor become '-' (which --output reserves for stdout):
-                // sanitize_filename now maps '-' to '_' directly.
-                entry_args.output = Some(sanitize_filename(name));
-            }
+        if let Some(ref name) = entry.name
+            && !name.is_empty()
+        {
+            entry_args.output = Some(sanitize_filename(name));
         }
 
-        // Pre-parse and validate digest before download attempt.
-        // When --json-verify-hash is set, missing/empty/unparseable digests are HARD failures
-        // (silently downloading without verification would defeat the flag's purpose).
         let parsed_sha256: Option<String> = if args.json_verify_hash {
             let digest_opt = entry.hash.as_deref().filter(|s| !s.is_empty());
             if let Some(digest_str) = digest_opt {
@@ -4544,12 +4637,7 @@ async fn process_json_downloads(
         };
 
         let mut attempt: u64 = 0;
-        // Output path and counter state pinned by the first attempt; retries
-        // reuse it so the auto-set resume flag cannot re-route the download (see download_file).
         let mut resolved_output: Option<PinnedOutput> = None;
-        // Set by download_file once an attempt reaches the point of opening the
-        // destination (or its temp file); a retry only auto-resumes after that,
-        // so a pre-existing file under --overwrite/-N is never appended to.
         let mut dest_touched = false;
 
         let entry_failed = loop {
@@ -4560,7 +4648,7 @@ async fn process_json_downloads(
             let mut attempt_used_filenames = used_filenames.clone();
 
             let result = async {
-                match resolve_final_url_and_client(
+                let resolved = resolve_final_url_and_client(
                     url.clone(),
                     &current_args,
                     client_cache,
@@ -4569,70 +4657,55 @@ async fn process_json_downloads(
                     cred_scope,
                     rl_tracker,
                 )
-                .await
-                {
-                    Ok((
-                        dl_client,
-                        final_url,
-                        content_length,
-                        content_disposition,
-                        last_modified,
-                        entry_send_auth,
-                    )) => {
-                        if current_args.verbose && final_url != url {
-                            eprintln!("Final URL: {final_url}");
-                        }
+                .await?;
 
-                        let effective_content_length = content_length.or(entry.size);
-
-                        if let (Some(max), Some(size)) =
-                            (current_args.max_size, effective_content_length)
-                            && size > max
-                        {
-                            return Err(PermanentError::FileSizeExceedsLimit {
-                                size,
-                                max,
-                                url: final_url.to_string(),
-                            }
-                            .into());
-                        }
-                        download_file(
-                            &dl_client,
-                            &final_url,
-                            &current_args,
-                            effective_content_length,
-                            content_disposition.as_deref(),
-                            last_modified.as_deref(),
-                            &mut attempt_used_filenames,
-                            parsed_sha256.as_deref(),
-                            dir_cache,
-                            &mut resolved_output,
-                            &mut dest_touched,
-                            entry_send_auth,
-                            rl_tracker,
-                        )
-                        .await
-                    },
-                    Err(e) => Err(e),
+                if current_args.verbose && resolved.final_url != url {
+                    eprintln!("Final URL: {}", resolved.final_url);
                 }
+
+                let effective_content_length = resolved.content_length.or(entry.size);
+
+                if let (Some(max), Some(size)) = (current_args.max_size, effective_content_length)
+                    && size > max
+                {
+                    return Err(PermanentError::FileSizeExceedsLimit {
+                        size,
+                        max,
+                        url: resolved.final_url.to_string(),
+                    }
+                    .into());
+                }
+                download_file(
+                    &resolved.client,
+                    &resolved.final_url,
+                    resolved.prefetched_get,
+                    &current_args,
+                    effective_content_length,
+                    resolved.content_disposition.as_deref(),
+                    resolved.last_modified.as_deref(),
+                    &mut attempt_used_filenames,
+                    parsed_sha256.as_deref(),
+                    dir_cache,
+                    &mut resolved_output,
+                    &mut dest_touched,
+                    resolved.same_host,
+                    rl_tracker,
+                )
+                .await
             }
             .await;
 
             match result {
                 Ok(()) => {
-                    // Commit the cache
                     *used_filenames = attempt_used_filenames;
                     break false;
                 },
                 Err(e) => {
-                    if is_permanent_error(&e) {
+                    if is_permanent_error(&e) || attempt >= max_retries {
                         eprintln!("Failed to download {url}: {e:#}");
                         break true;
                     }
-                    if attempt >= max_retries {
-                        eprintln!("Failed to download {url}: {e:#}");
-                        break true;
-                    }
+                    client_cache.clear();
                     eprintln!(
                         "Error: {}. Retrying (attempt {}/{})...",
                         e,
@@ -4661,740 +4734,6 @@ async fn process_json_downloads(
     } else {
         Err(PermanentError::JsonDownloadsFailed { failed: failed_count, total }.into())
     }
-}
-
-async fn download_file(
-    client: &Client,
-    url: &Url,
-    args: &Args,
-    expected_length: Option<u64>,
-    content_disposition: Option<&str>,
-    head_last_modified: Option<&str>,
-    used_filenames: &mut HashMap<PathBuf, u32>,
-    expected_sha256: Option<&str>,
-    dir_cache: &mut DirCache,
-    resolved_output: &mut Option<PinnedOutput>,
-    dest_touched: &mut bool,
-    send_auth: bool,
-    rl_tracker: &mut RateLimitTracker,
-) -> Result<()> {
-    // True when a previous attempt already resolved (pinned) the output path;
-    // this attempt must reuse it instead of re-deriving/re-numbering it.
-    let output_pinned = resolved_output.is_some();
-
-    // 1. Determine filenames first
-    let mut final_filename = determine_filename(args, url, content_disposition);
-    // The pre-numbering filename, used to detect a *real* Content-Disposition
-    // change on GET. Comparing against final_filename would misfire after
-    // --multiple-copies collision numbering ("a.txt" vs "a.txt.1") and
-    // re-number the output on every loop iteration.
-    let mut head_filename = final_filename.clone();
-    let mut output_path = if let Some(ref output) = args.output {
-        PathBuf::from(output)
-    } else {
-        PathBuf::from(&final_filename)
-    };
-
-    // '-' means stdout only when explicitly requested with --output. A filename
-    // derived from the URL or a server-supplied Content-Disposition must never
-    // be able to flip the download into stdout mode.
-    let is_stdout = args.output.as_deref() == Some("-");
-
-    // Apply --output-dir: prefix relative paths with the output directory
-    if !is_stdout
-        && let Some(ref dir_str) = args.output_dir
-        && output_path.is_relative()
-    {
-        output_path = Path::new(dir_str).join(&output_path);
-        // Update final_filename to reflect the new path
-        if let Some(fname) = output_path.file_name().and_then(|s| s.to_str()) {
-            final_filename = fname.to_string();
-        }
-    }
-
-    // Proactively truncate an over-long filename so the stat/open calls below
-    // do not fail with ENAMETOOLONG (which would surface from
-    // check_path_before_open before the reactive truncation in download_direct
-    // / perform_atomic_move gets a chance to run). Keeps the extension when one
-    // is present (see truncate_filename_to_limit). Paths without a valid UTF-8
-    // filename fall through to the existing error handling below.
-    if !is_stdout
-        && let Some(fname) = output_path.file_name().and_then(|s| s.to_str())
-        && fname.len() > MAX_FILENAME_BYTES
-    {
-        let truncated_name = truncate_filename_to_limit(fname);
-        let truncated_path = output_path.parent().unwrap_or(Path::new(".")).join(&truncated_name);
-        if !args.quiet {
-            eprintln!("Filename too long, truncating to: {}", truncated_path.display());
-        }
-        output_path = truncated_path;
-        final_filename = truncated_name;
-    }
-
-    // Handle --multiple-copies: resolve unique output path before any file checks.
-    // On retry attempts the path and counter state pinned by the first attempt
-    // are reused verbatim so the auto-set resume flag neither skips collision
-    // numbering nor corrupts the counter for subsequent downloads.
-    let mut initial_canonical_key: Option<PathBuf> = None;
-    let mut prev_used_counter: Option<u32> = None;
-    if !is_stdout {
-        if let Some(pinned) = resolved_output.as_ref() {
-            output_path = pinned.output_path.clone();
-            if let Some(fname) = output_path.file_name().and_then(|s| s.to_str()) {
-                final_filename = fname.to_string();
-            }
-            used_filenames.insert(pinned.canonical_key.clone(), pinned.next_counter);
-            initial_canonical_key = Some(pinned.canonical_key.clone());
-        } else {
-            let unnumbered_output_path = output_path.clone();
-            prev_used_counter = used_filenames.get(&unnumbered_output_path).copied();
-            let (resolved_path, was_renamed) =
-                resolve_unique_output_path(&output_path, args, used_filenames, dir_cache)?;
-            if was_renamed && !args.quiet {
-                eprintln!(
-                    "Filename collision: '{}' -> '{}'",
-                    output_path.display(),
-                    resolved_path.display()
-                );
-            }
-            output_path = resolved_path;
-            // Update final_filename if path changed
-            if let Some(fname) = output_path.file_name().and_then(|s| s.to_str()) {
-                final_filename = fname.to_string();
-            }
-            let next_counter = *used_filenames.get(&unnumbered_output_path).unwrap_or(&1);
-            *resolved_output = Some(PinnedOutput {
-                output_path: output_path.clone(),
-                canonical_key: unnumbered_output_path.clone(),
-                next_counter,
-            });
-            initial_canonical_key = Some(unnumbered_output_path);
-        }
-    }
-
-    if !is_stdout {
-        check_path_before_open(&output_path, dir_cache)?;
-    }
-
-    // Stat output file through DirCache for size/mtime checks below
-    let mut output_info =
-        if is_stdout { None } else { stat_file_via_cache(&output_path, dir_cache)? };
-
-    // Hash verification forces the temp-then-rename path: direct mode unlinks
-    // and recreates the destination before writing, so a corrupt or truncated
-    // download would replace a good file before the digest could be checked.
-    // Writing to the deterministic temp file and renaming only after the
-    // digest verifies keeps the destination intact on failure.
-    let force_temp_for_verify = expected_sha256.is_some();
-
-    // 2. Prepare Temp Path (using sanitized filename)
-    let mut temp_path = if (args.temp || force_temp_for_verify) && !is_stdout {
-        let parent = output_path.parent().unwrap_or(Path::new("."));
-        Some(generate_deterministic_temp_filename(
-            url,
-            &final_filename, // Use the sanitized filename for hash
-            parent,
-            args.tempnamelen,
-            args.debug,
-        ))
-    } else {
-        None
-    };
-
-    // Stat temp file through DirCache
-    let mut temp_info =
-        if let Some(ref tp) = temp_path { stat_file_via_cache(tp, dir_cache)? } else { None };
-
-    let mut start_byte: u64 = 0;
-    let mut force_truncate = false;
-    if !is_stdout {
-        match evaluate_local_target(
-            &output_path,
-            temp_path.as_deref(),
-            output_info.as_ref(),
-            temp_info.as_ref(),
-            args,
-            expected_length,
-            head_last_modified,
-            expected_sha256,
-            dir_cache,
-        )? {
-            LocalTargetAction::AlreadyComplete => return Ok(()),
-            LocalTargetAction::Proceed { start_byte: sb, force_truncate: ft } => {
-                start_byte = sb;
-                force_truncate = ft;
-            },
-        }
-    }
-
-    let response;
-    let mut content_length;
-    let mut get_last_modified;
-
-    let mut cd_redirect_count = 0;
-
-    // Loop added to safely retry the entire request if we discover a different
-    // Content-Disposition dynamically and need to reset or initiate a partial-resume context.
-    loop {
-        // Respect any RateLimit / Retry-After cooldown recorded during HEAD or prior GET
-        rl_tracker.wait_before_request(url, args).await;
-
-        // True when THIS request carries a Range header. The 416 handler must
-        // only interpret a 416 as "resume state says we're complete" when a
-        // range was actually requested; a 416 on a plain GET means the server
-        // rejected the request itself and is handled by the generic 4xx logic
-        // below (or saved as an error body under --content-on-error).
-        let range_sent = start_byte > 0;
-
-        let mut request = client.get(url.clone());
-        if range_sent {
-            request = request.header(RANGE, format!("bytes={start_byte}-"));
-        }
-
-        // -N mode without --no-if-modified-since: add If-Modified-Since header
-        // ONLY if local file size matches expected server size (if expected size is known).
-        // If size differs, the local file is incomplete/corrupted, so do not send If-Modified-Since.
-        let size_matches = match (expected_length, output_info.as_ref()) {
-            (Some(exp_len), Some(out_info)) => out_info.is_regular && out_info.size == exp_len,
-            _ => true,
-        };
-
-        let mut ims_sent = false;
-        if args.newer
-            && !args.no_if_modified_since
-            && !is_stdout
-            && size_matches
-            && let Some(ref out_info) = output_info
-            && let Some(local_mtime) = out_info.modified
-            && let http_date = format_http_date(local_mtime)
-        {
-            if args.verbose {
-                eprintln!("Sending If-Modified-Since: {http_date}");
-            }
-            request = request.header(IF_MODIFIED_SINCE, http_date);
-            ims_sent = true;
-        }
-
-        // Credentials are only sent when the final URL is still on the host/port the
-        // user named, without an https -> http downgrade
-        if send_auth && let Some(ref u) = args.user {
-            request = request.basic_auth(u, args.password.as_deref());
-        }
-        request = with_sensitive_headers(request, args, send_auth);
-
-        let current_response = request.send().await.context("Failed to send GET request")?;
-        let status = current_response.status();
-
-        // Handle 304 Not Modified (from If-Modified-Since in -N mode)
-        if status == StatusCode::NOT_MODIFIED {
-            rl_tracker.record_response(url, current_response.headers(), args);
-            let local_size = output_info.as_ref().map_or(0, |i| i.size);
-            if let Some(exp_len) = expected_length
-                && local_size != exp_len
-            {
-                if !args.quiet {
-                    eprintln!(
-                        "Server returned 304 Not Modified but local file size ({}) differs from server ({}), downloading entire file.",
-                        HumanBytes(local_size),
-                        HumanBytes(exp_len)
-                    );
-                }
-                start_byte = 0;
-                force_truncate = true;
-                rl_tracker.wait_before_request(url, args).await;
-                let mut full_request = client.get(url.clone());
-                if send_auth && let Some(ref u) = args.user {
-                    full_request = full_request.basic_auth(u, args.password.as_deref());
-                }
-                full_request = with_sensitive_headers(full_request, args, send_auth);
-                let full_response =
-                    full_request.send().await.context("Failed to send GET request")?;
-                let full_status = full_response.status();
-                if full_status.is_redirection() {
-                    rl_tracker.record_response(url, full_response.headers(), args);
-                    if let Some(location) = full_response.headers().get(LOCATION) {
-                        let location_str = location.to_str().unwrap_or("<invalid>");
-                        return Err(PermanentError::RedirectOnGet {
-                            status: full_status.as_u16(),
-                            location: location_str.to_string(),
-                        }
-                        .into());
-                    }
-                    return Err(
-                        PermanentError::RedirectWithoutLocation(full_status.as_u16()).into()
-                    );
-                }
-                if full_status.is_client_error() || full_status.is_server_error() {
-                    if args.content_on_error {
-                        rl_tracker.record_response(url, full_response.headers(), args);
-                        if !args.quiet {
-                            eprintln!(
-                                "Warning: HTTP {full_status} returned. Saving error body to file due to --content-on-error."
-                            );
-                        }
-                    } else {
-                        return Err(
-                            handle_error_response(full_response, url, args, rl_tracker).await
-                        );
-                    }
-                } else {
-                    rl_tracker.record_response(url, full_response.headers(), args);
-                }
-                get_last_modified = full_response
-                    .headers()
-                    .get(LAST_MODIFIED)
-                    .and_then(|v| v.to_str().ok())
-                    .map(std::string::ToString::to_string);
-                content_length = full_response
-                    .headers()
-                    .get(CONTENT_LENGTH)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse::<u64>().ok());
-                if let (Some(max), Some(rem)) = (args.max_size, content_length)
-                    && rem > max
-                {
-                    return Err(PermanentError::FileSizeExceedsLimit {
-                        size: rem,
-                        max,
-                        url: url.to_string(),
-                    }
-                    .into());
-                }
-                response = full_response;
-                break;
-            }
-            if !args.quiet {
-                eprintln!(
-                    "Server file is not newer than local file '{}', skipping.",
-                    output_path.display()
-                );
-            }
-            if let Some(expected) = expected_sha256 {
-                verify_sha256_file(&output_path, expected, args.quiet, dir_cache)?;
-            }
-            return Ok(());
-        }
-
-        // Check for redirect on GET (HEAD and GET may behave differently)
-        if status.is_redirection() {
-            rl_tracker.record_response(url, current_response.headers(), args);
-            if let Some(location) = current_response.headers().get(LOCATION) {
-                let location_str = location.to_str().unwrap_or("<invalid>");
-                return Err(PermanentError::RedirectOnGet {
-                    status: status.as_u16(),
-                    location: location_str.to_string(),
-                }
-                .into());
-            }
-            return Err(PermanentError::RedirectWithoutLocation(status.as_u16()).into());
-        }
-
-        if status == StatusCode::RANGE_NOT_SATISFIABLE && range_sent {
-            rl_tracker.record_response(url, current_response.headers(), args);
-            // Only a 416 in response to our own Range request signals that the
-            // resume state already covers the whole resource. (A 416 on a plain
-            // GET falls through to the generic 4xx handling below.)
-            if !args.quiet {
-                eprintln!("File already fully downloaded.");
-            }
-            let lm_416 = current_response
-                .headers()
-                .get(LAST_MODIFIED)
-                .and_then(|v| v.to_str().ok())
-                .or(head_last_modified);
-            // If we were using a temp file, verify (when requested), apply the
-            // server timestamp on the temp file, and then atomically rename it.
-            if let Some(ref tp) = temp_path
-                && temp_info.is_some()
-            {
-                if let Some(expected) = expected_sha256 {
-                    verify_sha256_file(tp, expected, args.quiet, dir_cache)?;
-                }
-                if args.server_timestamps {
-                    apply_server_timestamp(tp, lm_416, args.debug, dir_cache);
-                }
-                perform_atomic_move(tp, &output_path, args, dir_cache)?;
-            } else {
-                if let Some(expected) = expected_sha256 {
-                    // Non-temp resume: the presumed-complete data already sits at
-                    // the output path; --json-verify-hash must still check it.
-                    verify_sha256_file(&output_path, expected, args.quiet, dir_cache)?;
-                }
-                if args.server_timestamps {
-                    apply_server_timestamp(&output_path, lm_416, args.debug, dir_cache);
-                }
-            }
-            return Ok(());
-        }
-
-        // Handle HTTP 4xx and 5xx errors
-        if status.is_client_error() || status.is_server_error() {
-            // --content-on-error saves the error body, but never over data being
-            // resumed.
-            if args.content_on_error && !range_sent {
-                rl_tracker.record_response(url, current_response.headers(), args);
-                if !args.quiet {
-                    eprintln!(
-                        "Warning: HTTP {status} returned. Saving error body to file due to --content-on-error."
-                    );
-                }
-            } else {
-                return Err(handle_error_response(current_response, url, args, rl_tracker).await);
-            }
-        } else {
-            rl_tracker.record_response(url, current_response.headers(), args);
-        }
-
-        // In -N mode, when the GET response returns 2xx (instead of 304 Not Modified)
-        // for an existing local file, the server file is newer than the local file:
-        // ensure start_byte = 0 and force_truncate = true even if -c was also set.
-        if args.newer && output_info.is_some() && status.is_success() {
-            start_byte = 0;
-            force_truncate = true;
-        }
-
-        get_last_modified = current_response
-            .headers()
-            .get(LAST_MODIFIED)
-            .and_then(|v| v.to_str().ok())
-            .map(std::string::ToString::to_string);
-
-        // Validate Content-Range when resuming
-        if args.resume && start_byte > 0 {
-            if status == StatusCode::PARTIAL_CONTENT {
-                // Validate Content-Range header matches our request
-                if let Some(content_range) = current_response.headers().get(CONTENT_RANGE)
-                    && let Ok(range_str) = content_range.to_str()
-                    && let Some(server_start) = parse_content_range(range_str)
-                    && server_start != start_byte
-                {
-                    return Err(PermanentError::ContentRangeMismatch {
-                        requested: start_byte,
-                        received: server_start,
-                    }
-                    .into());
-                }
-            } else {
-                if !args.quiet {
-                    eprintln!("Server doesn't support resume, restarting from scratch.");
-                }
-                start_byte = 0;
-                force_truncate = true;
-            }
-        }
-
-        content_length = current_response
-            .headers()
-            .get(CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok());
-
-        // Enforce --max-size against the GET response's Content-Length (covers
-        // servers that omit Content-Length on HEAD but provide it on GET).
-        if let (Some(max), Some(rem)) = (args.max_size, content_length)
-            && start_byte.saturating_add(rem) > max
-        {
-            return Err(PermanentError::FileSizeExceedsLimit {
-                size: start_byte.saturating_add(rem),
-                max,
-                url: url.to_string(),
-            }
-            .into());
-        }
-
-        // Re-check Content-Disposition from GET response (some servers only set it on GET, not HEAD)
-        // Only relevant when no explicit --output was given. Skipped when the
-        // output path was pinned by a previous attempt: a retry must keep
-        // writing to the exact file the first attempt chose.
-        if args.output.is_none() && !is_stdout && !output_pinned {
-            let get_cd = current_response
-                .headers()
-                .get(CONTENT_DISPOSITION)
-                .and_then(|v| v.to_str().ok())
-                .and_then(parse_content_disposition_header);
-
-            if let Some(ref new_name) = get_cd
-                && *new_name != head_filename
-            {
-                if args.debug {
-                    eprintln!(
-                        "[DEBUG] Content-Disposition changed on GET: '{head_filename}' -> '{new_name}'"
-                    );
-                }
-
-                let old_filename = head_filename.clone();
-                head_filename.clone_from(new_name);
-                final_filename.clone_from(new_name);
-                output_path = if let Some(ref dir_str) = args.output_dir {
-                    Path::new(dir_str).join(&final_filename)
-                } else {
-                    PathBuf::from(&final_filename)
-                };
-
-                // Proactively truncate the new name too (same rules as the
-                // initial path above). head_filename intentionally keeps the
-                // untruncated name so a re-issued GET carrying the same
-                // Content-Disposition does not re-trigger this branch.
-                if let Some(fname) = output_path.file_name().and_then(|s| s.to_str())
-                    && fname.len() > MAX_FILENAME_BYTES
-                {
-                    let truncated_name = truncate_filename_to_limit(fname);
-                    let truncated_path =
-                        output_path.parent().unwrap_or(Path::new(".")).join(&truncated_name);
-                    if !args.quiet {
-                        eprintln!("Filename too long, truncating to: {}", truncated_path.display());
-                    }
-                    output_path = truncated_path;
-                    final_filename = truncated_name;
-                }
-
-                // The output path changed, so re-run the same collision/existence
-                // checks that were performed for the original name at the top of
-                // this function. Restore the previous used_filenames counter for
-                // the old key so earlier downloads of that name do not lose their
-                // collision counter.
-                if let Some(old_key) = initial_canonical_key.take() {
-                    if let Some(prev_count) = prev_used_counter {
-                        used_filenames.insert(old_key, prev_count);
-                    } else {
-                        used_filenames.remove(&old_key);
-                    }
-                }
-
-                let unnumbered_new_path = output_path.clone();
-                prev_used_counter = used_filenames.get(&unnumbered_new_path).copied();
-                let (resolved_path, was_renamed) =
-                    resolve_unique_output_path(&output_path, args, used_filenames, dir_cache)?;
-                if was_renamed && !args.quiet {
-                    eprintln!(
-                        "Filename collision: '{}' -> '{}'",
-                        output_path.display(),
-                        resolved_path.display()
-                    );
-                }
-                output_path = resolved_path;
-                if let Some(fname) = output_path.file_name().and_then(|s| s.to_str()) {
-                    final_filename = fname.to_string();
-                }
-                let next_counter = *used_filenames.get(&unnumbered_new_path).unwrap_or(&1);
-                *resolved_output = Some(PinnedOutput {
-                    output_path: output_path.clone(),
-                    canonical_key: unnumbered_new_path.clone(),
-                    next_counter,
-                });
-                initial_canonical_key = Some(unnumbered_new_path);
-
-                // Capture the old temp state BEFORE temp_path/temp_info are
-                // replaced below: the old temp file's deterministic name is
-                // derived from the old filename.
-                let old_temp = temp_path.clone();
-                let old_temp_existed = temp_info.is_some();
-
-                let uses_temp_here = args.temp || force_temp_for_verify;
-                if uses_temp_here {
-                    let parent = output_path.parent().unwrap_or(Path::new("."));
-                    temp_path = Some(generate_deterministic_temp_filename(
-                        url,
-                        &final_filename,
-                        parent,
-                        args.tempnamelen,
-                        args.debug,
-                    ));
-                }
-
-                check_path_before_open(&output_path, dir_cache)?;
-
-                // Refresh cached metadata for the NEW target: the restarted GET
-                // (If-Modified-Since / Range), the -N overwrite logic and the 416
-                // finalize path must act on the new path's state, not the old name's.
-                output_info = stat_file_via_cache(&output_path, dir_cache)?;
-                if let Some(ref tp) = temp_path {
-                    temp_info = stat_file_via_cache(tp, dir_cache)?;
-                }
-
-                // Best-effort cleanup of the now-orphaned old temp file when we
-                // were resuming from it, through the pinned directory handle.
-                if start_byte > 0
-                    && let Some(old_tp) = old_temp.as_deref()
-                    && old_temp_existed
-                    && temp_path.as_deref() != Some(old_tp)
-                {
-                    let parent = safe_parent(old_tp);
-                    if let Ok(dir) = get_cached_dir(dir_cache, parent)
-                        && let Some(old_name) = old_tp.file_name()
-                    {
-                        let _ = dir.remove_file(old_name);
-                        if args.debug {
-                            eprintln!(
-                                "[DEBUG] Removed orphaned temp file '{}' (filename changed on resume)",
-                                old_tp.display()
-                            );
-                        }
-                    }
-                }
-
-                // Determine the full resource size known at this point.
-                let total_known = if status == StatusCode::PARTIAL_CONTENT {
-                    current_response
-                        .headers()
-                        .get(CONTENT_RANGE)
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(parse_content_range_resp)
-                        .and_then(|r| r.complete_length)
-                        .or_else(|| content_length.map(|rem| start_byte.saturating_add(rem)))
-                        .or(expected_length)
-                } else if status.is_success() {
-                    content_length.or(expected_length)
-                } else {
-                    expected_length
-                };
-                let effective_lm = get_last_modified.as_deref().or(head_last_modified);
-
-                // Re-evaluate existing output/temp state for the newly discovered
-                // filename (checks completion, conflicts, -N, and partial resume).
-                let (new_start_byte, new_force_truncate) = match evaluate_local_target(
-                    &output_path,
-                    temp_path.as_deref(),
-                    output_info.as_ref(),
-                    temp_info.as_ref(),
-                    args,
-                    total_known,
-                    effective_lm,
-                    expected_sha256,
-                    dir_cache,
-                )? {
-                    LocalTargetAction::AlreadyComplete => return Ok(()),
-                    LocalTargetAction::Proceed { start_byte: sb, force_truncate: ft } => (sb, ft),
-                };
-
-                // Re-issue the GET request if:
-                // - the resume offset changed (either we were resuming the old name
-                //   from start_byte > 0, or the newly discovered filename has a
-                //   partial file on disk with new_start_byte > 0 that --continue
-                //   must resume from), OR
-                // - in -N mode without --no-if-modified-since, the newly discovered
-                //   file exists on disk with an mtime and we did not send
-                //   If-Modified-Since on the initial GET.
-                let needs_ims_retry = args.newer
-                    && !args.no_if_modified_since
-                    && !ims_sent
-                    && output_info.as_ref().is_some_and(|i| i.modified.is_some());
-
-                if new_start_byte != start_byte || needs_ims_retry {
-                    if cd_redirect_count >= MAX_REDIRECTS {
-                        return Err(PermanentError::TooManyRedirects(MAX_REDIRECTS).into());
-                    }
-                    cd_redirect_count += 1;
-
-                    if !args.quiet && new_start_byte != start_byte {
-                        eprintln!(
-                            "Filename changed ('{old_filename}' -> '{new_name}'), adjusting resume offset to byte {new_start_byte}."
-                        );
-                    }
-                    start_byte = new_start_byte;
-                    force_truncate = new_force_truncate;
-                    continue; // RE-ISSUE GET REQUEST
-                }
-
-                force_truncate = new_force_truncate;
-            }
-        }
-
-        response = current_response;
-        break; // Successfully got response, break loop
-    }
-
-    // Prefer GET's Last-Modified, fallback to HEAD's
-    let effective_last_modified = get_last_modified.as_deref().or(head_last_modified);
-
-    // Pre-parse server timestamp for futimens (used inside download functions)
-    let server_mtime = if args.server_timestamps {
-        effective_last_modified.and_then(parse_http_date)
-    } else {
-        None
-    };
-
-    // Calculate total size for resume logic, but for the progress bar
-    // we strictly want to track the *stream* size (remaining bytes)
-    // to ensure speed/ETA calculations are correct.
-    // When the GET response omits Content-Length (e.g. chunked transfer
-    // encoding), fall back to expected_length from HEAD or --json-size-field
-    // (adjusted by start_byte when resuming).
-    let remaining_bytes = content_length.or_else(|| {
-        if response.status().is_success() {
-            expected_length.and_then(|exp| exp.checked_sub(start_byte))
-        } else {
-            None
-        }
-    });
-
-    // If writing to stdout, bypass file/temp logic
-    if is_stdout {
-        // Safety: Refuse binary/unknown content to terminal unless --force-tty-write
-        if std::io::stdout().is_terminal() && !args.force_tty_write {
-            let get_content_type =
-                response.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok());
-            if !is_text_content_type(get_content_type) {
-                return Err(PermanentError::BinaryToTerminal(
-                    get_content_type.map(std::string::ToString::to_string),
-                )
-                .into());
-            }
-        }
-        let mut stdout = tokio::io::stdout();
-        write_response_to_file(response, &mut stdout, args, remaining_bytes, start_byte, "-")
-            .await?;
-        return Ok(());
-    }
-
-    // In -N mode, force overwrite since we've already determined the file needs updating
-    let mut effective_args = args.clone();
-    if args.newer && output_info.is_some() {
-        effective_args.overwrite = true;
-    }
-    // Route hash-verified downloads through temp + atomic rename (see
-    // force_temp_for_verify at the top of this function).
-    if force_temp_for_verify {
-        effective_args.temp = true;
-    }
-
-    // From here on the destination (or its temp file) is about to be opened and
-    // written, so a retry may legitimately resume from what this attempt leaves
-    // behind. Before this point (timeouts, 4xx/5xx, redirects, early returns) a
-    // pre-existing file is not ours to resume, and the callers do not auto-resume.
-    *dest_touched = true;
-
-    if effective_args.temp {
-        let path_buf = temp_path.clone().expect("Logic error: temp path missing");
-        download_to_temp(
-            response,
-            &output_path,
-            &effective_args,
-            start_byte,
-            remaining_bytes,
-            force_truncate,
-            path_buf,
-            expected_sha256,
-            dir_cache,
-            server_mtime,
-        )
-        .await?;
-    } else {
-        download_direct(
-            response,
-            &output_path,
-            &effective_args,
-            start_byte,
-            remaining_bytes,
-            force_truncate,
-            expected_sha256,
-            dir_cache,
-            server_mtime,
-        )
-        .await?;
-    }
-
-    Ok(())
 }
 
 /// Open a temp file for writing (with resume support).
@@ -5524,6 +4863,613 @@ fn remove_temp_via_cache(path: &Path, cache: &mut DirCache) {
     }
 }
 
+async fn download_file(
+    client: &Client,
+    url: &Url,
+    mut prefetched_get: Option<Response>,
+    args: &Args,
+    expected_length: Option<u64>,
+    content_disposition: Option<&str>,
+    head_last_modified: Option<&str>,
+    used_filenames: &mut HashMap<PathBuf, u32>,
+    expected_sha256: Option<&str>,
+    dir_cache: &mut DirCache,
+    resolved_output: &mut Option<PinnedOutput>,
+    dest_touched: &mut bool,
+    send_auth: bool,
+    rl_tracker: &mut RateLimitTracker,
+) -> Result<()> {
+    let output_pinned = resolved_output.is_some();
+
+    let determined = determine_filename(args, url, content_disposition);
+    let is_stdout = args.output.as_deref() == Some("-");
+
+    let mut output_path = if let Some(ref output) = args.output {
+        PathBuf::from(output)
+    } else {
+        PathBuf::from(&determined)
+    };
+
+    if !is_stdout
+        && let Some(ref dir_str) = args.output_dir
+        && output_path.is_relative()
+    {
+        output_path = Path::new(dir_str).join(&output_path);
+    }
+
+    // Always extract final_filename strictly from output_path.file_name()!
+    let mut final_filename = if is_stdout {
+        "-".to_string()
+    } else {
+        output_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| {
+                anyhow::anyhow!("Output path '{}' has no valid filename", output_path.display())
+            })?
+            .to_string()
+    };
+    let mut head_filename = final_filename.clone();
+
+    if !is_stdout && final_filename.len() > MAX_FILENAME_BYTES {
+        let truncated_name = truncate_filename_to_limit(&final_filename);
+        let truncated_path = output_path.parent().unwrap_or(Path::new(".")).join(&truncated_name);
+        if !args.quiet {
+            eprintln!("Filename too long, truncating to: {}", truncated_path.display());
+        }
+        output_path = truncated_path;
+        final_filename = truncated_name;
+    }
+
+    let mut initial_canonical_key: Option<PathBuf> = None;
+    let mut prev_used_counter: Option<u32> = None;
+    if !is_stdout {
+        if let Some(pinned) = resolved_output.as_ref() {
+            output_path = pinned.output_path.clone();
+            if let Some(fname) = output_path.file_name().and_then(|s| s.to_str()) {
+                final_filename = fname.to_string();
+            }
+            used_filenames.insert(pinned.canonical_key.clone(), pinned.next_counter);
+            initial_canonical_key = Some(pinned.canonical_key.clone());
+        } else {
+            let unnumbered_output_path = output_path.clone();
+            prev_used_counter = used_filenames.get(&unnumbered_output_path).copied();
+            let (resolved_path, was_renamed) =
+                resolve_unique_output_path(&output_path, args, used_filenames, dir_cache)?;
+            if was_renamed && !args.quiet {
+                eprintln!(
+                    "Filename collision: '{}' -> '{}'",
+                    output_path.display(),
+                    resolved_path.display()
+                );
+            }
+            output_path = resolved_path;
+            if let Some(fname) = output_path.file_name().and_then(|s| s.to_str()) {
+                final_filename = fname.to_string();
+            }
+            let next_counter = *used_filenames.get(&unnumbered_output_path).unwrap_or(&1);
+            *resolved_output = Some(PinnedOutput {
+                output_path: output_path.clone(),
+                canonical_key: unnumbered_output_path.clone(),
+                next_counter,
+            });
+            initial_canonical_key = Some(unnumbered_output_path);
+        }
+    }
+
+    if !is_stdout {
+        check_path_before_open(&output_path, dir_cache)?;
+    }
+
+    let mut output_info =
+        if is_stdout { None } else { stat_file_via_cache(&output_path, dir_cache)? };
+
+    let force_temp_for_verify = expected_sha256.is_some();
+
+    let mut temp_path = if (args.temp || force_temp_for_verify) && !is_stdout {
+        let parent = output_path.parent().unwrap_or(Path::new("."));
+        Some(generate_deterministic_temp_filename(
+            url,
+            &final_filename,
+            parent,
+            args.tempnamelen,
+            args.debug,
+        ))
+    } else {
+        None
+    };
+
+    let mut temp_info =
+        if let Some(ref tp) = temp_path { stat_file_via_cache(tp, dir_cache)? } else { None };
+
+    let mut start_byte: u64 = 0;
+    let mut force_truncate = false;
+    if !is_stdout {
+        match evaluate_local_target(
+            &output_path,
+            temp_path.as_deref(),
+            output_info.as_ref(),
+            temp_info.as_ref(),
+            args,
+            expected_length,
+            head_last_modified,
+            expected_sha256,
+            dir_cache,
+        )? {
+            LocalTargetAction::AlreadyComplete => return Ok(()),
+            LocalTargetAction::Proceed { start_byte: sb, force_truncate: ft } => {
+                start_byte = sb;
+                force_truncate = ft;
+            },
+        }
+    }
+
+    let response;
+    let mut content_length;
+    let mut get_last_modified;
+
+    let mut cd_redirect_count = 0;
+    let mut force_no_ims = false;
+
+    loop {
+        let range_sent = start_byte > 0;
+
+        let size_matches = match (expected_length, output_info.as_ref()) {
+            (Some(exp_len), Some(out_info)) => out_info.is_regular && out_info.size == exp_len,
+            _ => true,
+        };
+
+        // Wget rule: when resuming (--continue or start_byte > 0), do NOT send
+        // If-Modified-Since (which would return 304 Not Modified instead of 206 Partial Content).
+        let should_send_ims = args.newer
+            && !args.no_if_modified_since
+            && !force_no_ims
+            && !args.resume
+            && start_byte == 0
+            && !is_stdout
+            && size_matches
+            && output_info.as_ref().is_some_and(|i| i.modified.is_some());
+
+        let mut ims_sent = false;
+
+        // Reuse the prefetched 200 OK GET from a 405 probe ONLY when no Range or
+        // If-Modified-Since header is needed on this request.
+        let current_response = if !range_sent
+            && !should_send_ims
+            && let Some(prefetched) = prefetched_get.take()
+        {
+            prefetched
+        } else {
+            prefetched_get = None;
+            rl_tracker.wait_before_request(url, args).await;
+
+            let mut request = client.get(url.clone());
+            if range_sent {
+                request = request.header(RANGE, format!("bytes={start_byte}-"));
+            }
+
+            if should_send_ims
+                && let Some(ref out_info) = output_info
+                && let Some(local_mtime) = out_info.modified
+            {
+                let http_date = format_http_date(local_mtime);
+                if args.verbose {
+                    eprintln!("Sending If-Modified-Since: {http_date}");
+                }
+                request = request.header(IF_MODIFIED_SINCE, http_date);
+                ims_sent = true;
+            }
+
+            if send_auth && let Some(ref u) = args.user {
+                request = request.basic_auth(u, args.password.as_deref());
+            }
+            request = with_sensitive_headers(request, args, send_auth);
+
+            request.send().await.context("Failed to send GET request")?
+        };
+
+        let status = current_response.status();
+
+        // Handle 304 Not Modified: if size mismatches, loop back with force_no_ims = true
+        // so the full GET runs through the normal loop body (including Content-Disposition checks!).
+        if status == StatusCode::NOT_MODIFIED {
+            rl_tracker.record_response(url, current_response.headers(), args);
+            let local_size = output_info.as_ref().map_or(0, |i| i.size);
+            if let Some(exp_len) = expected_length
+                && local_size != exp_len
+            {
+                if cd_redirect_count >= MAX_REDIRECTS {
+                    return Err(PermanentError::TooManyRedirects(MAX_REDIRECTS).into());
+                }
+                cd_redirect_count += 1;
+                if !args.quiet {
+                    eprintln!(
+                        "Server returned 304 Not Modified but local file size ({}) differs from server ({}), downloading entire file.",
+                        HumanBytes(local_size),
+                        HumanBytes(exp_len)
+                    );
+                }
+                start_byte = 0;
+                force_truncate = true;
+                force_no_ims = true;
+                continue;
+            }
+            if !args.quiet {
+                eprintln!(
+                    "Server file is not newer than local file '{}', skipping.",
+                    output_path.display()
+                );
+            }
+            if let Some(expected) = expected_sha256 {
+                verify_sha256_file(&output_path, expected, args.quiet, dir_cache)?;
+            }
+            return Ok(());
+        }
+
+        if status.is_redirection() {
+            rl_tracker.record_response(url, current_response.headers(), args);
+            if let Some(location) = current_response.headers().get(LOCATION) {
+                let location_str = location.to_str().unwrap_or("<invalid>");
+                return Err(PermanentError::RedirectOnGet {
+                    status: status.as_u16(),
+                    location: location_str.to_string(),
+                }
+                .into());
+            }
+            return Err(PermanentError::RedirectWithoutLocation(status.as_u16()).into());
+        }
+
+        if status == StatusCode::RANGE_NOT_SATISFIABLE && range_sent {
+            rl_tracker.record_response(url, current_response.headers(), args);
+            if !args.quiet {
+                eprintln!("File already fully downloaded.");
+            }
+            let lm_416 = current_response
+                .headers()
+                .get(LAST_MODIFIED)
+                .and_then(|v| v.to_str().ok())
+                .or(head_last_modified);
+            if let Some(ref tp) = temp_path
+                && temp_info.is_some()
+            {
+                if let Some(expected) = expected_sha256 {
+                    verify_sha256_file(tp, expected, args.quiet, dir_cache)?;
+                }
+                if args.server_timestamps {
+                    apply_server_timestamp(tp, lm_416, args.debug, dir_cache);
+                }
+                perform_atomic_move(tp, &output_path, args, dir_cache)?;
+            } else {
+                if let Some(expected) = expected_sha256 {
+                    verify_sha256_file(&output_path, expected, args.quiet, dir_cache)?;
+                }
+                if args.server_timestamps {
+                    apply_server_timestamp(&output_path, lm_416, args.debug, dir_cache);
+                }
+            }
+            return Ok(());
+        }
+
+        if status.is_client_error() || status.is_server_error() {
+            if args.content_on_error && !range_sent {
+                rl_tracker.record_response(url, current_response.headers(), args);
+                if !args.quiet {
+                    eprintln!(
+                        "Warning: HTTP {status} returned. Saving error body to file due to --content-on-error."
+                    );
+                }
+            } else {
+                return Err(handle_error_response(current_response, url, args, rl_tracker).await);
+            }
+        } else {
+            rl_tracker.record_response(url, current_response.headers(), args);
+        }
+
+        // In -N mode without resume (or when non-206 200 OK is returned), replace from byte 0
+        if args.newer
+            && output_info.is_some()
+            && status.is_success()
+            && status != StatusCode::PARTIAL_CONTENT
+        {
+            start_byte = 0;
+            force_truncate = true;
+        }
+
+        get_last_modified = current_response
+            .headers()
+            .get(LAST_MODIFIED)
+            .and_then(|v| v.to_str().ok())
+            .map(std::string::ToString::to_string);
+
+        if args.resume && start_byte > 0 {
+            if status == StatusCode::PARTIAL_CONTENT {
+                if let Some(content_range) = current_response.headers().get(CONTENT_RANGE)
+                    && let Ok(range_str) = content_range.to_str()
+                    && let Some(server_start) = parse_content_range(range_str)
+                    && server_start != start_byte
+                {
+                    return Err(PermanentError::ContentRangeMismatch {
+                        requested: start_byte,
+                        received: server_start,
+                    }
+                    .into());
+                }
+            } else {
+                if !args.quiet {
+                    eprintln!("Server doesn't support resume, restarting from scratch.");
+                }
+                start_byte = 0;
+                force_truncate = true;
+            }
+        }
+
+        content_length = current_response
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
+
+        if let (Some(max), Some(rem)) = (args.max_size, content_length)
+            && start_byte.saturating_add(rem) > max
+        {
+            return Err(PermanentError::FileSizeExceedsLimit {
+                size: start_byte.saturating_add(rem),
+                max,
+                url: url.to_string(),
+            }
+            .into());
+        }
+
+        if args.output.is_none() && !is_stdout && !output_pinned {
+            let get_cd = current_response
+                .headers()
+                .get(CONTENT_DISPOSITION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_content_disposition_header);
+
+            if let Some(ref new_name) = get_cd
+                && *new_name != head_filename
+            {
+                if args.debug {
+                    eprintln!(
+                        "[DEBUG] Content-Disposition changed on GET: '{head_filename}' -> '{new_name}'"
+                    );
+                }
+
+                let old_filename = head_filename.clone();
+                head_filename.clone_from(new_name);
+                output_path = if let Some(ref dir_str) = args.output_dir {
+                    Path::new(dir_str).join(new_name)
+                } else {
+                    PathBuf::from(new_name)
+                };
+                final_filename = output_path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(new_name)
+                    .to_string();
+
+                if final_filename.len() > MAX_FILENAME_BYTES {
+                    let truncated_name = truncate_filename_to_limit(&final_filename);
+                    let truncated_path =
+                        output_path.parent().unwrap_or(Path::new(".")).join(&truncated_name);
+                    if !args.quiet {
+                        eprintln!("Filename too long, truncating to: {}", truncated_path.display());
+                    }
+                    output_path = truncated_path;
+                    final_filename = truncated_name;
+                }
+
+                if let Some(old_key) = initial_canonical_key.take() {
+                    if let Some(prev_count) = prev_used_counter {
+                        used_filenames.insert(old_key, prev_count);
+                    } else {
+                        used_filenames.remove(&old_key);
+                    }
+                }
+
+                let unnumbered_new_path = output_path.clone();
+                prev_used_counter = used_filenames.get(&unnumbered_new_path).copied();
+                let (resolved_path, was_renamed) =
+                    resolve_unique_output_path(&output_path, args, used_filenames, dir_cache)?;
+                if was_renamed && !args.quiet {
+                    eprintln!(
+                        "Filename collision: '{}' -> '{}'",
+                        output_path.display(),
+                        resolved_path.display()
+                    );
+                }
+                output_path = resolved_path;
+                if let Some(fname) = output_path.file_name().and_then(|s| s.to_str()) {
+                    final_filename = fname.to_string();
+                }
+                let next_counter = *used_filenames.get(&unnumbered_new_path).unwrap_or(&1);
+                *resolved_output = Some(PinnedOutput {
+                    output_path: output_path.clone(),
+                    canonical_key: unnumbered_new_path.clone(),
+                    next_counter,
+                });
+                initial_canonical_key = Some(unnumbered_new_path);
+
+                let old_temp = temp_path.clone();
+                let old_temp_existed = temp_info.is_some();
+
+                if args.temp || force_temp_for_verify {
+                    let parent = output_path.parent().unwrap_or(Path::new("."));
+                    temp_path = Some(generate_deterministic_temp_filename(
+                        url,
+                        &final_filename,
+                        parent,
+                        args.tempnamelen,
+                        args.debug,
+                    ));
+                }
+
+                check_path_before_open(&output_path, dir_cache)?;
+
+                output_info = stat_file_via_cache(&output_path, dir_cache)?;
+                if let Some(ref tp) = temp_path {
+                    temp_info = stat_file_via_cache(tp, dir_cache)?;
+                }
+
+                if start_byte > 0
+                    && let Some(old_tp) = old_temp.as_deref()
+                    && old_temp_existed
+                    && temp_path.as_deref() != Some(old_tp)
+                {
+                    let parent = safe_parent(old_tp);
+                    if let Ok(dir) = get_cached_dir(dir_cache, parent)
+                        && let Some(old_name) = old_tp.file_name()
+                    {
+                        let _ = dir.remove_file(old_name);
+                        if args.debug {
+                            eprintln!(
+                                "[DEBUG] Removed orphaned temp file '{}' (filename changed on resume)",
+                                old_tp.display()
+                            );
+                        }
+                    }
+                }
+
+                let total_known = if status == StatusCode::PARTIAL_CONTENT {
+                    current_response
+                        .headers()
+                        .get(CONTENT_RANGE)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(parse_content_range_resp)
+                        .and_then(|r| r.complete_length)
+                        .or_else(|| content_length.map(|rem| start_byte.saturating_add(rem)))
+                        .or(expected_length)
+                } else if status.is_success() {
+                    content_length.or(expected_length)
+                } else {
+                    expected_length
+                };
+                let effective_lm = get_last_modified.as_deref().or(head_last_modified);
+
+                let (new_start_byte, new_force_truncate) = match evaluate_local_target(
+                    &output_path,
+                    temp_path.as_deref(),
+                    output_info.as_ref(),
+                    temp_info.as_ref(),
+                    args,
+                    total_known,
+                    effective_lm,
+                    expected_sha256,
+                    dir_cache,
+                )? {
+                    LocalTargetAction::AlreadyComplete => return Ok(()),
+                    LocalTargetAction::Proceed { start_byte: sb, force_truncate: ft } => (sb, ft),
+                };
+
+                let needs_ims_retry = args.newer
+                    && !args.no_if_modified_since
+                    && !force_no_ims
+                    && !args.resume
+                    && new_start_byte == 0
+                    && !ims_sent
+                    && output_info.as_ref().is_some_and(|i| i.modified.is_some());
+
+                if new_start_byte != start_byte || needs_ims_retry {
+                    if cd_redirect_count >= MAX_REDIRECTS {
+                        return Err(PermanentError::TooManyRedirects(MAX_REDIRECTS).into());
+                    }
+                    cd_redirect_count += 1;
+
+                    if !args.quiet && new_start_byte != start_byte {
+                        eprintln!(
+                            "Filename changed ('{old_filename}' -> '{new_name}'), adjusting resume offset to byte {new_start_byte}."
+                        );
+                    }
+                    start_byte = new_start_byte;
+                    force_truncate = new_force_truncate;
+                    continue;
+                }
+
+                force_truncate = new_force_truncate;
+            }
+        }
+
+        response = current_response;
+        break;
+    }
+
+    let effective_last_modified = get_last_modified.as_deref().or(head_last_modified);
+
+    let server_mtime = if args.server_timestamps {
+        effective_last_modified.and_then(parse_http_date)
+    } else {
+        None
+    };
+
+    let remaining_bytes = content_length.or_else(|| {
+        if response.status().is_success() {
+            expected_length.and_then(|exp| exp.checked_sub(start_byte))
+        } else {
+            None
+        }
+    });
+
+    if is_stdout {
+        if std::io::stdout().is_terminal() && !args.force_tty_write {
+            let get_content_type =
+                response.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok());
+            if !is_text_content_type(get_content_type) {
+                return Err(PermanentError::BinaryToTerminal(
+                    get_content_type.map(std::string::ToString::to_string),
+                )
+                .into());
+            }
+        }
+        let mut stdout = tokio::io::stdout();
+        write_response_to_file(response, &mut stdout, args, remaining_bytes, start_byte, "-")
+            .await?;
+        return Ok(());
+    }
+
+    let mut effective_args = args.clone();
+    if args.newer && output_info.is_some() {
+        effective_args.overwrite = true;
+    }
+    if force_temp_for_verify {
+        effective_args.temp = true;
+    }
+
+    *dest_touched = true;
+
+    if effective_args.temp {
+        let path_buf = temp_path.clone().expect("Logic error: temp path missing");
+        download_to_temp(
+            response,
+            &output_path,
+            &effective_args,
+            start_byte,
+            remaining_bytes,
+            force_truncate,
+            path_buf,
+            expected_sha256,
+            dir_cache,
+            server_mtime,
+        )
+        .await?;
+    } else {
+        download_direct(
+            response,
+            &output_path,
+            &effective_args,
+            start_byte,
+            remaining_bytes,
+            force_truncate,
+            expected_sha256,
+            dir_cache,
+            server_mtime,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
 async fn download_to_temp(
     response: Response,
     output_path: &Path,
@@ -5536,17 +5482,6 @@ async fn download_to_temp(
     dir_cache: &mut DirCache,
     server_mtime: Option<SystemTime>,
 ) -> Result<PathBuf> {
-    // Store the pinned parent directory handle and temp path for potential
-    // cleanup on signal (the handler unlinks through the handle, not the ambient path)
-    {
-        let pinned_dir = get_cached_dir(dir_cache, safe_parent(&temp_path))
-            .and_then(cap_std::fs::Dir::try_clone)
-            .ok();
-        let mut guard = CURRENT_TEMP_PATH.lock().unwrap();
-        *guard = pinned_dir.map(|d| (d, temp_path.clone()));
-    }
-
-    // Log temporary filename
     if !args.quiet {
         if start_byte > 0 && !force_truncate {
             eprintln!("Resuming with temporary file: {}", temp_path.display());
@@ -5555,7 +5490,6 @@ async fn download_to_temp(
         }
     }
 
-    // Determine actual start byte from temp file
     let actual_start_byte = if force_truncate {
         0
     } else if start_byte > 0 {
@@ -5564,13 +5498,20 @@ async fn download_to_temp(
         0
     };
 
-    // Open temp file (create or append)
+    // Open temp file BEFORE arming the signal handler guard so an existing file is
+    // never unlinked prior to ownership/device checks, and keep `_temp_guard` alive
+    // so early `?` returns always clear CURRENT_TEMP_PATH automatically.
     let std_file =
         open_temp_file_safely(&temp_path, args, actual_start_byte, force_truncate, dir_cache)
             .context("Failed to open temp file")?;
 
+    let pinned_dir = get_cached_dir(dir_cache, safe_parent(&temp_path))
+        .and_then(cap_std::fs::Dir::try_clone)
+        .ok();
+    let _temp_guard = TempPathGuard::arm(pinned_dir, &temp_path);
+
     let mut async_file = tokio::fs::File::from_std(std_file);
-    let bytes_written = write_response_to_file(
+    let bytes_written = match write_response_to_file(
         response,
         &mut async_file,
         args,
@@ -5578,7 +5519,19 @@ async fn download_to_temp(
         actual_start_byte,
         output_path.to_str().unwrap_or(""),
     )
-    .await?;
+    .await
+    {
+        Ok(n) => n,
+        Err(e) => {
+            drop(async_file);
+            // If this is a permanent error (e.g. DownloadExceedsLimit) and --keep-temp
+            // was not requested, clean up the partial temp file immediately.
+            if is_permanent_error(&e) && !args.keep_temp {
+                remove_temp_via_cache(&temp_path, dir_cache);
+            }
+            return Err(e);
+        },
+    };
 
     match async_file.sync_all().await {
         Ok(()) => {},
@@ -5586,9 +5539,6 @@ async fn download_to_temp(
         Err(e) => return Err(e.into()),
     }
 
-    // Apply server timestamp on the temp file via futimens BEFORE close and rename.
-    // The mtime is set on the temp file's fd — rename preserves inode metadata,
-    // so the final file inherits the correct mtime.
     if let Some(mtime) = server_mtime {
         let std_file = async_file.into_std().await;
         if let Err(e) = set_mtime_on_fd(&std_file, mtime) {
@@ -5603,20 +5553,9 @@ async fn download_to_temp(
         drop(async_file);
     }
 
-    // Verify SHA256 on the temp file BEFORE renaming to the final path.
-    // This way a corrupt download never overwrites a good file.
     if let Some(expected) = expected_sha256
         && let Err(e) = verify_sha256_file(&temp_path, expected, args.quiet, dir_cache)
     {
-        {
-            let mut guard = CURRENT_TEMP_PATH.lock().unwrap();
-            *guard = None;
-        }
-        // A temp file that failed verification must not survive by default:
-        // with the deterministic temp name a later `--temp --continue` run
-        // would see it as size-complete and finalize it. With --keep-temp it
-        // is kept for inspection; the finalize paths re-verify before
-        // promoting it.
         if !args.keep_temp {
             remove_temp_via_cache(&temp_path, dir_cache);
         }
@@ -5624,13 +5563,10 @@ async fn download_to_temp(
     }
 
     let move_result = perform_atomic_move(&temp_path, output_path, args, dir_cache);
-    {
-        let mut guard = CURRENT_TEMP_PATH.lock().unwrap();
-        *guard = None;
-    }
+    drop(_temp_guard);
+
     match move_result {
         Ok(path) => {
-            // SUCCESS: Log the output and return the path
             if !args.quiet {
                 eprintln!(
                     "Downloaded {} to {}",
@@ -5644,7 +5580,6 @@ async fn download_to_temp(
             Ok(path)
         },
         Err(e) => {
-            // FAILURE: Clean up the temp file (unless --keep-temp is set)
             if !args.keep_temp {
                 remove_temp_via_cache(&temp_path, dir_cache);
             }
@@ -5882,50 +5817,6 @@ async fn write_response_to_file<W: AsyncWrite + Unpin>(
     }
 
     Ok(bytes_written)
-}
-
-#[cfg(all(target_os = "linux", not(target_os = "android")))]
-#[cfg(not(miri))]
-pub fn apply_security_sandbox() -> Result<(), Box<dyn std::error::Error>> {
-    use libseccomp::{ScmpAction, ScmpArgCompare, ScmpCompareOp, ScmpFilterContext, ScmpSyscall};
-
-    let mut ctx = ScmpFilterContext::new(ScmpAction::Allow)?;
-
-    // Synchronize the filter across ALL threads of the process
-    // (SECCOMP_FILTER_FLAG_TSYNC) instead of only the calling thread.
-    ctx.set_ctl_tsync(true)?;
-
-    // Block specific syscalls entirely
-    ctx.add_rule(ScmpAction::Errno(libc::EPERM), ScmpSyscall::from_name("execve")?)?;
-    ctx.add_rule(ScmpAction::Errno(libc::EPERM), ScmpSyscall::from_name("execveat")?)?;
-    ctx.add_rule(ScmpAction::Errno(libc::EPERM), ScmpSyscall::from_name("accept")?)?;
-    ctx.add_rule(ScmpAction::Errno(libc::EPERM), ScmpSyscall::from_name("accept4")?)?;
-    ctx.add_rule(ScmpAction::Errno(libc::EPERM), ScmpSyscall::from_name("bind")?)?;
-    ctx.add_rule(ScmpAction::Errno(libc::EPERM), ScmpSyscall::from_name("listen")?)?;
-    ctx.add_rule(ScmpAction::Errno(libc::EPERM), ScmpSyscall::from_name("ptrace")?)?;
-
-    // Block specific socket families.
-    // NOTE: glibc's getaddrinfo() opens an AF_NETLINK socket (__check_pf) to
-    // enumerate local addresses and may try AF_UNIX to reach nscd or
-    // systemd-resolved.
-    let blocked_families =
-        [libc::AF_UNIX, libc::AF_NETLINK, libc::AF_PACKET, libc::AF_BLUETOOTH, libc::AF_VSOCK];
-
-    for family in blocked_families {
-        ctx.add_rule_conditional(
-            ScmpAction::Errno(libc::EPERM),
-            ScmpSyscall::from_name("socket")?,
-            &[ScmpArgCompare::new(0, ScmpCompareOp::Equal, family as u64)],
-        )?;
-    }
-
-    ctx.load()?;
-    Ok(())
-}
-
-#[cfg(any(miri, target_os = "android", not(target_os = "linux")))]
-pub fn apply_security_sandbox() -> Result<(), Box<dyn std::error::Error>> {
-    Ok(())
 }
 
 //#[tokio::main]
