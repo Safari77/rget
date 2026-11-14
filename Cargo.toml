@@ -6,7 +6,7 @@ publish = false
 edition = "2024"
 description = "Secure file downloader with wget-like functionality"
 authors = ["Sami Farin"]
-license = "Apache-2.0 AND GPL-3.0-only"
+license = "GPL-3.0-only"
 
 [dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json", "hickory-dns"] }
