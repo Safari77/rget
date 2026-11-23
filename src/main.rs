@@ -63,7 +63,7 @@ use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
 use ipnet::{Ipv4Net, Ipv6Net};
 use regex::Regex;
 use reqwest::{
-    Client, Identity, Response, StatusCode,
+    Client, Identity, Method, Response, StatusCode,
     header::{
         AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, COOKIE,
         HeaderMap, HeaderName, HeaderValue, IF_MODIFIED_SINCE, LAST_MODIFIED, LOCATION,
@@ -1585,7 +1585,7 @@ async fn resolve_final_url_and_client(
 
         validate_url(&current_url, args.insecure)?;
 
-        rl_tracker.wait_before_request(&current_url, args).await;
+        rl_tracker.wait_before_request(&current_url, &Method::HEAD, args).await;
 
         if args.verbose {
             eprintln!("-> Requesting: {current_url}");
@@ -1657,7 +1657,13 @@ async fn resolve_final_url_and_client(
 
         let mut used_range_probe = false;
         let mut response = request.send().await.context("Failed to send HEAD request")?;
-        rl_tracker.record_response(&current_url, response.headers(), args);
+        rl_tracker.record_response(
+            &current_url,
+            &Method::HEAD,
+            response.status(),
+            response.headers(),
+            args,
+        );
 
         if response.status() == StatusCode::METHOD_NOT_ALLOWED {
             // Drain any small 405 body so the connection stays reusable for the GET probe
@@ -1669,7 +1675,7 @@ async fn resolve_final_url_and_client(
                     "[DEBUG] HEAD status: 405 Method Not Allowed. Probing with GET (Range: bytes=0-0)..."
                 );
             }
-            rl_tracker.wait_before_request(&current_url, args).await;
+            rl_tracker.wait_before_request(&current_url, &Method::GET, args).await;
             let mut get_request = client.get(current_url.clone()).header(RANGE, "bytes=0-0");
             if let Some(ref u) = args.user
                 && same_host
@@ -1678,7 +1684,13 @@ async fn resolve_final_url_and_client(
             }
             get_request = with_sensitive_headers(get_request, args, same_host);
             response = get_request.send().await.context("Failed to send GET request")?;
-            rl_tracker.record_response(&current_url, response.headers(), args);
+            rl_tracker.record_response(
+                &current_url,
+                &Method::GET,
+                response.status(),
+                response.headers(),
+                args,
+            );
             used_range_probe = true;
         }
 
@@ -1736,7 +1748,15 @@ async fn resolve_final_url_and_client(
         if (status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::SERVICE_UNAVAILABLE)
             && !args.content_on_error
         {
-            return Err(handle_error_response(response, &current_url, args, rl_tracker).await);
+            let req_method = if used_range_probe { &Method::GET } else { &Method::HEAD };
+            return Err(handle_error_response(
+                response,
+                &current_url,
+                req_method,
+                args,
+                rl_tracker,
+            )
+            .await);
         }
 
         let mut prefetched_get = None;
@@ -1928,7 +1948,7 @@ async fn run_with_args(args: Args, hsts_db: &mut HstsMap) -> Result<()> {
     }
 
     let mut client_cache: HashMap<String, Client> = HashMap::new();
-    let mut rl_tracker = RateLimitTracker::default();
+    let mut rl_tracker = RateLimitTracker::new();
     let mut overall_success = true;
     let max_retries = if args.retries == 0 { u64::MAX } else { args.retries };
 
@@ -4324,7 +4344,7 @@ async fn fetch_json_body(
     let response = if let Some(resp) = prefetched_get {
         resp
     } else {
-        rl_tracker.wait_before_request(url, args).await;
+        rl_tracker.wait_before_request(url, &Method::GET, args).await;
 
         let mut request = client.get(url.clone());
         if send_auth && let Some(ref u) = args.user {
@@ -4336,7 +4356,7 @@ async fn fetch_json_body(
         let status = resp.status();
 
         if status.is_redirection() {
-            rl_tracker.record_response(url, resp.headers(), args);
+            rl_tracker.record_response(url, &Method::GET, status, resp.headers(), args);
             if let Some(location) = resp.headers().get(LOCATION) {
                 let location_str = location.to_str().unwrap_or("<invalid>");
                 return Err(PermanentError::RedirectOnGet {
@@ -4349,10 +4369,10 @@ async fn fetch_json_body(
         }
 
         if !status.is_success() {
-            return Err(handle_error_response(resp, url, args, rl_tracker).await);
+            return Err(handle_error_response(resp, url, &Method::GET, args, rl_tracker).await);
         }
 
-        rl_tracker.record_response(url, resp.headers(), args);
+        rl_tracker.record_response(url, &Method::GET, status, resp.headers(), args);
         resp
     };
 
@@ -5041,7 +5061,7 @@ async fn download_file(
             prefetched
         } else {
             prefetched_get = None;
-            rl_tracker.wait_before_request(url, args).await;
+            rl_tracker.wait_before_request(url, &Method::GET, args).await;
 
             let mut request = client.get(url.clone());
             if range_sent {
@@ -5073,7 +5093,7 @@ async fn download_file(
         // Handle 304 Not Modified: if size mismatches, loop back with force_no_ims = true
         // so the full GET runs through the normal loop body (including Content-Disposition checks!).
         if status == StatusCode::NOT_MODIFIED {
-            rl_tracker.record_response(url, current_response.headers(), args);
+            rl_tracker.record_response(url, &Method::GET, status, current_response.headers(), args);
             let local_size = output_info.as_ref().map_or(0, |i| i.size);
             if let Some(exp_len) = expected_length
                 && local_size != exp_len
@@ -5107,7 +5127,7 @@ async fn download_file(
         }
 
         if status.is_redirection() {
-            rl_tracker.record_response(url, current_response.headers(), args);
+            rl_tracker.record_response(url, &Method::GET, status, current_response.headers(), args);
             if let Some(location) = current_response.headers().get(LOCATION) {
                 let location_str = location.to_str().unwrap_or("<invalid>");
                 return Err(PermanentError::RedirectOnGet {
@@ -5120,7 +5140,7 @@ async fn download_file(
         }
 
         if status == StatusCode::RANGE_NOT_SATISFIABLE && range_sent {
-            rl_tracker.record_response(url, current_response.headers(), args);
+            rl_tracker.record_response(url, &Method::GET, status, current_response.headers(), args);
             if !args.quiet {
                 eprintln!("File already fully downloaded.");
             }
@@ -5152,17 +5172,30 @@ async fn download_file(
 
         if status.is_client_error() || status.is_server_error() {
             if args.content_on_error && !range_sent {
-                rl_tracker.record_response(url, current_response.headers(), args);
+                rl_tracker.record_response(
+                    url,
+                    &Method::GET,
+                    status,
+                    current_response.headers(),
+                    args,
+                );
                 if !args.quiet {
                     eprintln!(
                         "Warning: HTTP {status} returned. Saving error body to file due to --content-on-error."
                     );
                 }
             } else {
-                return Err(handle_error_response(current_response, url, args, rl_tracker).await);
+                return Err(handle_error_response(
+                    current_response,
+                    url,
+                    &Method::GET,
+                    args,
+                    rl_tracker,
+                )
+                .await);
             }
         } else {
-            rl_tracker.record_response(url, current_response.headers(), args);
+            rl_tracker.record_response(url, &Method::GET, status, current_response.headers(), args);
         }
 
         // In -N mode without resume (or when non-206 200 OK is returned), replace from byte 0

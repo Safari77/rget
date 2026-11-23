@@ -16,6 +16,7 @@
 * **Atomic Writes:** Implementation of `--temp` writes data to a temporary file first and atomically renames it upon completion, preventing corrupted partial files.
 * **Smart Filenames:** Derives filenames from the URL or `Content-Disposition` headers (with RFC 5987 charset support).
 * **Resumable Downloads:** Supports `Range` headers to resume interrupted downloads (`-c`).
+* **HTTP API ratelimit draft:** Retries downloads automatically according to `draft-ietf-httpapi-ratelimit-headers-12.txt`.
 * **Filename Truncation:** Automatically truncates filenames that exceed the filesystem's limit.
 
 ### **Networking & UX**
