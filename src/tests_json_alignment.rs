@@ -448,6 +448,7 @@ fn test_json_argument_validation_scenarios() {
         filemode: None,
         cert: None,
         key: None,
+        cafile: None,
         force_tty_write: false,
         hsts_file: None,
         no_hsts_update: true,

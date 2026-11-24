@@ -17,6 +17,7 @@
 //! - Safe open flags when creating files (`O_EXCL` `O_NOFOLLOW` `O_NOCTTY`)
 //! - Windows Reserved Filename protection
 //! - Mutual TLS (mTLS) support via --cert and --key
+//! - Custom CA certificate bundle support via --cafile
 //! - HSTS Persistence to enforce HTTPS for known hosts
 //! - End-of-stream Content-Length verification (truncated download detection)
 //! - Hash verification (--json-verify-hash) always writes via temp file + atomic rename
@@ -340,6 +341,9 @@ pub enum PermanentError {
     // --cert and --key
     ClientCertError(String),
 
+    // --cafile
+    CaFileError(String),
+
     // Stdout safety
     BinaryToTerminal(Option<String>),
 
@@ -483,6 +487,9 @@ impl std::fmt::Display for PermanentError {
             },
             Self::ClientCertError(msg) => {
                 write!(f, "Client certificate/key error: {msg}")
+            },
+            Self::CaFileError(msg) => {
+                write!(f, "CA certificate file error: {msg}")
             },
             Self::BinaryToTerminal(ct) => {
                 if let Some(ct) = ct {
@@ -865,6 +872,10 @@ struct Args {
     /// Private key file (PEM) for Mutual TLS
     #[arg(long = "key", requires = "cert", help = "Private key file (PEM) for Mutual TLS")]
     key: Option<String>,
+
+    /// CA certificate file (PEM) used as the CA cert list to verify peer certificates
+    #[arg(long = "cafile", help = "CA certificate file (PEM) to verify peer certificates")]
+    cafile: Option<String>,
 
     /// Force writing to terminal even for binary or unknown content types
     #[arg(
@@ -1263,47 +1274,102 @@ fn safe_parent(path: &Path) -> &Path {
     if parent.as_os_str().is_empty() { Path::new(".") } else { parent }
 }
 
+/// Load CA certificates from a PEM file into a fresh `RootCertStore`.
+/// Used by `--cafile` to replace the default CA certificate list.
+fn load_ca_root_store(path: &str, quiet: bool, debug: bool) -> Result<rustls::RootCertStore> {
+    use rustls::pki_types::pem::{Error as PemError, PemObject};
+
+    let certs = rustls::pki_types::CertificateDer::pem_file_iter(path)
+        .map_err(|e| PermanentError::CaFileError(format!("Failed to open '{path}': {e}")))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| match e {
+            PemError::Io(io_err) => {
+                PermanentError::CaFileError(format!("Failed to read '{path}': {io_err}"))
+            },
+            other => PermanentError::CaFileError(format!("Invalid PEM in '{path}': {other}")),
+        })?;
+
+    if certs.is_empty() {
+        return Err(
+            PermanentError::CaFileError(format!("No CA certificates found in '{path}'")).into()
+        );
+    }
+
+    let mut root_store = rustls::RootCertStore::empty();
+    let (added, ignored) = root_store.add_parsable_certificates(certs);
+
+    if added == 0 {
+        return Err(PermanentError::CaFileError(format!(
+            "No valid CA certificates found in '{path}' ({ignored} failed to parse)"
+        ))
+        .into());
+    }
+
+    if ignored > 0 && !quiet {
+        eprintln!(
+            "Warning: Ignored {ignored} unparsable CA certificate(s) in '{path}' (loaded {added})"
+        );
+    }
+
+    if debug {
+        eprintln!("[DEBUG] Loaded {added} CA certificate(s) from '{path}'");
+    }
+
+    Ok(root_store)
+}
+
 /// Build the TLS `ClientConfig` once per invocation.
 /// Returns None in --insecure mode (no rustls config needed).
 fn build_tls_config(args: &Args) -> Result<Option<ClientConfig>> {
     if args.insecure {
+        if args.debug && args.cafile.is_some() {
+            eprintln!(
+                "[DEBUG] --insecure specified: certificate verification disabled (ignoring --cafile)"
+            );
+        }
         return Ok(None);
     }
 
-    let tls_builder = ClientConfig::builder();
+    let tls_builder = if let Some(ref cafile_path) = args.cafile {
+        let root_store = load_ca_root_store(cafile_path, args.quiet, args.debug)?;
+        ClientConfig::builder().with_root_certificates(root_store)
+    } else {
+        // Try platform verifier, fallback to WebPKI roots if failed.
+        // On Android, we explicitly skip platform verifier to avoid panics in CLI environments (missing JNI).
+        #[cfg(not(target_os = "android"))]
+        {
+            match ClientConfig::builder().with_platform_verifier() {
+                Ok(builder) => builder,
+                Err(e) => {
+                    if args.debug || args.verbose {
+                        eprintln!(
+                            "Warning: Platform verifier unavailable ({e}). Falling back to WebPKI roots."
+                        );
+                    }
+                    let mut root_store = rustls::RootCertStore::empty();
+                    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                    ClientConfig::builder().with_root_certificates(root_store)
+                },
+            }
+        }
 
-    // Try platform verifier, fallback to WebPKI roots if failed.
-    // On Android, we explicitly skip platform verifier to avoid panics in CLI environments (missing JNI).
-    #[cfg(not(target_os = "android"))]
-    let tls_builder = match tls_builder.with_platform_verifier() {
-        Ok(builder) => builder,
-        Err(e) => {
-            if args.debug || args.verbose {
+        #[cfg(target_os = "android")]
+        {
+            if args.debug {
                 eprintln!(
-                    "Warning: Platform verifier unavailable ({e}). Falling back to WebPKI roots."
+                    "[DEBUG] Android detected: Skipping platform verifier (requires JNI), using bundled WebPKI roots."
                 );
             }
             let mut root_store = rustls::RootCertStore::empty();
             root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
             ClientConfig::builder().with_root_certificates(root_store)
-        },
-    };
-
-    #[cfg(target_os = "android")]
-    let tls_builder = {
-        if args.debug {
-            eprintln!(
-                "[DEBUG] Android detected: Skipping platform verifier (requires JNI), using bundled WebPKI roots."
-            );
         }
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        ClientConfig::builder().with_root_certificates(root_store)
     };
 
     let client_config = if let (Some(cert_path), Some(key_path)) = (&args.cert, &args.key) {
         if args.debug {
-            eprintln!("[DEBUG] Loading client certificate (platform-verifier): {cert_path}");
+            let verifier = if args.cafile.is_some() { "cafile" } else { "platform-verifier" };
+            eprintln!("[DEBUG] Loading client certificate ({verifier}): {cert_path}");
         }
         let certs = load_certs(cert_path)?;
         let key = load_key(key_path)?;

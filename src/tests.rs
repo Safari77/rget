@@ -37,6 +37,7 @@ fn make_args() -> Args {
         disable_hsts: false,
         cert: None,
         key: None,
+        cafile: None,
         force_tty_write: false,
         newer: false,
         no_if_modified_since: false,
@@ -2415,4 +2416,344 @@ fn test_open_temp_file_safely_and_server_timestamps() {
             Some(PermanentError::IsASymlink(_))
         ));
     }
+}
+
+// --- --cafile TLS tests ---
+
+const TEST_CA_A_PEM: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIBmTCCAT+gAwIBAgIUS3S+4s5FQERlNVYOLzoWa5hTs+8wCgYIKoZIzj0EAwIw
+GTEXMBUGA1UEAwwOVGVzdCBSb290IENBIEEwIBcNMjAwMTAxMDAwMDAwWhgPMjA5
+OTEyMzEyMzU5NTlaMBkxFzAVBgNVBAMMDlRlc3QgUm9vdCBDQSBBMFkwEwYHKoZI
+zj0CAQYIKoZIzj0DAQcDQgAE6rU7Mu9BxiplCi4Y2XEODg6wNN87YuvznkvSAoSt
+hFzGm2Zv5TW17Fso1ejB/9s94FDN3v4ay728ZIBPJmWItaNjMGEwHQYDVR0OBBYE
+FEEQOHl0tqO00mHCOwebUoScCIXUMB8GA1UdIwQYMBaAFEEQOHl0tqO00mHCOweb
+UoScCIXUMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMAoGCCqGSM49
+BAMCA0gAMEUCIEji8IpngNXVT2dCQEtfd+4sAHvgaboK2eOIoHIqK9kOAiEAk05a
+sQtPRL2qrnS8btM0JXRNxX5wupiIhYv03+4kqoc=
+-----END CERTIFICATE-----
+";
+
+const TEST_SRV_A_CERT_PEM: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIBxTCCAWygAwIBAgIUN/LKtOfJX408dYNUfKAbPLEQNL0wCgYIKoZIzj0EAwIw
+GTEXMBUGA1UEAwwOVGVzdCBSb290IENBIEEwIBcNMjAwMTAxMDAwMDAwWhgPMjA5
+OTEyMzEyMzU5NTlaMBgxFjAUBgNVBAMMDXNlcnZlci1hLnRlc3QwWTATBgcqhkjO
+PQIBBggqhkjOPQMBBwNCAATSr7wCZmSaembIKv3JI7ukRfMu/xHpNQE98sgFNQp0
+FtZ80oeE4xZdUpGGZj6d8ymjp/Z865EpTy2dsRw3r66do4GQMIGNMAwGA1UdEwEB
+/wQCMAAwDgYDVR0PAQH/BAQDAgeAMBMGA1UdJQQMMAoGCCsGAQUFBwMBMBgGA1Ud
+EQQRMA+CDXNlcnZlci1hLnRlc3QwHQYDVR0OBBYEFDBrGx6DSagu7qN09bCU61lQ
+VjtIMB8GA1UdIwQYMBaAFEEQOHl0tqO00mHCOwebUoScCIXUMAoGCCqGSM49BAMC
+A0cAMEQCIHo/gagxQz8RREcLWM5U7XQj9crxnhrCUrJFfJNflpT1AiAev4PlpJn8
+xN23ZxwrHcI/JHhRkYsrxO4VyrEfKKfXgA==
+-----END CERTIFICATE-----
+";
+
+const TEST_SRV_A_KEY_PEM: &str = "\
+-----BEGIN EC PRIVATE KEY-----
+MHcCAQEEIGqMyBuHAxbicDMGdSoP2Gupy5npzHfyh7dyuXznP1AZoAoGCCqGSM49
+AwEHoUQDQgAE0q+8AmZkmnpmyCr9ySO7pEXzLv8R6TUBPfLIBTUKdBbWfNKHhOMW
+XVKRhmY+nfMpo6f2fOuRKU8tnbEcN6+unQ==
+-----END EC PRIVATE KEY-----
+";
+
+const TEST_CA_B_PEM: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIBmjCCAT+gAwIBAgIUeb8H7LdnkpWAF47N8yM0ohEn/KQwCgYIKoZIzj0EAwIw
+GTEXMBUGA1UEAwwOVGVzdCBSb290IENBIEIwIBcNMjAwMTAxMDAwMDAwWhgPMjA5
+OTEyMzEyMzU5NTlaMBkxFzAVBgNVBAMMDlRlc3QgUm9vdCBDQSBCMFkwEwYHKoZI
+zj0CAQYIKoZIzj0DAQcDQgAES+S/p5DTZjdmNF/Jl2j27q2zolL8rsKdkddV91y7
+rji17YohhjvxjOiFJb/+DXZOskn4r49OpffsXiQdQfqhoKNjMGEwHQYDVR0OBBYE
+FH1H+djHVafbWeTPc9ii+10Riv+qMB8GA1UdIwQYMBaAFH1H+djHVafbWeTPc9ii
++10Riv+qMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMAoGCCqGSM49
+BAMCA0kAMEYCIQDoU4Eee2I4zamDoPvydcFwZKVlhTT//mJj2a9l3HsSnwIhAM6x
+syc1D1XJAcfvnNPsUhRpSAhV7212JdckVdwr1JmN
+-----END CERTIFICATE-----
+";
+
+const TEST_SRV_B_CERT_PEM: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIBxjCCAWygAwIBAgIUNCljg22V6qdJ29AKCF0B54ehSZIwCgYIKoZIzj0EAwIw
+GTEXMBUGA1UEAwwOVGVzdCBSb290IENBIEIwIBcNMjAwMTAxMDAwMDAwWhgPMjA5
+OTEyMzEyMzU5NTlaMBgxFjAUBgNVBAMMDXNlcnZlci1iLnRlc3QwWTATBgcqhkjO
+PQIBBggqhkjOPQMBBwNCAAR5uorZ1wwtgV97Wa1ps+9gK+4k9jpaPJArQ63Eyb3Y
+9KGtd4H+C6SWH1jBpQLCCVvSBSNwrVNFptkGAH5dTXRGo4GQMIGNMAwGA1UdEwEB
+/wQCMAAwDgYDVR0PAQH/BAQDAgeAMBMGA1UdJQQMMAoGCCsGAQUFBwMBMBgGA1Ud
+EQQRMA+CDXNlcnZlci1iLnRlc3QwHQYDVR0OBBYEFDt7EAQFfMB3Z/m6v8i45T3B
+sSlBMB8GA1UdIwQYMBaAFH1H+djHVafbWeTPc9ii+10Riv+qMAoGCCqGSM49BAMC
+A0gAMEUCIFSOnCz5UjmucMFq++CMLSqMubQv4FeT7nBgetbEPDMZAiEA/yGXw/Y7
+1XEXbqztWnnDT7MPu8iwrQ8T9Sx9UKa5Bpg=
+-----END CERTIFICATE-----
+";
+
+const TEST_SRV_B_KEY_PEM: &str = "\
+-----BEGIN EC PRIVATE KEY-----
+MHcCAQEEIC9s1dTY5M7pmqOHx5fhT1OzD36xWjFyQ3SQjjkyYZRQoAoGCCqGSM49
+AwEHoUQDQgAEebqK2dcMLYFfe1mtabPvYCvuJPY6WjyQK0OtxMm92PShrXeB/guk
+lh9YwaUCwglb0gUjcK1TRabZBgB+XU10Rg==
+-----END EC PRIVATE KEY-----
+";
+
+const TEST_CLI_A_CERT_PEM: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIBpzCCAU6gAwIBAgIUN/LKtOfJX408dYNUfKAbPLEQNL4wCgYIKoZIzj0EAwIw
+GTEXMBUGA1UEAwwOVGVzdCBSb290IENBIEEwIBcNMjAwMTAxMDAwMDAwWhgPMjA5
+OTEyMzEyMzU5NTlaMBYxFDASBgNVBAMMC3Rlc3QtY2xpZW50MFkwEwYHKoZIzj0C
+AQYIKoZIzj0DAQcDQgAEU4yCn7+1k38+FO65FAFgdimINflEXGctr7S6rf01NZZQ
+ArUS38omMeI5H5C3lv6Woo+l8b0t5vDVLz6Pm7ejkaN1MHMwDAYDVR0TAQH/BAIw
+ADAOBgNVHQ8BAf8EBAMCB4AwEwYDVR0lBAwwCgYIKwYBBQUHAwIwHQYDVR0OBBYE
+FBrdgpQWKP895dXzGuIEcQ9PXyb9MB8GA1UdIwQYMBaAFEEQOHl0tqO00mHCOweb
+UoScCIXUMAoGCCqGSM49BAMCA0cAMEQCIBv3y4I2beJ1egHZ1ojmJK4CeVG774xm
+6WPWQT8pF1d6AiAkULSKBWzMu4Choeb/LTs3a9h7Fpox67fyCLjnjmMFWw==
+-----END CERTIFICATE-----
+";
+
+const TEST_CLI_A_KEY_PEM: &str = "\
+-----BEGIN EC PRIVATE KEY-----
+MHcCAQEEIAvirXgiXBH/8oCL9969cjsUoApS8KSeD98rx/bVq0s7oAoGCCqGSM49
+AwEHoUQDQgAEU4yCn7+1k38+FO65FAFgdimINflEXGctr7S6rf01NZZQArUS38om
+MeI5H5C3lv6Woo+l8b0t5vDVLz6Pm7ejkQ==
+-----END EC PRIVATE KEY-----
+";
+
+fn ensure_crypto_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
+fn make_test_server_config(
+    cert_pem: &str,
+    key_pem: &str,
+    client_ca_pem: Option<&str>,
+) -> Arc<rustls::ServerConfig> {
+    use rustls::pki_types::pem::PemObject;
+    ensure_crypto_provider();
+
+    let certs: Vec<_> = rustls::pki_types::CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).unwrap();
+
+    let builder = if let Some(ca_pem) = client_ca_pem {
+        let ca_certs: Vec<_> = rustls::pki_types::CertificateDer::pem_slice_iter(ca_pem.as_bytes())
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.add_parsable_certificates(ca_certs);
+        let verifier =
+            rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store)).build().unwrap();
+        rustls::ServerConfig::builder().with_client_cert_verifier(verifier)
+    } else {
+        rustls::ServerConfig::builder().with_no_client_auth()
+    };
+
+    Arc::new(builder.with_single_cert(certs, key).unwrap())
+}
+
+fn run_in_memory_tls_handshake(
+    client_config: Arc<ClientConfig>,
+    server_config: Arc<rustls::ServerConfig>,
+    server_name: &'static str,
+) -> std::result::Result<(), rustls::Error> {
+    let sni = rustls::pki_types::ServerName::try_from(server_name).unwrap();
+    let mut client = rustls::ClientConnection::new(client_config, sni)?;
+    let mut server = rustls::ServerConnection::new(server_config)?;
+
+    let mut c2s = Vec::new();
+    let mut s2c = Vec::new();
+    while client.is_handshaking() || server.is_handshaking() {
+        c2s.clear();
+        client.write_tls(&mut c2s).unwrap();
+        if !c2s.is_empty() {
+            let mut rd: &[u8] = &c2s;
+            server.read_tls(&mut rd).unwrap();
+            server.process_new_packets()?;
+        }
+
+        s2c.clear();
+        server.write_tls(&mut s2c).unwrap();
+        if !s2c.is_empty() {
+            let mut rd: &[u8] = &s2c;
+            client.read_tls(&mut rd).unwrap();
+            client.process_new_packets()?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_cafile_cli_parsing() {
+    let parsed = Args::try_parse_from([
+        "rget",
+        "--cafile",
+        "/tmp/my-ca.pem",
+        "https://server-a.test/file.bin",
+    ])
+    .expect("--cafile should parse");
+    assert_eq!(parsed.cafile.as_deref(), Some("/tmp/my-ca.pem"));
+    assert!(!parsed.insecure);
+
+    // --cafile does not conflict with --insecure
+    let parsed_insecure = Args::try_parse_from([
+        "rget",
+        "--cafile",
+        "/tmp/my-ca.pem",
+        "--insecure",
+        "https://server-a.test/file.bin",
+    ])
+    .expect("--cafile with --insecure should parse");
+    assert_eq!(parsed_insecure.cafile.as_deref(), Some("/tmp/my-ca.pem"));
+    assert!(parsed_insecure.insecure);
+}
+
+#[test]
+fn test_cafile_verifies_only_specified_ca_and_enforces_hostname() {
+    ensure_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let ca_a_path = dir.path().join("ca_a.pem");
+    std::fs::write(&ca_a_path, TEST_CA_A_PEM).unwrap();
+
+    let mut args = make_args();
+    args.cafile = Some(ca_a_path.to_str().unwrap().to_string());
+
+    let client_config = Arc::new(build_tls_config(&args).unwrap().expect("TLS config expected"));
+
+    // reqwest client builds cleanly with the preconfigured --cafile TLS config
+    build_client(&args, None, &Some((*client_config).clone())).unwrap();
+
+    // Server A (signed by CA A) succeeds for matching hostname
+    let srv_a = make_test_server_config(TEST_SRV_A_CERT_PEM, TEST_SRV_A_KEY_PEM, None);
+    run_in_memory_tls_handshake(client_config.clone(), srv_a.clone(), "server-a.test")
+        .expect("cert signed by --cafile CA should be trusted");
+
+    // Server A fails when hostname does not match (--insecure is still needed for invalid hostnames)
+    let wrong_host_err =
+        run_in_memory_tls_handshake(client_config.clone(), srv_a, "wrong-host.test")
+            .expect_err("hostname mismatch must still be rejected with --cafile");
+    assert!(matches!(wrong_host_err, rustls::Error::InvalidCertificate(_)));
+
+    // Server B (signed by CA B, not in ca_a.pem) is rejected
+    let srv_b = make_test_server_config(TEST_SRV_B_CERT_PEM, TEST_SRV_B_KEY_PEM, None);
+    let untrusted_err = run_in_memory_tls_handshake(client_config, srv_b, "server-b.test")
+        .expect_err("cert signed by CA not in --cafile must be rejected");
+    assert!(matches!(untrusted_err, rustls::Error::InvalidCertificate(_)));
+
+    // Plain HTTP is still refused unless --insecure is passed
+    let http_url = Url::parse("http://server-a.test/file.bin").unwrap();
+    let url_err = validate_url(&http_url, args.insecure).unwrap_err();
+    assert!(matches!(
+        url_err.downcast_ref::<PermanentError>(),
+        Some(PermanentError::InsecureUrl(_))
+    ));
+}
+
+#[test]
+fn test_cafile_bundle_with_multiple_cas_and_comments() {
+    ensure_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let bundle_path = dir.path().join("ca_bundle.pem");
+    let bundle = format!(
+        "# Custom CA bundle\nSubject: Test Root CA A\n{TEST_CA_A_PEM}\n# Second CA\n{TEST_CA_B_PEM}"
+    );
+    std::fs::write(&bundle_path, bundle).unwrap();
+
+    let mut args = make_args();
+    args.cafile = Some(bundle_path.to_str().unwrap().to_string());
+
+    let client_config = Arc::new(build_tls_config(&args).unwrap().expect("TLS config expected"));
+
+    let srv_a = make_test_server_config(TEST_SRV_A_CERT_PEM, TEST_SRV_A_KEY_PEM, None);
+    let srv_b = make_test_server_config(TEST_SRV_B_CERT_PEM, TEST_SRV_B_KEY_PEM, None);
+
+    run_in_memory_tls_handshake(client_config.clone(), srv_a, "server-a.test")
+        .expect("CA A in bundle should verify server A");
+    run_in_memory_tls_handshake(client_config, srv_b, "server-b.test")
+        .expect("CA B in bundle should verify server B");
+}
+
+#[test]
+fn test_cafile_with_mtls_client_cert() {
+    ensure_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let ca_a_path = dir.path().join("ca_a.pem");
+    let cli_cert_path = dir.path().join("cli_a.crt");
+    let cli_key_path = dir.path().join("cli_a.key");
+    std::fs::write(&ca_a_path, TEST_CA_A_PEM).unwrap();
+    std::fs::write(&cli_cert_path, TEST_CLI_A_CERT_PEM).unwrap();
+    std::fs::write(&cli_key_path, TEST_CLI_A_KEY_PEM).unwrap();
+
+    let mut args = make_args();
+    args.cafile = Some(ca_a_path.to_str().unwrap().to_string());
+    args.cert = Some(cli_cert_path.to_str().unwrap().to_string());
+    args.key = Some(cli_key_path.to_str().unwrap().to_string());
+
+    let client_config = Arc::new(build_tls_config(&args).unwrap().expect("TLS config expected"));
+    let srv_mtls =
+        make_test_server_config(TEST_SRV_A_CERT_PEM, TEST_SRV_A_KEY_PEM, Some(TEST_CA_A_PEM));
+
+    run_in_memory_tls_handshake(client_config, srv_mtls, "server-a.test")
+        .expect("--cafile should work together with --cert and --key for mTLS");
+}
+
+#[test]
+fn test_cafile_with_insecure_returns_none() {
+    ensure_crypto_provider();
+    let mut args = make_args();
+    args.insecure = true;
+    args.cafile = Some("/nonexistent/ca.pem".to_string());
+
+    let tls_config = build_tls_config(&args).unwrap();
+    assert!(tls_config.is_none());
+}
+
+#[test]
+fn test_cafile_error_cases_and_partial_bundle() {
+    ensure_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+
+    // 1. Missing file
+    let mut args = make_args();
+    args.cafile = Some(dir.path().join("missing.pem").to_str().unwrap().to_string());
+    let err = build_tls_config(&args).unwrap_err();
+    assert!(matches!(err.downcast_ref::<PermanentError>(), Some(PermanentError::CaFileError(_))));
+    assert!(is_permanent_error(&err));
+
+    // 2. Directory path instead of file
+    args.cafile = Some(dir.path().to_str().unwrap().to_string());
+    let err = build_tls_config(&args).unwrap_err();
+    assert!(matches!(err.downcast_ref::<PermanentError>(), Some(PermanentError::CaFileError(_))));
+
+    // 3. Empty file (no certificates)
+    let empty_path = dir.path().join("empty.pem");
+    std::fs::write(&empty_path, "# just a comment\n").unwrap();
+    args.cafile = Some(empty_path.to_str().unwrap().to_string());
+    let err = build_tls_config(&args).unwrap_err();
+    assert!(matches!(err.downcast_ref::<PermanentError>(), Some(PermanentError::CaFileError(_))));
+
+    // 4. Malformed PEM base64
+    let bad_pem_path = dir.path().join("bad_pem.pem");
+    std::fs::write(
+        &bad_pem_path,
+        "-----BEGIN CERTIFICATE-----\n!!!not-base64!!!\n-----END CERTIFICATE-----\n",
+    )
+    .unwrap();
+    args.cafile = Some(bad_pem_path.to_str().unwrap().to_string());
+    let err = build_tls_config(&args).unwrap_err();
+    assert!(matches!(err.downcast_ref::<PermanentError>(), Some(PermanentError::CaFileError(_))));
+
+    // 5. Valid PEM base64 but invalid DER X.509 certificate
+    let bad_der_pem = "-----BEGIN CERTIFICATE-----\nAQIDBA==\n-----END CERTIFICATE-----\n";
+    let bad_der_path = dir.path().join("bad_der.pem");
+    std::fs::write(&bad_der_path, bad_der_pem).unwrap();
+    args.cafile = Some(bad_der_path.to_str().unwrap().to_string());
+    let err = build_tls_config(&args).unwrap_err();
+    assert!(matches!(err.downcast_ref::<PermanentError>(), Some(PermanentError::CaFileError(_))));
+
+    // 6. Bundle with 1 valid cert + 1 unparsable DER cert succeeds using the valid cert
+    let mixed_path = dir.path().join("mixed.pem");
+    std::fs::write(&mixed_path, format!("{bad_der_pem}\n{TEST_CA_A_PEM}")).unwrap();
+    args.cafile = Some(mixed_path.to_str().unwrap().to_string());
+    let client_config = Arc::new(build_tls_config(&args).unwrap().expect("TLS config expected"));
+    let srv_a = make_test_server_config(TEST_SRV_A_CERT_PEM, TEST_SRV_A_KEY_PEM, None);
+    run_in_memory_tls_handshake(client_config, srv_a, "server-a.test")
+        .expect("valid cert in mixed bundle should still be loaded");
 }

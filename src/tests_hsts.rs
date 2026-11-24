@@ -50,6 +50,7 @@ fn make_test_args() -> Args {
         json_verify_hash: false,
         cert: None,
         key: None,
+        cafile: None,
         force_tty_write: false,
     }
 }
